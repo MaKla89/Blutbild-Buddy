@@ -1,0 +1,13 @@
+[server]
+headless = true
+runOnSave = false
+# "none" disables the file watcher (replaces the removed "watchMode" option).
+# In Docker this is also set via STREAMLIT_SERVER_FILE_WATCHER_TYPE=none.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+primaryColor = "#42a5f5"
+base = "dark"

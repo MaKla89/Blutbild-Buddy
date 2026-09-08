@@ -1,0 +1,28 @@
+# Virtual environments
+.venv/
+venv/
+
+# Database
+blutbild_buddy.db
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Patient PDFs (sensitive data)
+reports_input/*
+!reports_input/
+
+# Database files
+*.db
+
+# Streamlit cache (keep config.toml — app theme/server settings)
+.streamlit/*
+!.streamlit/config.toml
+
+# Environment variables (may contain secrets)
+.env
+
+.vscode/

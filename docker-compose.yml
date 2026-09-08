@@ -1,0 +1,51 @@
+services:
+  blutbild-buddy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: blutbild-buddy
+
+    # Bind to localhost only — add a reverse proxy with TLS for external access
+    ports:
+      - "8501:8501"
+
+    environment:
+      # TODO: Replace with your LLM server's actual IP address!
+      # Example: http://192.168.1.100:8888/v1 (if Unsloth runs on another machine)
+      # Or http://172.17.0.1:8888/v1 (if Unsloth runs on the NAS host via Docker bridge)
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://172.17.0.1:8888/v1}
+      - LLM_MODEL=${LLM_MODEL:-unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M}
+      # LLM_API_KEY should be set in .env (gitignored) — never hardcode secrets here
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-300}
+
+    volumes:
+      - blutbild-data:/app/data
+      - blutbild-reports:/app/reports_input
+
+    # Security hardening
+    tmpfs:                             # Writable temp dirs the app needs
+      - /tmp:size=64M,mode=1777
+      - /app/__pycache__               # Python bytecode cache (writable overlay)
+    security_opt:
+      - no-new-privileges:true         # Prevent privilege escalation
+
+    # Resource limits to prevent host impact
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 512M
+
+    restart: unless-stopped
+    healthcheck:                       # Leverage the Dockerfile HEALTHCHECK
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  blutbild-data:
+  blutbild-reports:

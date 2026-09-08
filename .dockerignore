@@ -1,0 +1,37 @@
+# Virtual environments
+.venv/
+venv/
+.venv
+venv
+
+# Database
+blutbild_buddy.db
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Sensitive data (uploaded PDFs)
+reports_input/*.pdf
+reports_input/.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+.env
+
+# Docs / local files not needed in container
+README.md
+AGENTS.md
+test_blutbild_buddy.py
