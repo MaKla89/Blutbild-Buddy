@@ -308,9 +308,9 @@ def _job_process_pdfs(session, cfg, lang, params):
             errors.append(f"{t('error_risk_flags', lang=lang)}: {e}")
 
     # Auto-generate the health summary for the patient selected at submit time.
-    patient_name = params.get("patient")
-    if processed and patient_name:
-        p = session.query(Patient).filter(Patient.name == patient_name).first()
+    patient_id = params.get("patient_id")
+    if processed and patient_id is not None:
+        p = session.query(Patient).filter(Patient.id == patient_id).first()
         if p:
             try:
                 llm = _build_client()

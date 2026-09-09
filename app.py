@@ -152,18 +152,9 @@ def _render_health_summary(session, patient, t):
     st.caption(t("summary_disclaimer"))
 
 
-def _patient_select_labels(session, patients):
-    """Build the patient selectbox options: label → Patient dict.
-
-    Each label is "Name — N Berichte, letzter DD.MM.YYYY" (DE) /
-    "Name — N reports, last DD.MM.YYYY" (EN); patients without reports get
-    just their name. Mirrors the report-label pattern in ui/tabs/detail.py.
-    """
-    if not patients:
-        return {}
-
-    # One aggregate query for counts + latest date per patient.
-    stats = {
+def _patient_report_stats(session):
+    """One aggregate query for report count + latest date per patient."""
+    return {
         pid: (count, latest)
         for pid, count, latest in session.query(
             Report.patient_id, func.count(Report.id), func.max(Report.report_date)
@@ -173,20 +164,20 @@ def _patient_select_labels(session, patients):
         .all()
     }
 
-    options = {}
-    for p in patients:
-        count, latest = stats.get(p.id, (0, None))
-        if count and latest is not None:
-            label = t(
-                "patient_option_with_reports",
-                name=p.name,
-                n=count,
-                date=latest.strftime("%d.%m.%Y"),
-            )
-            options[label] = p
-        else:
-            options[p.name] = p
-    return options
+
+def _patient_label(stats, patient):
+    """Selectbox label for a patient: "Name — N Berichte, letzter DD.MM.YYYY"
+    (DE) / "Name — N reports, last DD.MM.YYYY" (EN); patients without reports
+    get just their name. Used as the selectbox format_func."""
+    count, latest = stats.get(patient.id, (0, None))
+    if count and latest is not None:
+        return t(
+            "patient_option_with_reports",
+            name=patient.name,
+            n=count,
+            date=latest.strftime("%d.%m.%Y"),
+        )
+    return patient.name
 
 
 def main():
@@ -216,15 +207,20 @@ def main():
 
     # Patient selector at top (not in sidebar) — labels carry report count
     # and latest report date so the choice is informative at a glance.
-    patient_options = _patient_select_labels(session, patients)
-    selected_label = st.selectbox(
+    # The options are the Patient objects themselves (format_func renders the
+    # label), so st.session_state._selected_patient holds the actual patient —
+    # consumers must never treat it as a name string.
+    patient_stats = _patient_report_stats(session)
+    selected_patient = st.selectbox(
         t("select_patient"),
-        list(patient_options.keys()) if patient_options else ["—"],
+        patients,
+        format_func=lambda p: _patient_label(patient_stats, p),
         key="_selected_patient",
+        disabled=not patients,
     )
 
     # Determine which tabs to show
-    has_patient = bool(patient_options) and selected_label in patient_options
+    has_patient = bool(patients) and selected_patient is not None
     
     # Build tab labels — result-based tabs first (left), settings-related tabs second (right)
     data_tabs = [
@@ -287,7 +283,7 @@ def main():
         session.close()
         return
 
-    patient = patient_options[selected_label]
+    patient = selected_patient
     patient_reports = (
         session.query(Report)
         .filter(Report.patient_id == patient.id)

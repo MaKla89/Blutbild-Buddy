@@ -18,7 +18,7 @@ from sqlalchemy import func
 
 import config
 from database import (
-    Patient, Report, DataPoint, RiskFlag, get_session,
+    Report, DataPoint, RiskFlag, get_session,
 )
 from llm_jobs import submit_job
 from translations import t
@@ -60,10 +60,10 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
     def _op_process_pdfs():
         _show_flash("process_pdfs")
         if st.button(t("btn_process_all"), type="primary", width='stretch'):
-            selected = st.session_state.get("_selected_patient")
+            patient = st.session_state.get("_selected_patient")
             job = submit_job(
                 "process_pdfs", "job_kind_process_pdfs",
-                params={"patient": selected} if selected else None,
+                params={"patient_id": patient.id} if patient else None,
             )
             if job is None:
                 st.info(t("msg_job_already_running"))
@@ -88,16 +88,11 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
     def _op_regenerate_summary():
         _show_flash("regen_summary")
         if st.button(t("btn_regenerate_summary"), key="reports_regenerate_summary", width='stretch', type="primary"):
-            selected = st.session_state.get("_selected_patient")
-            if not selected:
+            patient = st.session_state.get("_selected_patient")
+            if not patient:
                 st.warning(t("error_select_patient"))
                 return
-            with get_session() as op_session:
-                p = op_session.query(Patient).filter(Patient.name == selected).first()
-                patient_id = p.id if p else None
-            if not patient_id:
-                st.error(t("error_select_patient"))
-                return
+            patient_id = patient.id
             job = submit_job(
                 "regen_summary", "job_kind_regen_summary",
                 params={"patient_id": patient_id},
@@ -112,16 +107,11 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
     def _op_bulk_descriptions():
         _show_flash("bulk_desc")
         if st.button(t("btn_generate_all_descriptions"), type="primary", key="btn_bulk_gen_desc", width='stretch'):
-            selected = st.session_state.get("_selected_patient")
-            if not selected:
+            patient = st.session_state.get("_selected_patient")
+            if not patient:
                 st.warning(t("error_select_patient"))
                 return
-            with get_session() as op_session:
-                p = op_session.query(Patient).filter(Patient.name == selected).first()
-                patient_id = p.id if p else None
-            if not patient_id:
-                st.error(t("error_select_patient"))
-                return
+            patient_id = patient.id
             job = submit_job(
                 "bulk_descriptions", "job_kind_bulk_descriptions",
                 params={"patient_id": patient_id},
@@ -136,16 +126,11 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
     def _op_bulk_interpretations():
         _show_flash("bulk_interp")
         if st.button(t("btn_generate_all_interpretations"), type="primary", key="btn_bulk_gen_interp", width='stretch'):
-            selected = st.session_state.get("_selected_patient")
-            if not selected:
+            patient = st.session_state.get("_selected_patient")
+            if not patient:
                 st.warning(t("error_select_patient"))
                 return
-            with get_session() as op_session:
-                p = op_session.query(Patient).filter(Patient.name == selected).first()
-                patient_id = p.id if p else None
-            if not patient_id:
-                st.error(t("error_select_patient"))
-                return
+            patient_id = patient.id
             job = submit_job(
                 "bulk_interpretations", "job_kind_bulk_interpretations",
                 params={"patient_id": patient_id},
@@ -167,15 +152,9 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
         """
         _show_flash("reprocess_pdfs")
         if st.button(t("btn_reprocess_pdfs"), type="primary", key="btn_reprocess_pdfs_action", width='stretch'):
-            selected = st.session_state.get("_selected_patient")
-            patient_id = None
+            patient = st.session_state.get("_selected_patient")
+            patient_id = patient.id if patient else None
             with get_session() as op_session:
-                if selected:
-                    p = op_session.query(Patient).filter(Patient.name == selected).first()
-                    if not p:
-                        st.error(t("error_select_patient"))
-                        return
-                    patient_id = p.id
                 rq = op_session.query(Report)
                 if patient_id is not None:
                     rq = rq.filter(Report.patient_id == patient_id)
