@@ -16,6 +16,7 @@ import streamlit as st
 
 from database import Report, DataPoint, RiskFlag
 from translations import t
+from ui.helpers import _time_range_slider
 
 
 def render_overview_tab(session, patient, patient_reports, min_date, max_date, time_range_key, render_health_summary):
@@ -170,21 +171,10 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
             patient.favorites = json.dumps(selected_fav_labels)
             session.commit()
 
-        # --- Time range slider ---
-        if min_date and max_date:
-            time_range = st.slider(
-                t("time_range_label"),
-                min_value=min_date,
-                max_value=max_date,
-                value=st.session_state[time_range_key],
-                format="DD.MM.YYYY",
-                key=f"slider_{patient.id}",
-            )
-            st.session_state[time_range_key] = time_range
-            start_date, end_date = time_range
-        else:
-            start_date = None
-            end_date = None
+        # --- Time range slider (robust against a single report) ---
+        start_date, end_date = _time_range_slider(
+            min_date, max_date, time_range_key, f"slider_{patient.id}", t("time_range_label"),
+        )
 
           # --- Favorite biomarker charts (absolute values, one per biomarker) ---
         for label in selected_fav_labels:

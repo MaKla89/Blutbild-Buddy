@@ -13,7 +13,7 @@ import config
 from database import Report, DataPoint, get_biomarker_info, upsert_biomarker_info, get_session
 from llm_client import _build_client, generate_biomarker_description, generate_biomarker_interpretation
 from translations import t, _get_lang
-from ui.helpers import _flash, _show_flash
+from ui.helpers import _flash, _show_flash, _time_range_slider
 
 
 def render_trends_tab(session, patient, patient_reports, min_date, max_date, time_range_key, lang):
@@ -41,21 +41,10 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
         selected_label = st.selectbox(t("select_biomarker"), display_labels)
         selected_cname, selected_unit = [t[1] for t in trend_options if t[0] == selected_label][0], [t[2] for t in trend_options if t[0] == selected_label][0]
 
-        # --- Time range slider ---
-        if min_date and max_date:
-            time_range = st.slider(
-                t("time_range_label"),
-                min_value=min_date,
-                max_value=max_date,
-                value=st.session_state[time_range_key],
-                format="DD.MM.YYYY",
-                key=f"slider_trends_{patient.id}",
-            )
-            st.session_state[time_range_key] = time_range
-            start_date, end_date = time_range
-        else:
-            start_date = None
-            end_date = None
+        # --- Time range slider (robust against a single report) ---
+        start_date, end_date = _time_range_slider(
+            min_date, max_date, time_range_key, f"slider_trends_{patient.id}", t("time_range_label"),
+        )
 
         dp_data = (
             session.query(DataPoint, Report.report_date)

@@ -69,6 +69,46 @@ def _show_flash(key: str):
     for level, text in st.session_state.pop(f"_flash_{key}", []):
         getattr(st, level)(text)
 
+def _time_range_slider(min_date, max_date, value_key, slider_key, label):
+    """Robust date-range slider shared by the Overview and Trends tabs.
+
+    Returns a (start_date, end_date) tuple, or (None, None) when no slider can
+    be shown. Guards against two StreamlitAPIException cases:
+      - min_date == max_date (patient with exactly one report): st.slider
+        requires min_value < max_value, so we skip the slider and use the
+        single date as both bounds.
+      - stale session state from a previous run (e.g. reports deleted since):
+        the stored value is clamped into [min_date, max_date].
+    """
+    if not min_date or not max_date:
+        return None, None
+
+    if min_date >= max_date:
+        # Single report (or all reports on one day): nothing to slide.
+        return min_date, max_date
+
+    value = st.session_state.get(value_key)
+    if not (isinstance(value, (list, tuple)) and len(value) == 2):
+        value = [min_date, max_date]
+    else:
+        start, end = value
+        # Clamp into the current range so deleted reports can't break the slider.
+        start = min(max(start, min_date), max_date)
+        end = min(max(end, min_date), max_date)
+        if start > end:
+            start, end = end, start
+        value = [start, end]
+
+    time_range = st.slider(
+        label,
+        min_value=min_date,
+        max_value=max_date,
+        value=value,
+        format="DD.MM.YYYY",
+        key=slider_key,
+    )
+    st.session_state[value_key] = time_range
+    return time_range[0], time_range[1]
 
 def load_data(session):
     patients = session.query(Patient).all()
