@@ -21,7 +21,7 @@ from database import (
     Report, DataPoint, RiskFlag, get_session,
 )
 from llm_jobs import submit_job
-from translations import t
+from translations import t, _get_lang
 from ui.helpers import (
     _handle_file_upload,
     _flash, _show_flash,
@@ -216,7 +216,8 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
 
     # Report list with status and biomarker counts
     st.divider()
-    st.markdown(f"**{len(reports)} {t('col_report_filename').lower()}**")
+    _plural = "" if len(reports) == 1 else ("e" if _get_lang() == "de" else "s")
+    st.markdown(f"**{t('heading_reports_list', n=len(reports), plural=_plural)}**")
     st.caption(t("caption_stats", n=len(reports), m=len(dps)))
 
     if not reports:
@@ -263,7 +264,7 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
 
         # Delete report section
         st.divider()
-        st.markdown(f"🗑️ **{t('btn_delete_report')}**")
+        st.markdown(f"**{t('btn_delete_report')}**")
         col_del1, col_del2 = st.columns([3, 1])
         with col_del1:
             delete_options = {r.filename: r.id for r in reports}

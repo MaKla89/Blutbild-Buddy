@@ -171,10 +171,13 @@ def _patient_label(stats, patient):
     get just their name. Used as the selectbox format_func."""
     count, latest = stats.get(patient.id, (0, None))
     if count and latest is not None:
+        # Language-aware plural suffix: "Bericht(e)" in DE, "report(s)" in EN.
+        plural = "" if count == 1 else ("e" if _get_lang() == "de" else "s")
         return t(
             "patient_option_with_reports",
             name=patient.name,
             n=count,
+            plural=plural,
             date=latest.strftime("%d.%m.%Y"),
         )
     return patient.name

@@ -28,11 +28,12 @@ DE = {
     "spinner_refreshing": "Risikoanalyse wird durchgeführt...",
     "msg_risks_refreshed": "{n} Risikomarkierungen aktualisiert.",
     "select_patient": "Patient auswählen",
-    "patient_option_with_reports": "{name} — {n} Berichte, letzter {date}",
+    "patient_option_with_reports": "{name} — {n} Bericht{plural}, letzter {date}",
     "rename_patient": "Patient umbenennen",
     "msg_renamed": "Umbenannt: {old} → {new}",
     "msg_rename_error": "Fehler beim Umbenennen.",
     "caption_stats": "Berichte: {n} | Messwerte: {m}",
+    "heading_reports_list": "{n} Bericht{plural}",
     "sidebar_pdf_settings": "PDF-Einstellungen",
     "label_upload_pdf": "PDF-Datei hochladen",
     "label_batch_size": "Seiten pro LLM-Aufruf",
@@ -108,6 +109,7 @@ DE = {
 
     # Patients tab
     "subheader_patients_manage": "Patienten verwalten",
+    "heading_patients_list": "{n} Patient{plural}",
     "caption_patients_manage": "Liste aller Patienten, Umbenennen und Zusammenführen.",
     "btn_select_for_merge": "Auswählen",
     "btn_merge_selected": "🔗 Ausgewählte zusammenführen",
@@ -425,11 +427,12 @@ EN = {
     "spinner_refreshing": "Running risk analysis...",
     "msg_risks_refreshed": "{n} risk flags updated.",
     "select_patient": "Select Patient",
-    "patient_option_with_reports": "{name} — {n} reports, last {date}",
+    "patient_option_with_reports": "{name} — {n} report{plural}, last {date}",
     "rename_patient": "Rename Patient",
     "msg_renamed": "Renamed: {old} → {new}",
     "msg_rename_error": "Error during rename.",
     "caption_stats": "Reports: {n} | Values: {m}",
+    "heading_reports_list": "{n} Report{plural}",
     "sidebar_pdf_settings": "PDF Settings",
     "label_upload_pdf": "Upload PDF Files",
     "label_batch_size": "Pages per LLM Call",
@@ -505,6 +508,7 @@ EN = {
 
     # Patients tab
     "subheader_patients_manage": "Manage Patients",
+    "heading_patients_list": "{n} patient{plural}",
     "caption_patients_manage": "List of all patients, rename and merge operations.",
     "btn_select_for_merge": "Select",
     "btn_merge_selected": "🔗 Merge Selected",

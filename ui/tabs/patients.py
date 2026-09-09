@@ -9,7 +9,7 @@ import streamlit as st
 from sqlalchemy import func
 
 from database import Report, DataPoint, rename_patient, merge_patients, get_session
-from translations import t
+from translations import t, _get_lang
 
 
 def render_patients_tab(session, patients):
@@ -22,7 +22,8 @@ def render_patients_tab(session, patients):
         return
 
     # Patient list with rename and merge options
-    st.markdown(f"**{len(patients)} {t('select_patient').lower()}**")
+    _plural = "" if len(patients) == 1 else ("e" if _get_lang() == "de" else "s")
+    st.markdown(f"**{t('heading_patients_list', n=len(patients), plural=_plural)}**")
 
     patient_options = {p.name: p.id for p in patients}
 
