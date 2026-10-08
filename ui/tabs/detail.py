@@ -20,7 +20,7 @@ def render_detail_tab(session, patient, patient_reports):
 
     if patient_reports:
         report_options = {
-            f"{r.report_date.strftime('%d.%m.%Y')} — {r.filename}": r
+            f"{r.report_date.strftime('%d.%m.%Y') if r.report_date else '?'} — {r.filename}": r
             for r in reversed(patient_reports)
         }
         selected_label = st.selectbox(t("select_report"), list(report_options.keys()))

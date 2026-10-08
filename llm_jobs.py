@@ -42,7 +42,7 @@ from llm_client import (
     generate_patient_summary, generate_biomarker_description,
     generate_biomarker_interpretation,
     run_biomarker_quality_check, run_duplicate_check,
-    is_job_aborted, request_job_abort, set_current_job_id,
+    is_job_aborted, request_job_abort, set_current_job_id, clear_job_abort,
 )
 from analyzer import refresh_risk_flags
 from extractor import process_new_pdfs
@@ -169,6 +169,14 @@ def _run_job(job_id: int):
         set_job_config(cfg)
         _current_job_id_var.job_id = job_id
         set_current_job_id(job_id)
+        # A SQLite rowid can be reused by a new job after the old row was
+        # deleted. The DB row's aborted flag is the source of truth for THIS
+        # rowid instance: if it is not aborted, any id lingering in the
+        # in-memory set is stale from a deleted prior job → drop it. If it IS
+        # aborted (a pending job aborted before its worker started), keep the
+        # flag so the worker still sees the abort.
+        if not job.aborted:
+            clear_job_abort(job_id)
         lang = cfg.get("lang") or "de"
 
         job.status = "running"
@@ -210,6 +218,7 @@ def _run_job(job_id: int):
         set_job_config(None)
         _current_job_id_var.job_id = None
         set_current_job_id(None)
+        clear_job_abort(job_id)
         session.close()
         with _kind_lock:
             if kind:
@@ -303,7 +312,7 @@ def _job_process_pdfs(session, cfg, lang, params):
     n_risks = 0
     if processed:
         try:
-            n_risks = refresh_risk_flags(session, _build_client())
+            n_risks = refresh_risk_flags(session, _build_client(), lang=lang)
         except Exception as e:
             errors.append(f"{t('error_risk_flags', lang=lang)}: {e}")
 
@@ -551,7 +560,7 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
     n_risks = 0
     if processed:
         try:
-            n_risks = refresh_risk_flags(session, _build_client())
+            n_risks = refresh_risk_flags(session, _build_client(), lang=lang)
         except Exception as e:
             errors.append(f"{t('error_risk_flags', lang=lang)}: {e}")
 
@@ -583,7 +592,7 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
 
 
 def _job_refresh_risks(session, cfg, lang, params):
-    n = refresh_risk_flags(session, _build_client())
+    n = refresh_risk_flags(session, _build_client(), lang=lang)
     return "success", t("msg_risks_refreshed_all", lang=lang, n=n)
 
 

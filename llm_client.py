@@ -25,8 +25,10 @@ class LLMResponseError(ValueError):
 # check is_job_aborted() between steps, and _abort_timeout() cuts an in-flight
 # HTTP request of an aborted job short (1s → APITimeoutError, caught by the
 # worker and surfaced as "interrupted"). The current job id is thread-local
-# (set by llm_jobs._run_job) because LLM call sites don't take a job id. Job
-# ids are unique, so finished entries never match a new job — no clearing.
+# (set by llm_jobs._run_job) because LLM call sites don't take a job id.
+# LlmJob.id is a reusable SQLite rowid, so _run_job's finally block calls
+# clear_job_abort() to drop the id when the worker exits — otherwise a later
+# job could inherit a stale id and start already-aborted.
 _aborted_job_ids: set[int] = set()
 _abort_lock = threading.Lock()
 _current_job_id_local = threading.local()
@@ -36,6 +38,18 @@ def request_job_abort(job_id: int):
     """Mark one job as aborted; its worker stops after the current step."""
     with _abort_lock:
         _aborted_job_ids.add(job_id)
+
+
+def clear_job_abort(job_id: int):
+    """Discard a job id from the aborted set once its worker has finished.
+
+    LlmJob.id is a SQLite rowid alias (INTEGER PRIMARY KEY, no AUTOINCREMENT)
+    and clear_finished_llm_jobs() deletes finished rows, so SQLite reuses freed
+    rowids for later jobs. Without this, a new job could inherit a stale id and
+    start already-aborted. Called from llm_jobs._run_job's finally block.
+    """
+    with _abort_lock:
+        _aborted_job_ids.discard(job_id)
 
 
 def is_job_aborted(job_id: int | None = None) -> bool:
@@ -148,7 +162,10 @@ def _resolve_config(explicit: dict | None) -> dict:
     if explicit:
         return explicit
     cfg = getattr(_job_config_var, "config", None)
-    if cfg:
+    if cfg is not None:
+        # A worker's config snapshot (possibly an empty dict → fall back to
+        # env-var defaults downstream in _build_client). `is not None` matters:
+        # a falsy empty dict must NOT fall through to session state.
         return cfg
     import streamlit as st
     if hasattr(st, "session_state"):
@@ -218,7 +235,7 @@ def extract_pages_batch(llm: OpenAI, page_images: list[Image.Image] | list[str],
             temperature=0.0,
             timeout=_abort_timeout() or _get_timeout(),
         )
-        raw = _strip_markdown_json(resp.choices[0].message.content)
+        raw = _strip_markdown_json(resp.choices[0].message.content or "")
     try:
         data = json.loads(raw)
         pages = data.get("pages", [])
@@ -230,12 +247,15 @@ def extract_pages_batch(llm: OpenAI, page_images: list[Image.Image] | list[str],
     except Exception as e:
         raise LLMResponseError(f"LLM response parsing failed for batch page extraction: {e}\nResponse snippet: {raw[:200]}")
 
-    # R3-12: verify every requested page came back. The prompt instructs the
-    # LLM to include "page_index" (0-based) per page; a short or mismatched
-    # response must surface as an error instead of silently dropping pages.
-    expected = set(range(len(page_images)))
-    returned = {p.page_index for p in results if p.page_index is not None}
-    if all(p.page_index is None for p in results):
+    # R3-12: verify every requested page came back EXACTLY once. The prompt
+    # instructs the LLM to include "page_index" (0-based) per page; a short,
+    # duplicated or mismatched response must surface as an error instead of
+    # silently dropping/misaligning pages. A set-based check would let
+    # duplicates through (e.g. [0,1,1] for 3 pages → one page's data lost), so
+    # we require the returned indices to be exactly 0..N-1 with no repeats.
+    expected = list(range(len(page_images)))
+    indices = [p.page_index for p in results]
+    if all(idx is None for idx in indices):
         # No page_index at all: only accept when the count matches exactly,
         # trusting positional order. Anything else is unverifiable → error.
         if len(results) != len(page_images):
@@ -245,14 +265,20 @@ def extract_pages_batch(llm: OpenAI, page_images: list[Image.Image] | list[str],
                 f"Refusing to continue with partial data — retry or use batch size 1."
             )
         return results
-    missing = sorted(expected - returned)
-    extra = sorted(returned - expected)
-    if missing or extra:
+    if len(results) != len(page_images) or sorted(indices) != expected:
+        returned = sorted(i for i in indices if i is not None)
+        missing = sorted(set(expected) - set(returned))
+        extra = sorted(set(returned) - set(expected))
+        dupes = sorted({i for i in returned if returned.count(i) > 1})
         raise LLMResponseError(
             f"Batch page extraction incomplete: requested {len(page_images)} pages, "
-            f"got indices {sorted(returned)} (missing: {missing}, unexpected: {extra}). "
+            f"got indices {returned} (missing: {missing}, unexpected: {extra}, "
+            f"duplicated: {dupes}). "
             f"Refusing to continue with partial data — retry or use batch size 1."
         )
+    # Correct order for downstream positional consumers (extractor maps results
+    # back to pages by index).
+    results.sort(key=lambda p: p.page_index)
     return results
 
 
@@ -283,7 +309,7 @@ def extract_page(llm: OpenAI, page_image: Image.Image | str, quality: int = 75) 
             temperature=0.0,
             timeout=_abort_timeout() or _get_timeout(),
         )
-        raw = _strip_markdown_json(resp.choices[0].message.content)
+        raw = _strip_markdown_json(resp.choices[0].message.content or "")
     try:
         return ExtractedPage(**json.loads(raw))
     except json.JSONDecodeError as e:
@@ -343,7 +369,7 @@ def normalize_names(llm: OpenAI, extracted_names: list[dict] | list[str], canoni
             temperature=0.0,
             timeout=_abort_timeout() or _get_timeout(),
         )
-        raw = _strip_markdown_json(resp.choices[0].message.content)
+        raw = _strip_markdown_json(resp.choices[0].message.content or "")
     try:
         return NormalizationMapping(**json.loads(raw))
     except json.JSONDecodeError as e:
@@ -502,9 +528,25 @@ def _parse_findings(raw, allowed_categories=None, allowed_target_types=None) -> 
             if not ids:
                 continue
             if action == "set_ref_range":
-                has_bound = params.get("low") is not None or params.get("high") is not None
-                if not has_bound:
+                # Coerce the bounds to float NOW: database._apply_data_point_fix
+                # does float(params["low"]) when the user accepts, so a
+                # non-numeric value ("n/a", "", "low") from the LLM would crash
+                # the Accept button. Drop the finding if a bound is not numeric.
+                coerced = {}
+                bad = False
+                for key in ("low", "high"):
+                    val = params.get(key)
+                    if val is None:
+                        coerced[key] = None
+                        continue
+                    try:
+                        coerced[key] = float(val)
+                    except (TypeError, ValueError):
+                        bad = True
+                        break
+                if bad or (coerced["low"] is None and coerced["high"] is None):
                     continue
+                params = {**params, "low": coerced["low"], "high": coerced["high"]}
             if action == "set_unit" and not str(params.get("unit", "")).strip():
                 continue
             data_points = ids
@@ -913,8 +955,6 @@ IMPORTANT RULES:
 - Recommendations should be patient-oriented (e.g., "Please ask your doctor to check... at your next visit", "Discuss with your physician...", not "prescribe...")."""
 
 
-
-
 RISK_ASSESSMENT_SYSTEM_PROMPT_DE = """Du bist ein erfahrener Arzt, der Laborbefunde eines Patienten bewertet.
 
 Du erhältst eine nummerierte Liste von Risikofindern (Kategorie + Beschreibung). Deine Aufgabe:
@@ -1011,7 +1051,7 @@ def assess_risks(llm: OpenAI, findings_data: list[dict], lang: str | None = None
             temperature=0.0,
             timeout=_abort_timeout() or _get_timeout(),
         )
-        raw = resp.choices[0].message.content
+        raw = resp.choices[0].message.content or ""
 
     try:
         data = json.loads(_strip_markdown_json(raw))
@@ -1181,7 +1221,8 @@ def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk
             temperature=0.3,
             timeout=_abort_timeout() or _get_timeout(),
         )
-    return resp.choices[0].message.content.strip()
+    content = resp.choices[0].message.content
+    return content.strip() if content else None
 
 
 # ── Biomarker Description & Interpretation ────────────────────────────────────

@@ -49,11 +49,17 @@ def _ensure_session_local():
 def normalize_patient_name(raw: str) -> str:
     """Normalize a patient name to 'LastName, FirstName' canonical form.
 
-    Handles formats like:
-      'Doe J.' → 'Doe, J.'
-      'J., Doe' → 'J., Doe'
-      'Doe_J.' → 'Doe, J.'
-      'Doe J' → 'Doe, J'
+    Heuristic: the LAST whitespace-separated word is the surname and
+    everything before it is the first name (PDFs frequently list names as
+    "First Last" or "First L."). A name that already contains a comma is
+    treated as "Last, First" and left in that order.
+
+    Examples:
+      'Doe J.'  → 'J., Doe'    (last word "J." = surname)
+      'J. Doe'  → 'Doe, J.'
+      'J., Doe' → 'J., Doe'    (already Last, First)
+      'Doe_J.'  → 'J., Doe'    (underscore → space)
+      'Doe J'   → 'J, Doe'
     """
     if not raw:
         return raw

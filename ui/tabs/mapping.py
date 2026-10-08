@@ -81,7 +81,8 @@ def render_mapping_tab(session, patient, patient_reports):
         t("select_all_reports"): None,
     }
     for r in patient_reports:
-        report_options[r.report_date.strftime("%d.%m.%Y") + " — " + r.filename] = r.id
+        date_str = r.report_date.strftime("%d.%m.%Y") if r.report_date else "?"
+        report_options[date_str + " — " + r.filename] = r.id
     selected_report_label = st.selectbox(t("select_filter_report"), list(report_options.keys()))
     selected_report_id = report_options[selected_report_label]
 

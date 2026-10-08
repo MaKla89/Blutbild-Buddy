@@ -534,14 +534,23 @@ def _get_latest_report_date(session: SASession, patient_id: int) -> datetime | N
 def _get_biomarker_latest(session: SASession, patient_id: int, canonical_name: str) -> tuple[DataPoint | None, datetime | None]:
     """Get the latest data point for a biomarker for a patient.
 
+    Matches the *full* canonical name case-insensitively, NOT the base name
+    with the parenthesised unit suffix stripped. The cross-biomarker rules and
+    the required-marker list reference exact registry canonical names
+    ("HbA1c (%)", "eGFR (CKD-EPI)", "Glukose (nüchtern)") that the extractor
+    stores verbatim; comparing against normalize_canonical_name()'s base form
+    ("hba1c") never matched, so those markers were silently treated as
+    never-measured. Matching the full lowered name also keeps unit-qualified
+    variants (HbA1c (%) vs HbA1c (mmol/mol)) distinct.
+
     Returns (DataPoint, report_date) or (None, None).
     """
-    norm_name = normalize_canonical_name(canonical_name)
+    name_lower = canonical_name.strip().lower()
     result = (
         session.query(DataPoint, Report.report_date)
         .join(Report)
         .filter(
-            func.lower(DataPoint.canonical_name) == norm_name,
+            func.lower(DataPoint.canonical_name) == name_lower,
             DataPoint.value.isnot(None),
             DataPoint.is_disabled == False,  # noqa: E712
             Report.patient_id == patient_id,
@@ -883,11 +892,19 @@ def analyze_trends(session: SASession) -> list[RiskFlag]:
     all_flags = []
     patients = session.query(Patient).all()
 
+    # Dedup PER PATIENT, not globally. _dedup_by_biomarker groups by
+    # (patient_id, base canonical name), so a global pass across all patients
+    # would let one patient's flag suppress another patient's same-named
+    # biomarker and let a single patient consume the whole max_flags budget.
+    # Scoping per patient matches refresh_patient_risk_flags().
     for patient in patients:
-        all_flags.extend(_analyze_patient(session, patient))
+        all_flags.extend(
+            _dedup_by_biomarker(
+                _analyze_patient(session, patient), session, RISK_CONFIG["max_flags"]
+            )
+        )
 
-    deduped_flags = _dedup_by_biomarker(all_flags, session, RISK_CONFIG["max_flags"])
-    return deduped_flags
+    return all_flags
 
 
 def refresh_patient_risk_flags(session: SASession, patient_id: int) -> int:
@@ -934,7 +951,7 @@ def refresh_patient_risk_flags(session: SASession, patient_id: int) -> int:
     return len(flags)
 
 
-def refresh_risk_flags(session: SASession, llm=None) -> int:
+def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) -> int:
     """Rebuild all risk flags and let the LLM rank + explain them.
 
     Detection (analyze_trends) is deterministic and LLM-free. The LLM then
@@ -958,7 +975,7 @@ def refresh_risk_flags(session: SASession, llm=None) -> int:
         findings_data = [{"category": f.category, "description": f.description} for f in flags]
         from llm_client import assess_risks
         try:
-            risks = assess_risks(llm, findings_data)
+            risks = assess_risks(llm, findings_data, lang=lang)
         except Exception:
             risks = []
         if risks:

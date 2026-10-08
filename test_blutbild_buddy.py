@@ -1582,6 +1582,34 @@ class TestCrossBiomarkerPatterns(unittest.TestCase):
         for f in cross_flags:
             self.assertIsNotNone(f.report_id)
 
+    def test_parenthesized_canonical_names_match(self):
+        """Regression: rules reference exact canonical names with a parenthesised
+        unit suffix ('Glukose (nüchtern)', 'HbA1c (%)'). _get_biomarker_latest
+        used to strip that suffix via normalize_canonical_name, so the SQL never
+        matched and the diabetes rule was dead. It must fire now."""
+        from analyzer import _detect_cross_biomarker_patterns
+        pid = self._add_patient_with_markers('DiabetesPattern', [
+            ('Glukose (nüchtern)', 150.0, 'mg/dl', 70, 110, True),  # high
+            ('HbA1c (%)', 7.1, '%', 4.0, 5.7, True),                # high
+        ], report_date=datetime(2025, 6, 1))
+        flags = _detect_cross_biomarker_patterns(self.session, pid, datetime(2025, 6, 1))
+        dm_flags = [f for f in flags if 'Diabetes-Muster' in f.description]
+        self.assertGreater(len(dm_flags), 0)
+
+    def test_unit_qualified_variants_stay_distinct(self):
+        """HbA1c (%) and HbA1c (mmol/mol) are different canonical names; a rule
+        asking for HbA1c (%) must not match a value stored as HbA1c (mmol/mol)."""
+        from analyzer import _get_biomarker_latest_value
+        pid = self._add_patient_with_markers('HbA1cVariant', [
+            ('HbA1c (mmol/mol)', 55.0, 'mmol/mol', 20, 39, True),
+        ], report_date=datetime(2025, 6, 1))
+        # The '%' variant was never measured → lookup must return None.
+        value, *_ = _get_biomarker_latest_value(self.session, pid, 'HbA1c (%)')
+        self.assertIsNone(value)
+        # The mmol/mol variant IS present.
+        value, *_ = _get_biomarker_latest_value(self.session, pid, 'HbA1c (mmol/mol)')
+        self.assertEqual(value, 55.0)
+
 
 class TestDetectMissingMarkers(unittest.TestCase):
     """Tests for _detect_missing_markers."""
@@ -2468,6 +2496,22 @@ class TestBatchPageVerification(unittest.TestCase):
         mock_llm = _MockLLM(self._pages_json([0, 5]))
         with self.assertRaises(LLMResponseError):
             extract_pages_batch(mock_llm, ["b64a", "b64b"])
+
+    def test_duplicate_index_raises(self):
+        """Duplicated page_index (e.g. [0,1,1] for 3 pages) must not pass —
+        a set-based check would let it through and silently drop a page."""
+        from llm_client import extract_pages_batch, LLMResponseError
+        mock_llm = _MockLLM(self._pages_json([0, 1, 1]))
+        with self.assertRaises(LLMResponseError) as ctx:
+            extract_pages_batch(mock_llm, ["b64a", "b64b", "b64c"])
+        self.assertIn("duplicated", str(ctx.exception))
+
+    def test_results_sorted_by_index(self):
+        """Out-of-order indices are returned sorted by page_index."""
+        from llm_client import extract_pages_batch
+        mock_llm = _MockLLM(self._pages_json([2, 0, 1]))
+        results = extract_pages_batch(mock_llm, ["a", "b", "c"])
+        self.assertEqual([p.page_index for p in results], [0, 1, 2])
 
     def test_no_index_matching_count_ok(self):
         """No page_index at all is tolerated when the count matches exactly."""
@@ -3576,6 +3620,37 @@ class TestLlmJobAbort(unittest.TestCase):
         self.assertEqual(database.get_llm_job(self.session, ids["p"]).status, "pending")
         self.assertEqual(database.get_llm_job(self.session, ids["r"]).status, "running")
 
+    def test_clear_job_abort_discards_id(self):
+        """clear_job_abort() removes an id from the aborted set (unit level)."""
+        import llm_client
+        llm_client.request_job_abort(999)
+        self.assertTrue(llm_client.is_job_aborted(999))
+        llm_client.clear_job_abort(999)
+        self.assertFalse(llm_client.is_job_aborted(999))
+
+    def test_run_job_discards_abort_id_after_finish(self):
+        """Regression: LlmJob.id is a reusable SQLite rowid. If a finished job's
+        id stayed in _aborted_job_ids, a later job reusing that rowid would be
+        born already-aborted. _run_job's finally block must discard the id."""
+        import llm_client
+        import llm_jobs
+        # A job aborted before its worker starts (row.aborted = True).
+        r = database.create_llm_job(self.session, "regen_summary", "aborted pending")
+        r.status = "pending"
+        r.aborted = True
+        r.params_json = json.dumps({"patient_id": self.patient.id})
+        self.session.commit()
+        llm_client.request_job_abort(r.id)
+        self.assertTrue(llm_client.is_job_aborted(r.id))
+
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "generate_patient_summary", return_value="x"):
+            llm_jobs._run_job(r.id)
+
+        # Worker finished → the id must no longer be in the aborted set.
+        self.assertNotIn(r.id, llm_client._aborted_job_ids)
+        self.assertFalse(llm_client.is_job_aborted(r.id))
+
 
 class TestReprocessPdfs(unittest.TestCase):
     """Re-extract existing reports with the current LLM + registry (reprocess_pdfs job)."""
@@ -3786,6 +3861,32 @@ class TestDataQualityParsing(unittest.TestCase):
              "action": "set_unit", "params": {"unit": "  "}, "data_points": [1]},
         ]
         self.assertEqual(_parse_findings(raw), [])
+
+    def test_parse_set_ref_range_coerces_bounds(self):
+        """Non-numeric bounds are dropped (they would crash the Accept button);
+        numeric-string bounds are coerced to float."""
+        from llm_client import _parse_findings
+        # "n/a" bound → finding dropped entirely
+        raw_bad = [{"category": "ref_range", "target_type": "data_point",
+                    "biomarker": "CRP", "description": "d",
+                    "action": "set_ref_range",
+                    "params": {"low": "n/a", "high": 10}, "data_points": [1]}]
+        self.assertEqual(_parse_findings(raw_bad), [])
+        # numeric strings coerced to float
+        raw_str = [{"category": "ref_range", "target_type": "data_point",
+                    "biomarker": "CRP", "description": "d",
+                    "action": "set_ref_range",
+                    "params": {"low": "0", "high": "10.5"}, "data_points": [1]}]
+        out = _parse_findings(raw_str)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["params"]["low"], 0.0)
+        self.assertEqual(out[0]["params"]["high"], 10.5)
+        # both bounds None → dropped
+        raw_none = [{"category": "ref_range", "target_type": "data_point",
+                     "biomarker": "CRP", "description": "d",
+                     "action": "set_ref_range",
+                     "params": {"low": None, "high": None}, "data_points": [1]}]
+        self.assertEqual(_parse_findings(raw_none), [])
 
     def test_parse_drops_malformed_entries(self):
         from llm_client import _parse_findings
