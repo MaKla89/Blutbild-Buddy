@@ -2933,7 +2933,7 @@ class TestDisabledMeasurements(unittest.TestCase):
 
         captured = {}
 
-        def fake_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None):
+        def fake_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None, profile=None):
             captured["recent"] = list(recent_dps)
             return "ok"
 
@@ -3501,7 +3501,7 @@ class TestLlmJobs(unittest.TestCase):
         # user had selected — passed as ISO strings in params_json.
         captured = {}
 
-        def gen(llm_, name, unit, dp_tuples, lang=None):
+        def gen(llm_, name, unit, dp_tuples, lang=None, context_lines=None):
             captured["dates"] = [d for (d, *_rest) in dp_tuples]
             return f"interp for {name}"
 
@@ -3527,7 +3527,7 @@ class TestLlmJobs(unittest.TestCase):
         import llm_jobs
         captured = {}
 
-        def gen(llm_, name, unit, dp_tuples, lang=None):
+        def gen(llm_, name, unit, dp_tuples, lang=None, context_lines=None):
             captured["n"] = len(dp_tuples)
             return "interp"
 
@@ -4622,6 +4622,289 @@ class TestDataQualityJob(unittest.TestCase):
         self.assertIn("patient_id", stored.error or "")
 
 
+class TestHealthInsightPipeline(unittest.TestCase):
+    """Tests for the LLM-insight improvements: patient demographics, temporally
+    aligned cross-biomarker patterns, enriched risk-assessment context,
+    precomputed per-biomarker trend summaries, and related-marker context."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = _fresh_db('test_insight.db')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.session.close()
+
+    def _add_report(self, patient, name, date, markers):
+        report = database.Report(
+            patient_id=patient.id, filename=f'{name}.pdf',
+            file_hash=f'insight_{name}', report_date=date,
+        )
+        self.session.add(report)
+        self.session.flush()
+        for canonical, value, unit, ref_low, ref_high, is_abnormal in markers:
+            self.session.add(database.DataPoint(
+                report_id=report.id, canonical_name=canonical, original_name=canonical,
+                value=value, unit=unit, ref_low=ref_low, ref_high=ref_high,
+                is_abnormal=is_abnormal,
+            ))
+        self.session.commit()
+        return report
+
+    # ── Patient demographics ────────────────────────────────────────────────
+
+    def test_patient_profile_update_and_age(self):
+        p = database.get_or_create_patient(self.session, "Profil Patient")
+        self.assertIsNone(p.birth_date)
+        self.assertIsNone(p.sex)
+        ok = database.update_patient_profile(
+            self.session, p.id,
+            birth_date=datetime(1980, 5, 15), sex="f",
+            clinical_context="Hypertonie, Ramipril",
+        )
+        self.assertTrue(ok)
+        self.session.expire_all()
+        p = self.session.query(database.Patient).filter(database.Patient.id == p.id).one()
+        self.assertEqual(p.sex, "f")
+        self.assertEqual(p.clinical_context, "Hypertonie, Ramipril")
+        age = database.patient_age_years(p, reference_date=datetime(2025, 1, 10))
+        self.assertEqual(age, 44)  # birthday May 15 → not yet 45 on Jan 10
+        self.assertEqual(database.patient_age_years(p, reference_date=datetime(2025, 6, 1)), 45)
+
+    def test_patient_profile_partial_update(self):
+        p = database.get_or_create_patient(self.session, "Profil Partial")
+        database.update_patient_profile(self.session, p.id, sex="m")
+        database.update_patient_profile(self.session, p.id, clinical_context="Diabetes")
+        self.session.expire_all()
+        p = self.session.query(database.Patient).filter(database.Patient.id == p.id).one()
+        self.assertEqual(p.sex, "m")  # untouched by second call
+        self.assertEqual(p.clinical_context, "Diabetes")
+        # Empty string clears the context, None leaves it alone.
+        database.update_patient_profile(self.session, p.id, clinical_context="")
+        self.session.expire_all()
+        p = self.session.query(database.Patient).filter(database.Patient.id == p.id).one()
+        self.assertIsNone(p.clinical_context)
+
+    def test_patient_age_none_without_birth_date(self):
+        p = database.get_or_create_patient(self.session, "Profil Ohne Geb")
+        self.assertIsNone(database.patient_age_years(p))
+
+    # ── Temporally aligned cross-biomarker detection ────────────────────────
+
+    def test_cross_pattern_requires_same_report(self):
+        """CK abnormal in 2023 and Troponin abnormal in 2025 must NOT produce
+        the cardiac pattern — the two values were never measured together."""
+        from analyzer import _detect_cross_biomarker_patterns
+        p = database.get_or_create_patient(self.session, "Zeitlich Getrennt")
+        self._add_report(p, "ck2023", datetime(2023, 1, 1),
+                         [("CK gesamt", 900.0, "U/l", 0, 200, True)])
+        self._add_report(p, "trop2025", datetime(2025, 6, 1),
+                         [("Troponin T", 0.5, "ng/ml", 0, 0.014, True)])
+        flags = _detect_cross_biomarker_patterns(self.session, p.id)
+        cardiac = [f for f in flags if "Herzinfarkt" in f.description]
+        self.assertEqual(cardiac, [], "Values from different reports must not correlate")
+
+    def test_cross_pattern_dates_the_matching_report(self):
+        """A pattern that matches in two reports fires once, from the newest,
+        and its description carries the shared measurement date."""
+        from analyzer import _detect_cross_biomarker_patterns
+        p = database.get_or_create_patient(self.session, "Zwei Muster")
+        self._add_report(p, "alt", datetime(2023, 1, 1),
+                         [("CK gesamt", 500.0, "U/l", 0, 200, True),
+                          ("Troponin T", 0.2, "ng/ml", 0, 0.014, True)])
+        self._add_report(p, "neu", datetime(2025, 6, 1),
+                         [("CK gesamt", 700.0, "U/l", 0, 200, True),
+                          ("Troponin T", 0.3, "ng/ml", 0, 0.014, True)])
+        flags = _detect_cross_biomarker_patterns(self.session, p.id)
+        cardiac = [f for f in flags if "Herzinfarkt" in f.description]
+        self.assertEqual(len(cardiac), 1, "Only the most recent match is reported")
+        self.assertIn("Gemeinsam gemessen am 01.06.2025:", cardiac[0].description)
+        self.assertIn("CK gesamt = 700.0 U/l", cardiac[0].description)
+
+    def test_cross_pattern_date_translates_to_english(self):
+        from translations import translate_description
+        de = ("⚠️ Herzinfarkt-Muster: Gemeinsam gemessen am 01.06.2025: "
+              "CK gesamt = 500.0 U/l. Gleichzeitige Erhöhung von CK und "
+              "Troponin T.")
+        out = translate_description(de)
+        self.assertIn("Measured together on 01.06.2025:", out)
+        self.assertNotIn("Gemeinsam gemessen am", out)
+
+    # ── Enriched risk-assessment findings ───────────────────────────────────
+
+    def test_build_findings_with_context_adds_numbers(self):
+        from analyzer import _build_findings_with_context, refresh_risk_flags
+        p = database.get_or_create_patient(self.session, "Kontext Patient")
+        # Creatinine rising across three reports, latest far above range.
+        self._add_report(p, "k1", datetime(2023, 1, 1),
+                         [("Kreatinin", 0.9, "mg/dl", 0.7, 1.3, False)])
+        self._add_report(p, "k2", datetime(2024, 1, 1),
+                         [("Kreatinin", 1.6, "mg/dl", 0.7, 1.3, True)])
+        self._add_report(p, "k3", datetime(2025, 1, 1),
+                         [("Kreatinin", 2.6, "mg/dl", 0.7, 1.3, True)])
+        refresh_risk_flags(self.session, llm=None)
+        flags = (
+            self.session.query(database.RiskFlag)
+            .join(database.Report, database.RiskFlag.report_id == database.Report.id)
+            .filter(database.Report.patient_id == p.id)
+            .all()
+        )
+        self.assertTrue(flags)
+        findings = _build_findings_with_context(self.session, flags)
+        self.assertEqual(len(findings), len(flags))
+        crea = [f for f in findings if "Kreatinin" in f["description"]]
+        self.assertTrue(crea)
+        f = crea[0]
+        self.assertEqual(f["value"], 2.6)
+        self.assertEqual(f["ref_low"], 0.7)
+        self.assertEqual(f["ref_high"], 1.3)
+        self.assertEqual(f["n_measurements"], 3)
+        self.assertEqual(f["trend_first"], 0.9)
+        self.assertEqual(f["trend_last"], 2.6)
+        self.assertEqual(f["latest_date"], "01.01.2025")
+
+    def test_assess_risks_prompt_includes_value_context(self):
+        import llm_client
+        captured = {}
+
+        class CapturingCompletions:
+            def create(self, *a, **kw):
+                captured["messages"] = kw.get("messages") or (a[0] if a else None)
+                return _MockLLMResponse('{"risks": []}')
+
+        class CapturingLLM:
+            chat = type("_C", (), {"completions": CapturingCompletions()})()
+
+        findings = [{
+            "category": "critical_value", "description": "Kreatinin: 2.6 mg/dl ...",
+            "value": 2.6, "unit": "mg/dl", "ref_low": 0.7, "ref_high": 1.3,
+            "n_measurements": 3, "trend_first": 0.9, "trend_last": 2.6,
+            "latest_date": "01.01.2025",
+        }]
+        with patch.object(llm_client, "_get_model", return_value="m"), \
+             patch.object(llm_client, "_get_timeout", return_value=30):
+            llm_client.assess_risks(CapturingLLM(), findings, lang="en")
+        user = [m for m in captured["messages"] if m["role"] == "user"][0]["content"]
+        self.assertIn("Value context:", user)
+        self.assertIn("2.6 mg/dl (Ref 0.7–1.3)", user)
+        self.assertIn("+100% above upper limit", user)
+        self.assertIn("3 measurements | Trend 0.9→2.6 (+189%)", user)
+
+    def test_assess_risks_prompt_without_context_unchanged(self):
+        """Findings carrying only category/description render exactly as before."""
+        from llm_client import _format_finding_context
+        self.assertEqual(_format_finding_context({"category": "a", "description": "d"}, "en"), "")
+
+    # ── Precomputed per-biomarker trend summaries ───────────────────────────
+
+    def test_summarize_biomarker_series_de(self):
+        from llm_client import _summarize_biomarker_series
+        series = [
+            (datetime(2023, 1, 3), 0.9, "mg/dl", 0.7, 1.3, False),
+            (datetime(2024, 6, 12), 1.1, "mg/dl", 0.7, 1.3, False),
+            (datetime(2025, 6, 12), 1.35, "mg/dl", 0.7, 1.3, True),
+        ]
+        line = _summarize_biomarker_series(series, "de")
+        self.assertIn("3 Messungen 03.01.2023→12.06.2025", line)
+        self.assertIn("letzter 1.35 (12.06.2025, +4% über Obergrenze, Ref 0.7–1.3)", line)
+        self.assertIn("Trend 0.9→1.35 (+50%)", line)
+        self.assertIn("1/3 außerhalb Referenz", line)
+
+    def test_summarize_biomarker_series_single_measurement(self):
+        from llm_client import _summarize_biomarker_series
+        series = [(datetime(2025, 1, 1), 5.0, "mg/dl", 4.0, 6.0, False)]
+        line = _summarize_biomarker_series(series, "en")
+        self.assertNotIn("Trend", line)
+        self.assertIn("1 measurement", line)
+        self.assertIn("0/1 outside reference range", line)
+
+    # ── Restructured summary prompt: profile + 4-tuple flags ────────────────
+
+    def test_summary_prompt_profile_and_trend_sections(self):
+        from llm_client import build_patient_summary_prompt
+        recent = [
+            (datetime(2024, 1, 1), "Kreatinin", 1.1, "mg/dl", 0.7, 1.3, False),
+            (datetime(2025, 1, 1), "Kreatinin", 2.6, "mg/dl", 0.7, 1.3, True),
+        ]
+        flags = [
+            ("critical_value", "Kreatinin: 2.6 mg/dl", "critical", "Nierenfunktion prüfen"),
+            ("cross_biomarker_correlation", "⚠️ Muster: CK = 500"),
+        ]
+        prompt = build_patient_summary_prompt(
+            "Erika", recent, [], flags, "de",
+            profile={"age": 67, "sex": "f", "clinical_context": "Hypertonie"},
+        )
+        self.assertIn("=== Patientenprofil ===", prompt)
+        self.assertIn("Alter: 67", prompt)
+        self.assertIn("Geschlecht: weiblich", prompt)
+        self.assertIn("Klinischer Kontext (Vorerkrankungen/Medikamente): Hypertonie", prompt)
+        # Per-marker summary line with precomputed trend
+        self.assertIn("Kreatinin (mg/dl): 2 Messungen", prompt)
+        self.assertIn("Trend 1.1→2.6 (+136%)", prompt)
+        # Detail section marks the abnormal latest value
+        self.assertIn("[ABNORMAL]", prompt)
+        # 4-tuple flag renders urgency + explanation; cross pattern is a hint
+        self.assertIn("[critical_value] [critical] Kreatinin: 2.6 mg/dl", prompt)
+        self.assertIn("Einordnung: Nierenfunktion prüfen", prompt)
+        self.assertIn("Regelwerk-Hinweise", prompt)
+        self.assertIn("⚠️ Muster: CK = 500", prompt)
+
+    def test_summary_prompt_english_without_profile(self):
+        from llm_client import build_patient_summary_prompt
+        prompt = build_patient_summary_prompt(
+            "John", [], [], [("trending", "LDL rising")], "en",
+        )
+        self.assertNotIn("=== Patient profile ===", prompt)  # no profile → no section
+        self.assertIn("[trending] LDL rising", prompt)
+        self.assertIn("(none)", prompt)
+
+    # ── Related-marker context for interpretations ──────────────────────────
+
+    def test_get_related_biomarkers(self):
+        self.assertIn("Ferritin", config.get_related_biomarkers("MCV"))
+        # Case-insensitive lookup
+        self.assertIn("Hämoglobin (Hb)", config.get_related_biomarkers("mcv"))
+        self.assertEqual(config.get_related_biomarkers("Nicht Existierend"), [])
+        self.assertEqual(config.get_related_biomarkers(None), [])
+
+    def test_interpretation_prompt_includes_context_lines(self):
+        import llm_client
+        captured = {}
+
+        class CapturingCompletions:
+            def create(self, *a, **kw):
+                captured["messages"] = kw.get("messages") or (a[0] if a else None)
+                return _MockLLMResponse("ok")
+
+        class CapturingLLM:
+            chat = type("_C", (), {"completions": CapturingCompletions()})()
+
+        d = datetime(2025, 1, 1)
+        with patch.object(llm_client, "_get_model", return_value="m"), \
+             patch.object(llm_client, "_get_timeout", return_value=30):
+            llm_client.generate_biomarker_interpretation(
+                CapturingLLM(), "MCV", "fl", [(d, 72.0, 80.0, 100.0)], lang="de",
+                context_lines=["Ferritin = 8.0 ng/ml (Ref 30-400) [ABNORMAL] (01.01.2025)"],
+            )
+        user = [m for m in captured["messages"] if m["role"] == "user"][0]["content"]
+        self.assertIn("Aktuelle Werte klinisch verwandter Marker", user)
+        self.assertIn("Ferritin = 8.0 ng/ml (Ref 30-400) [ABNORMAL] (01.01.2025)", user)
+
+    def test_related_context_lines_from_db(self):
+        from llm_jobs import _related_context_lines
+        p = database.get_or_create_patient(self.session, "Kontext Interpretation")
+        self._add_report(p, "e1", datetime(2025, 1, 1),
+                         [("MCV", 72.0, "fl", 80, 100, True),
+                          ("Ferritin", 8.0, "ng/ml", 30, 400, True)])
+        lines = _related_context_lines(self.session, p.id, "MCV")
+        joined = "\n".join(lines)
+        self.assertIn("Ferritin = 8.0 ng/ml (Ref 30.0-400.0) [ABNORMAL]", joined)
+        # Markers the patient never measured are simply absent.
+        self.assertNotIn("Vitamin B12", joined)
+        # A marker without configured relations yields no context.
+        self.assertEqual(_related_context_lines(self.session, p.id, "Nicht Existierend"), [])
+
+
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""
     if TEST_DIR.exists():
@@ -4673,6 +4956,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityParsing))
     suite.addTests(loader.loadTestsFromTestCase(TestApplyDataQualityFinding))
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityJob))
+    suite.addTests(loader.loadTestsFromTestCase(TestHealthInsightPipeline))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

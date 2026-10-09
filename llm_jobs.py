@@ -30,11 +30,12 @@ from datetime import datetime, timedelta
 import streamlit as st
 
 import config
+from sqlalchemy import func
 from database import (
     Patient, Report, DataPoint, RiskFlag, PatientSummary, BiomarkerInfo,
     get_session, create_llm_job, get_llm_job,
     upsert_biomarker_info, backfill_reference_ranges, create_patient_summary,
-    get_registry,
+    get_registry, patient_age_years,
     DataQualityFinding, clear_patient_data_quality_findings,
 )
 from llm_client import (
@@ -266,8 +267,8 @@ def _save_patient_summary(session, patient_id: int, text: str):
 
 
 def _gather_summary_data(session, patient):
-    """Collect recent (2y) + historical data points and risk flags for the
-    summary prompt. Same logic as app._generate_summary_for_patient."""
+    """Collect recent (2y) + historical data points, risk flags and the patient
+    profile for the summary prompt. Same logic as app._generate_summary_for_patient."""
     cutoff = datetime.now() - timedelta(days=2 * 365)
 
     recent_dps = (
@@ -291,13 +292,23 @@ def _gather_summary_data(session, patient):
     historical_data = _collect_historical_data(session, patient.id, cutoff)
 
     rf_rows = (
-        session.query(RiskFlag.category, RiskFlag.description)
+        session.query(RiskFlag.category, RiskFlag.description,
+                      RiskFlag.severity, RiskFlag.explanation)
         .join(Report)
         .filter(Report.patient_id == patient.id)
         .all()
     )
-    risk_data = [(rf.category, rf.description) for rf in rf_rows]
-    return recent_data, historical_data, risk_data
+    _urgency_by_severity = {3: "critical", 2: "long_term"}
+    risk_data = [
+        (rf.category, rf.description, _urgency_by_severity.get(rf.severity), rf.explanation)
+        for rf in rf_rows
+    ]
+    profile = {
+        "age": patient_age_years(patient),
+        "sex": patient.sex,
+        "clinical_context": patient.clinical_context,
+    }
+    return recent_data, historical_data, risk_data, profile
 
 
 def _job_process_pdfs(session, cfg, lang, params):
@@ -323,8 +334,10 @@ def _job_process_pdfs(session, cfg, lang, params):
         if p:
             try:
                 llm = _build_client()
-                recent, historical, risks = _gather_summary_data(session, p)
-                text = generate_patient_summary(llm, p.name, recent, historical, risks, lang)
+                recent, historical, risks, profile = _gather_summary_data(session, p)
+                text = generate_patient_summary(
+                    llm, p.name, recent, historical, risks, lang, profile=profile
+                )
                 if text:
                     _save_patient_summary(session, p.id, text)
             except Exception as e:
@@ -606,8 +619,10 @@ def _job_regen_summary(session, cfg, lang, params):
     _update_progress(session, getattr(_current_job_id_var, "job_id", None),
                      t("msg_generating_summary", lang=lang), 0.1)
     llm = _build_client()
-    recent, historical, risks = _gather_summary_data(session, p)
-    text = generate_patient_summary(llm, p.name, recent, historical, risks, lang)
+    recent, historical, risks, profile = _gather_summary_data(session, p)
+    text = generate_patient_summary(
+        llm, p.name, recent, historical, risks, lang, profile=profile
+    )
     if not text:
         return "error", t("error_summary_generation", lang=lang)
     _save_patient_summary(session, p.id, text)
@@ -681,6 +696,65 @@ def _job_bulk_descriptions(session, cfg, lang, params):
     return _bulk_result(ok, len(items), errors, "msg_all_descriptions_generated", lang)
 
 
+def _related_context_lines(session, patient_id: int, cname: str) -> list[str]:
+    """Latest values of clinically related markers, for the interpretation prompt.
+
+    config.RELATED_BIOMARKERS lists which markers belong to the same panel;
+    a single marker interpreted in isolation cannot be judged correctly
+    (low MCV with low ferritin vs. normal ferritin are different pictures).
+    Returns [] when the marker has no configured relations or the patient has
+    no matching measurements.
+    """
+    related = config.get_related_biomarkers(cname)
+    if not related:
+        return []
+    rows = (
+        session.query(
+            DataPoint.canonical_name,
+            DataPoint.value,
+            DataPoint.unit,
+            DataPoint.ref_low,
+            DataPoint.ref_high,
+            Report.report_date,
+        )
+        .join(Report, DataPoint.report_id == Report.id)
+        .filter(
+            Report.patient_id == patient_id,
+            func.lower(DataPoint.canonical_name).in_([r.lower() for r in related]),
+            DataPoint.value.isnot(None),
+            DataPoint.is_disabled == False,  # noqa: E712
+        )
+        .order_by(Report.report_date.desc())
+        .all()
+    )
+    latest: dict[str, tuple] = {}
+    for name, value, unit, ref_low, ref_high, rdate in rows:
+        key = name.lower()
+        if key not in latest:  # order_by desc → first hit is the latest
+            latest[key] = (name, value, unit, ref_low, ref_high, rdate)
+    lines = []
+    for r in related:
+        hit = latest.get(r.lower())
+        if hit is None:
+            continue
+        _name, value, unit, ref_low, ref_high, rdate = hit
+        ref_str = ""
+        if ref_low is not None and ref_high is not None:
+            ref_str = f" (Ref {ref_low}-{ref_high})"
+        elif ref_high is not None:
+            ref_str = f" (Ref < {ref_high})"
+        elif ref_low is not None:
+            ref_str = f" (Ref > {ref_low})"
+        abnormal = (
+            (ref_low is not None and value < ref_low)
+            or (ref_high is not None and value > ref_high)
+        )
+        marker = " [ABNORMAL]" if abnormal else ""
+        date_str = rdate.strftime("%d.%m.%Y") if rdate else "?"
+        lines.append(f"{r} = {value} {unit or ''}{ref_str}{marker} ({date_str})")
+    return lines
+
+
 def _job_bulk_interpretations(session, cfg, lang, params):
     patient_id = params.get("patient_id")
     items = _patient_biomarkers(session, patient_id)
@@ -704,7 +778,10 @@ def _job_bulk_interpretations(session, cfg, lang, params):
             .all()
         )
         dp_tuples = [(rd, dp.value, dp.ref_low, dp.ref_high) for dp, rd in dp_rows]
-        return generate_biomarker_interpretation(llm_, cname, unit, dp_tuples, lang)
+        context_lines = _related_context_lines(session, patient_id, cname)
+        return generate_biomarker_interpretation(
+            llm_, cname, unit, dp_tuples, lang, context_lines=context_lines
+        )
 
     ok, errors = _run_bulk(
         session, patient_id, llm, items, "interpretation",
@@ -773,7 +850,10 @@ def _job_gen_interpretation(session, cfg, lang, params):
     dp_tuples = [(rd, dp.value, dp.ref_low, dp.ref_high) for dp, rd in rows]
 
     llm = _build_client()
-    text = generate_biomarker_interpretation(llm, cname, unit, dp_tuples, lang)
+    text = generate_biomarker_interpretation(
+        llm, cname, unit, dp_tuples, lang,
+        context_lines=_related_context_lines(session, patient_id, cname),
+    )
     if not text:
         return "error", t("error_summary_generation", lang=lang)
     upsert_biomarker_info(session, patient_id, cname, interpretation=text)

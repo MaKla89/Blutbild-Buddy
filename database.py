@@ -108,6 +108,13 @@ class Patient(Base):
     name_normalized = Column(String(255), nullable=False, index=True, default="")
     created_at = Column(DateTime, default=datetime.utcnow)
     favorites = Column(Text, nullable=True)
+    # Demographics feed the LLM prompts: reference ranges are age- and
+    # sex-dependent, and "overall health" reasoning is impossible without them.
+    birth_date = Column(DateTime, nullable=True)
+    sex = Column(String(10), nullable=True)  # "m" | "f" | "d" | None
+    # Free-text clinical context (conditions, medication, symptoms) — optional,
+    # user-maintained, injected verbatim into summary/interpretation prompts.
+    clinical_context = Column(Text, nullable=True)
 
     reports = relationship("Report", back_populates="patient", cascade="all, delete-orphan")
 
@@ -326,6 +333,7 @@ def init_db():
     _migrate_llm_jobs(engine)
     _migrate_data_quality_findings(engine)
     _migrate_fix_implausible_ref_ranges(engine)
+    _migrate_patient_demographics(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -473,6 +481,29 @@ def _migrate_data_quality_findings(engine):
     tables = inspector.get_table_names()
     if "data_quality_findings" not in tables:
         DataQualityFinding.__table__.create(engine)
+
+
+def _migrate_patient_demographics(engine):
+    """Add birth_date / sex / clinical_context to patients (LLM context).
+
+    Reference ranges are age- and sex-dependent, so the summary and risk
+    assessment prompts need these to reason about overall health. All three
+    columns are nullable — existing patients simply have no profile yet.
+    """
+    inspector = inspect(engine)
+    columns = [c["name"] for c in inspector.get_columns("patients")]
+    missing = {
+        col: ddl for col, ddl in (
+            ("birth_date", "ALTER TABLE patients ADD COLUMN birth_date DATETIME"),
+            ("sex", "ALTER TABLE patients ADD COLUMN sex VARCHAR(10)"),
+            ("clinical_context", "ALTER TABLE patients ADD COLUMN clinical_context TEXT"),
+        ) if col not in columns
+    }
+    if missing:
+        with engine.connect() as conn:
+            for ddl in missing.values():
+                conn.execute(text(ddl))
+            conn.commit()
 
 
 def _migrate_fix_implausible_ref_ranges(engine):
@@ -1023,6 +1054,16 @@ def merge_patients(session: SASession, source_patient_id: int, target_patient_id
             info.patient_id = target_patient_id
             infos_moved += 1
 
+    # Inherit demographics from the source when the target has none — the
+    # merged data belongs to one physical person, and silently losing the
+    # profile would degrade the LLM prompts.
+    if target.birth_date is None and source.birth_date is not None:
+        target.birth_date = source.birth_date
+    if not target.sex and source.sex:
+        target.sex = source.sex
+    if not target.clinical_context and source.clinical_context:
+        target.clinical_context = source.clinical_context
+
     # Delete the source patient — cascade will remove its reports, dps, and flags.
     # We already moved those above, so this is safe.
     session.delete(source)
@@ -1052,6 +1093,42 @@ def get_or_create_patient(session: SASession, name: str) -> Patient:
         session.add(patient)
         session.flush()
     return patient
+
+
+def update_patient_profile(
+    session: SASession,
+    patient_id: int,
+    birth_date=None,
+    sex: str | None = None,
+    clinical_context: str | None = None,
+) -> bool:
+    """Update a patient's demographic/clinical profile (LLM prompt context).
+
+    Each field is applied only when the corresponding argument is not None,
+    so the UI can update one field without clobbering the others. An empty
+    ``clinical_context`` string clears the field (None means "leave alone").
+    """
+    patient = session.query(Patient).filter(Patient.id == patient_id).first()
+    if patient is None:
+        return False
+    if birth_date is not None:
+        patient.birth_date = birth_date
+    if sex is not None:
+        patient.sex = sex or None
+    if clinical_context is not None:
+        patient.clinical_context = clinical_context.strip() or None
+    session.commit()
+    return True
+
+
+def patient_age_years(patient, reference_date=None) -> int | None:
+    """Age in whole years at ``reference_date`` (default: today), or None."""
+    if patient is None or getattr(patient, "birth_date", None) is None:
+        return None
+    ref = reference_date or datetime.now()
+    bd = patient.birth_date
+    age = ref.year - bd.year - ((ref.month, ref.day) < (bd.month, bd.day))
+    return age if age >= 0 else None
 
 
 def rename_patient(session: SASession, current_name: str, new_name: str) -> bool:

@@ -500,6 +500,96 @@ def get_critical_direction(canonical_name: str | None) -> str:
     return CRITICAL_DIRECTIONS.get(base, "both")
 
 
+# Clinically related biomarker groups. When the LLM interprets ONE biomarker
+# in isolation it cannot tell e.g. microcytic from macrocytic anaemia — the
+# interpretation call therefore also receives the latest values of the
+# markers listed here. Keyed by canonical name (exact case); lookup is
+# case-insensitive. Kept deliberately small (3-6 markers) to bound prompt
+# size for the local model.
+RELATED_BIOMARKERS = {
+    # ── Red blood cell panel ────────────────────────────────────────────────
+    "Hämoglobin (Hb)": ["MCV", "MCH", "Hämatokrit (Hkt)", "Erythrozyten (RBC)", "Ferritin"],
+    "Hämatokrit (Hkt)": ["Hämoglobin (Hb)", "MCV", "Erythrozyten (RBC)"],
+    "Erythrozyten (RBC)": ["Hämoglobin (Hb)", "MCV", "Hämatokrit (Hkt)"],
+    "MCV": ["Hämoglobin (Hb)", "MCH", "MCHC", "Ferritin", "Vitamin B12", "Folsäure"],
+    "MCH": ["MCV", "MCHC", "Hämoglobin (Hb)"],
+    "MCHC": ["MCV", "MCH", "Hämoglobin (Hb)"],
+    "Ferritin": ["Eisen", "Transferrin", "Transferrinsättigung", "CRP", "Hämoglobin (Hb)", "MCV"],
+    "Eisen": ["Ferritin", "Transferrin", "Transferrinsättigung", "Hämoglobin (Hb)", "MCV"],
+    "Transferrin": ["Eisen", "Ferritin", "Transferrinsättigung"],
+    "Transferrinsättigung": ["Eisen", "Ferritin", "Transferrin"],
+    "Vitamin B12": ["Folsäure", "MCV", "Hämoglobin (Hb)"],
+    "Folsäure": ["Vitamin B12", "MCV", "Hämoglobin (Hb)"],
+    # ── White blood cells ───────────────────────────────────────────────────
+    "Leukozyten (WBC)": ["Neutrophile Granulozyten", "Lymphozyten", "CRP"],
+    "Neutrophile Granulozyten": ["Leukozyten (WBC)", "Lymphozyten", "CRP"],
+    "Lymphozyten": ["Leukozyten (WBC)", "Neutrophile Granulozyten", "CRP"],
+    "Thrombozyten (PLT)": ["Leukozyten (WBC)", "Hämoglobin (Hb)", "CRP"],
+    # ── Liver ───────────────────────────────────────────────────────────────
+    "ALT (GPT)": ["AST (GOT)", "Gamma-GT (GGT)", "Alkalische Phosphatase (AP)", "Bilirubin gesamt", "Albumin"],
+    "AST (GOT)": ["ALT (GPT)", "Gamma-GT (GGT)", "Bilirubin gesamt", "Albumin"],
+    "Gamma-GT (GGT)": ["ALT (GPT)", "AST (GOT)", "Alkalische Phosphatase (AP)", "Bilirubin gesamt"],
+    "Alkalische Phosphatase (AP)": ["Gamma-GT (GGT)", "ALT (GPT)", "Bilirubin gesamt", "Calcium"],
+    "Bilirubin gesamt": ["ALT (GPT)", "AST (GOT)", "Gamma-GT (GGT)", "Alkalische Phosphatase (AP)", "Hämoglobin (Hb)"],
+    "Albumin": ["Total Protein", "Kreatinin", "ALT (GPT)", "CRP"],
+    # ── Kidney ──────────────────────────────────────────────────────────────
+    "Kreatinin": ["eGFR (CKD-EPI)", "Harnstoff", "Harnsäure", "Cystatin C", "Albumin"],
+    "eGFR (CKD-EPI)": ["Kreatinin", "Harnstoff", "Cystatin C", "Albumin"],
+    "Harnstoff": ["Kreatinin", "eGFR (CKD-EPI)", "Albumin"],
+    "Harnsäure": ["Kreatinin", "eGFR (CKD-EPI)"],
+    # ── Electrolytes ────────────────────────────────────────────────────────
+    "Natrium": ["Kalium", "Chlorid", "Calcium", "Kreatinin"],
+    "Kalium": ["Natrium", "Calcium", "Kreatinin", "eGFR (CKD-EPI)"],
+    "Calcium": ["Albumin", "Phosphat", "Magnesium", "Vitamin D (25-OH)", "Kreatinin"],
+    "Magnesium": ["Calcium", "Kalium", "Natrium"],
+    "Chlorid": ["Natrium", "Kalium"],
+    "Phosphat": ["Calcium", "Vitamin D (25-OH)", "Kreatinin"],
+    # ── Thyroid ─────────────────────────────────────────────────────────────
+    "TSH basal": ["fT3", "fT4", "TPO-Antikörper", "TRAK"],
+    "fT3": ["TSH basal", "fT4"],
+    "fT4": ["TSH basal", "fT3"],
+    "TPO-Antikörper": ["TSH basal", "fT4", "fT3"],
+    "TRAK": ["TSH basal", "fT4", "fT3"],
+    # ── Metabolic / diabetes ────────────────────────────────────────────────
+    "Glukose (nüchtern)": ["HbA1c (%)", "HbA1c (mmol/mol)", "Insulin (nüchtern)", "Triglyceride"],
+    "HbA1c (%)": ["Glukose (nüchtern)", "HbA1c (mmol/mol)"],
+    "HbA1c (mmol/mol)": ["Glukose (nüchtern)", "HbA1c (%)"],
+    "Insulin (nüchtern)": ["Glukose (nüchtern)", "HbA1c (%)", "C-Peptid"],
+    # ── Lipids ──────────────────────────────────────────────────────────────
+    "Cholesterin gesamt": ["HDL-Cholesterin", "LDL-Cholesterin", "Triglyceride"],
+    "HDL-Cholesterin": ["Cholesterin gesamt", "LDL-Cholesterin", "Triglyceride"],
+    "LDL-Cholesterin": ["Cholesterin gesamt", "HDL-Cholesterin", "Triglyceride"],
+    "Triglyceride": ["Cholesterin gesamt", "HDL-Cholesterin", "LDL-Cholesterin", "Glukose (nüchtern)"],
+    # ── Inflammation ────────────────────────────────────────────────────────
+    "CRP": ["BSG", "IL-6", "Albumin", "Leukozyten (WBC)", "Ferritin"],
+    "BSG": ["CRP", "Albumin", "Leukozyten (WBC)"],
+    "IL-6": ["CRP", "BSG", "Leukozyten (WBC)"],
+    # ── Cardiac / muscle ────────────────────────────────────────────────────
+    "CK gesamt": ["CK-MB", "Troponin T", "Kreatinin"],
+    "CK-MB": ["CK gesamt", "Troponin T"],
+    "Troponin T": ["CK gesamt", "NT-proBNP"],
+    "NT-proBNP": ["Troponin T", "Kreatinin", "Albumin"],
+    # ── Bone / nutrition ────────────────────────────────────────────────────
+    "Vitamin D (25-OH)": ["Calcium", "Phosphat", "Parathormon (PTH)", "Magnesium"],
+}
+
+
+def get_related_biomarkers(canonical_name: str | None) -> list[str]:
+    """Return clinically related canonical biomarker names (may be empty).
+
+    Lookup is case-insensitive so registry variants with different casing still
+    resolve. Returned names are canonical registry names — callers match them
+    against DataPoint.canonical_name case-insensitively.
+    """
+    if not canonical_name:
+        return []
+    name = canonical_name.strip()
+    for key, related in RELATED_BIOMARKERS.items():
+        if key.lower() == name.lower():
+            return list(related)
+    return []
+
+
 RISK_CONFIG = {
     "critical_margin_pct": 20,
     "concerning_trend_pct": 15,

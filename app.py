@@ -7,7 +7,7 @@ import config
 
 from database import (
     init_db, get_session, Patient, Report, DataPoint, RiskFlag,
-    get_latest_patient_summary,
+    get_latest_patient_summary, patient_age_years,
     mark_stale_llm_jobs_interrupted,
 )
 from sqlalchemy import func
@@ -103,18 +103,33 @@ def _generate_summary_for_patient(session, patient, llm):
     # overlap with the recent window, capped per biomarker).
     historical_data = _collect_historical_data(session, patient.id, cutoff)
 
-    # Risk flags
+    # Risk flags — include urgency + LLM explanation so the summary agrees
+    # with the Risks tab (same findings, same urgency) instead of re-guessing.
     risk_flags = (
-        session.query(RiskFlag.category, RiskFlag.description)
+        session.query(RiskFlag.category, RiskFlag.description,
+                      RiskFlag.severity, RiskFlag.explanation)
         .join(Report)
         .filter(Report.patient_id == patient.id)
         .all()
     )
-    risk_data = [(rf.category, rf.description) for rf in risk_flags]
+    _urgency_by_severity = {3: "critical", 2: "long_term"}
+    risk_data = [
+        (rf.category, rf.description, _urgency_by_severity.get(rf.severity), rf.explanation)
+        for rf in risk_flags
+    ]
+
+    profile = {
+        "age": patient_age_years(patient),
+        "sex": patient.sex,
+        "clinical_context": patient.clinical_context,
+    }
 
     lang = _get_lang()
     try:
-        return generate_patient_summary(llm, patient.name, recent_data, historical_data, risk_data, lang)
+        return generate_patient_summary(
+            llm, patient.name, recent_data, historical_data, risk_data, lang,
+            profile=profile,
+        )
     except Exception:
         return None
 

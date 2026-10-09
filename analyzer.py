@@ -1,5 +1,5 @@
 import random
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session as SASession
 
@@ -578,7 +578,7 @@ def _get_biomarker_latest_value(session: SASession, patient_id: int, canonical_n
 def _detect_cross_biomarker_patterns(
     session: SASession,
     patient_id: int,
-    latest_report_date: datetime | None,
+    latest_report_date: datetime | None = None,
 ) -> list[RiskFlag]:
     """Detect clinically meaningful patterns across multiple biomarkers.
 
@@ -591,91 +591,146 @@ def _detect_cross_biomarker_patterns(
       - Low TSH + high fT3/fT4 → hyperthyroidism (composite flag)
       - High LDL + low HDL → elevated cardiovascular risk
       - High CRP + high BSG → systemic inflammation
+
+    TEMPORAL ALIGNMENT: a correlation is only meaningful if the markers were
+    measured *together*. The former implementation compared each marker's
+    latest value regardless of when it was measured, so a CK from 2023 could
+    "correlate" with a Troponin from 2025 and produce a pattern the patient
+    never had. Rules are now evaluated per report: every marker condition must
+    match within the SAME report. Only the most recent matching report is
+    reported, and its date is part of the description so the LLM can tell a
+    current pattern from a historical one.
+
+    ``latest_report_date`` is accepted for call-site compatibility but no
+    longer used — the report a pattern matched on is the anchor now.
     """
     flags = []
     rules = RISK_CONFIG.get("cross_biomarker_rules", [])
+    if not rules:
+        return flags
+
+    # Newest first — the first matching report wins. Reports without a date
+    # sort last (SQLite: NULL < any value, so DESC puts NULLs at the end), so
+    # a dated match is always preferred, but dateless reports can still
+    # produce a pattern.
+    reports = (
+        session.query(Report)
+        .filter(Report.patient_id == patient_id)
+        .order_by(Report.report_date.desc())
+        .all()
+    )
+    if not reports:
+        return flags
+
+    # Batch-load every valued data point once and index it by
+    # (report_id, lowered canonical name). Evaluating 12 rules × N reports with
+    # a query each would be needlessly expensive.
+    by_report: dict[int, dict[str, DataPoint]] = {}
+    for dp in (
+        session.query(DataPoint)
+        .join(Report)
+        .filter(
+            Report.patient_id == patient_id,
+            DataPoint.value.isnot(None),
+            DataPoint.is_disabled == False,  # noqa: E712
+        )
+        .all()
+    ):
+        key = (dp.canonical_name or "").strip().lower()
+        if not key:
+            continue
+        slot = by_report.setdefault(dp.report_id, {})
+        # Several measurements of the same marker in one report: keep the one
+        # that actually violates its reference range, so the pattern sees the
+        # abnormal value rather than whichever row happened to come last.
+        existing = slot.get(key)
+        if existing is None or (dp.is_abnormal and not existing.is_abnormal):
+            slot[key] = dp
 
     for rule in rules:
-        marker_results = []
-        all_have_data = True
+        marker_defs = rule["markers"]
 
-        for mdef in rule["markers"]:
-            canonical = mdef["canonical"]
-            condition = mdef["condition"]
+        for report in reports:
+            values = by_report.get(report.id, {})
+            marker_results = []
+            incomplete = False
 
-            value, is_abnormal, rpt_date, ref_low, ref_high = _get_biomarker_latest_value(session, patient_id, canonical)
+            for mdef in marker_defs:
+                canonical = mdef["canonical"]
+                condition = mdef["condition"]
+                dp = values.get(canonical.strip().lower())
 
-            if value is None:
-                # Missing data — treat as "missing" condition match for some rules
-                if condition == "normal_or_missing":
-                    marker_results.append({"canonical": canonical, "condition": condition, "matched": True, "value": None})
+                if dp is None:
+                    # Marker absent from THIS report. Rules that explicitly
+                    # tolerate a missing marker ("normal_or_missing") still
+                    # match; every other condition requires real data, so the
+                    # rule cannot fire on this report.
+                    if condition == "normal_or_missing":
+                        marker_results.append({
+                            "canonical": canonical, "condition": condition,
+                            "matched": True, "value": None, "unit": None,
+                        })
+                        continue
+                    incomplete = True
+                    break
+
+                # "high"/"low" are evaluated against the data point's own
+                # reference bounds (not 0.0 — lab values are positive).
+                if condition == "abnormal":
+                    matched = bool(dp.is_abnormal)
+                elif condition == "normal_or_missing":
+                    matched = not bool(dp.is_abnormal)
+                elif condition == "high":
+                    matched = dp.ref_high is not None and dp.value > dp.ref_high
+                elif condition == "low":
+                    matched = dp.ref_low is not None and dp.value < dp.ref_low
                 else:
-                    all_have_data = False
-                    marker_results.append({"canonical": canonical, "condition": condition, "matched": False, "value": None})
+                    matched = False
+
+                marker_results.append({
+                    "canonical": canonical, "condition": condition,
+                    "matched": matched, "value": float(dp.value),
+                    "unit": dp.unit or "",
+                })
+
+            if incomplete or not all(mr["matched"] for mr in marker_results):
                 continue
 
-            # Determine if the condition matches. "high"/"low" are evaluated against
-            # the data point's own reference bounds (not 0.0 — lab values are positive).
-            matched = False
-            if condition == "abnormal":
-                matched = bool(is_abnormal)
-            elif condition == "normal_or_missing":
-                matched = not bool(is_abnormal)
-            elif condition == "high":
-                matched = ref_high is not None and value > ref_high
-            elif condition == "low":
-                matched = ref_low is not None and value < ref_low
+            desc = _build_cross_biomarker_description(
+                rule, marker_results, report_date=report.report_date
+            )
+            if not desc:
+                continue
 
-            marker_results.append({"canonical": canonical, "condition": condition, "matched": matched, "value": value})
+            severity = 2  # default warning
+            mod = rule.get("severity_modifier", 0)
+            if mod == 1:
+                severity = 3  # upgrade to critical
+            elif mod == -1:
+                severity = 1  # downgrade to info
 
-        if not all_have_data:
-            # If a rule requires specific markers and one is completely missing
-            # (not just normal), skip unless the rule explicitly allows it
-            for mr in marker_results:
-                if mr["value"] is None and mr["condition"] != "normal_or_missing":
-                    continue  # This marker was truly absent, check if rule requires it
-
-        # Check if all conditions are met
-        all_matched = all(mr["matched"] for mr in marker_results)
-        if not all_matched:
-            continue
-
-        # Build description based on rule type
-        desc = _build_cross_biomarker_description(rule, marker_results)
-        if not desc:
-            continue
-
-        severity = 2  # default warning
-        mod = rule.get("severity_modifier", 0)
-        if mod == 1:
-            severity = 3  # upgrade to critical
-        elif mod == -1:
-            severity = 1  # downgrade to info
-
-        flags.append(RiskFlag(
-            data_point_id=None,
-            category=rule.get("category", "cross_biomarker_correlation"),
-            severity=severity,
-            description=desc,
-        ))
-
-    # Set report_id to the latest report for this patient
-    if flags and latest_report_date:
-        latest_report = (
-            session.query(Report.id)
-            .filter(Report.patient_id == patient_id, Report.report_date == latest_report_date)
-            .order_by(Report.id.desc())
-            .first()
-        )
-        if latest_report:
-            for flag in flags:
-                flag.report_id = latest_report.id
+            flags.append(RiskFlag(
+                report_id=report.id,
+                data_point_id=None,
+                category=rule.get("category", "cross_biomarker_correlation"),
+                severity=severity,
+                description=desc,
+            ))
+            # One flag per rule, from the most recent matching report. Older
+            # matches would only duplicate the finding with a stale date.
+            break
 
     return flags
 
 
-def _build_cross_biomarker_description(rule: dict, marker_results: list) -> str:
-    """Build a human-readable description for a cross-biomarker pattern."""
+def _build_cross_biomarker_description(rule: dict, marker_results: list, report_date=None) -> str:
+    """Build a human-readable description for a cross-biomarker pattern.
+
+    ``report_date`` dates the pattern: the values below were measured
+    *together*, which is what makes the correlation meaningful. Without the
+    date, a downstream LLM cannot tell a simultaneous acute pattern from two
+    unrelated historical outliers.
+    """
     template = rule.get("description_template", "")
     rule_name = rule.get("name", "Korrelationsmuster")
 
@@ -684,14 +739,17 @@ def _build_cross_biomarker_description(rule: dict, marker_results: list) -> str:
     for mr in marker_results:
         canonical = mr["canonical"]
         value = mr["value"]
+        unit = mr.get("unit") or ""
         condition = mr["condition"]
 
         if value is not None:
-            matched_info.append(f"{canonical} = {value}")
+            matched_info.append(f"{canonical} = {value} {unit}".strip())
         else:
             matched_info.append(f"{canonical} = nicht gemessen")
 
     info_str = ", ".join(matched_info)
+    if report_date is not None:
+        info_str = f"Gemeinsam gemessen am {report_date:%d.%m.%Y}: {info_str}"
 
     # German descriptions for known patterns
     descriptions = {
@@ -951,6 +1009,81 @@ def refresh_patient_risk_flags(session: SASession, patient_id: int) -> int:
     return len(flags)
 
 
+def _build_findings_with_context(session: SASession, flags: list[RiskFlag]) -> list[dict]:
+    """Build the findings list for the LLM risk ranking, enriched with numbers.
+
+    The ranking prompt used to contain category + description text only, so
+    the LLM had to guess how far a value is from its reference range from
+    prose. This adds the latest measurement (value/unit/refs), the number of
+    measurements and the first→last trend per flagged biomarker, batch-loaded
+    in a few queries.
+    """
+    findings = [{"category": f.category, "description": f.description} for f in flags]
+
+    # (patient_id, canonical_name) -> latest valued, non-disabled data point
+    # plus a chronological series, for every marker a flag points at.
+    marker_keys: set[tuple[int, str]] = set()
+    flag_marker: dict[int, tuple[int, str]] = {}
+    for i, flag in enumerate(flags, start=1):
+        dp = flag.data_point
+        if dp is None or not dp.canonical_name:
+            continue
+        report = session.query(Report).filter(Report.id == dp.report_id).first()
+        if report is None or report.patient_id is None:
+            continue
+        key = (report.patient_id, dp.canonical_name)
+        marker_keys.add(key)
+        flag_marker[i] = key
+    if not marker_keys:
+        return findings
+
+    patient_ids = {pid for pid, _name in marker_keys}
+    names = {name for _pid, name in marker_keys}
+    rows = (
+        session.query(
+            Report.patient_id,
+            DataPoint.canonical_name,
+            Report.report_date,
+            DataPoint.value,
+            DataPoint.unit,
+            DataPoint.ref_low,
+            DataPoint.ref_high,
+        )
+        .join(Report, DataPoint.report_id == Report.id)
+        .filter(
+            Report.patient_id.in_(patient_ids),
+            DataPoint.canonical_name.in_(names),
+            DataPoint.is_disabled.is_(False),
+            DataPoint.value.isnot(None),
+        )
+        .all()
+    )
+    series: dict[tuple[int, str], list] = {}
+    for pid, name, rdate, value, unit, ref_low, ref_high in rows:
+        series.setdefault((pid, name), []).append((rdate, value, unit, ref_low, ref_high))
+
+    for key, entries in series.items():
+        entries.sort(key=lambda r: r[0] or datetime.min)
+
+    for i, finding in enumerate(findings, start=1):
+        key = flag_marker.get(i)
+        entries = series.get(key) if key else None
+        if not entries:
+            continue
+        _d, value, unit, ref_low, ref_high = entries[-1]
+        finding["value"] = value
+        finding["unit"] = unit
+        finding["ref_low"] = ref_low
+        finding["ref_high"] = ref_high
+        finding["n_measurements"] = len(entries)
+        finding["trend_first"] = entries[0][1]
+        finding["trend_last"] = entries[-1][1]
+        latest_date = entries[-1][0]
+        if latest_date is not None:
+            finding["latest_date"] = latest_date.strftime("%d.%m.%Y")
+    return findings
+
+
 def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) -> int:
     """Rebuild all risk flags and let the LLM rank + explain them.
 
@@ -972,7 +1105,7 @@ def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) ->
 
     ranked: list[RiskFlag] | None = None
     if llm and flags:
-        findings_data = [{"category": f.category, "description": f.description} for f in flags]
+        findings_data = _build_findings_with_context(session, flags)
         from llm_client import assess_risks
         try:
             risks = assess_risks(llm, findings_data, lang=lang)

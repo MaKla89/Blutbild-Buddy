@@ -1,5 +1,7 @@
 import json
 import threading
+from datetime import datetime
+
 from openai import OpenAI
 from PIL import Image
 
@@ -924,40 +926,64 @@ def suggest_merge_targets(llm: OpenAI, groups: list[dict], canonical_names: list
 
 PATIENT_SUMMARY_SYSTEM_PROMPT_DE = """Du bist ein erfahrener Arzt, der die Gesundheitszusammenfassung eines Patienten erstellst.
 
-Deine Aufgabe: Erstelle eine prägnante, zusammenhängende Zusammenfassung des Gesundheitszustands des Patienten basierend auf dessen Laborbefunden.
+Deine Aufgabe: Erstelle eine strukturierte, zusammenhängende Beurteilung des GESAMTEN Gesundheitszustands auf Basis der Laborbefunde. Kreuzprüfe die Marker miteinander: Ein einzelner Wert ist selten aussagekräftig — die Kombination mehrerer Marker entscheidet.
+
+EINGABEDATEN:
+- Patientenprofil (Alter, Geschlecht, Vorerkrankungen/Medikamente) — soweit vorhanden. Referenzbereiche sind alters- und geschlechtsabhängig; ordne Werte entsprechend ein (z.B. Hb, Kreatinin, eGFR, Ferritin). Ein bereitgestellter klinischer Kontext (z.B. "L-Thyroxin") verändert die Interpretation deutlich — beziehe ihn ein.
+- Pro Biomarker ein vorberechneter Verlauf: Anzahl der Messungen, letzter Wert mit Datum, Abweichung vom Referenzbereich, Trend (erste→letzte Messung), Anzahl der Messungen außerhalb des Referenzbereichs. Nutze diese Signale, statt selbst zu schätzen.
+- "Vom System erkannte Muster": Hinweise eines Regelwerks, KEINE unfehlbare Diagnose. Prüfe jedes Muster an den Rohdaten: Stützen die Werte das Muster (gleicher Bericht, plausible Werte)? Wenn nicht, erwähne es kritisch statt es blind zu übernehmen. Identifiziere AKTIV weitere Korrelationen, die das Regelwerk nicht nennt (z.B. MCV+Hb+Ferritin für Anämie-Ursache, Neutrophile/Lymphozyten, Albumin+Kreatinin, Eisen+Ferritin+CRP, GGT+ALP+Bilirubin).
+- Risikomarkierungen mit Dringlichkeit (critical = aktueller Wert akut problematisch, long_term = Beobachtung).
 
 WICHTIGE REGELN:
-- Die Zusammenfassung soll 100-200 Wörter umfassen, maximal 250 Wörter.
-- Fokussiere dich auf die letzten 2 Jahre der Befunde, betrachte aber auch den Langzeitverlauf auffälliger Werte.
-- PRIORISIERE die Sektion "Kreuz-Biomarker-Muster": Diese wurden vom System als klinisch relevante Korrelationen identifiziert (z.B. CK + Troponin für Herzmuskelverletzung, TSH + fT3/fT4 für Schilddrüsenfunktionsstörung, LDL + HDL für kardiovaskuläres Risiko). Vertraue diesen vorab erkannten Mustern und beziehe sie zentral in die Zusammenfassung ein.
-- Verbinde zusätzlich eigenständig die Punkte zwischen verschiedenen Biomarkern: Identifiziere gemeinsame Ursachen oder zugrunde liegende Probleme (z.B. niedriges Eisen + hohes Ferritin = mögliche Eisenmangelanämie mit Entzündung).
-- Hebe besorgniserregende Tendenzen hervor.
-- Stütze jede Aussage strikt auf die vorliegenden Messwerte: Erfinde oder unterstelle keine Werte, Trends, Diagnosen oder Zustände, die nicht durch die gegebenen Daten belegt sind. Liegen zu wenige Messungen für eine belastbare Trendaussage vor (oder wurde kein Langzeitverlauf bereitgestellt), sage dies ausdrücklich statt eines Trends zu inferieren.
-- Schließe mit 1-3 konkreten, praxisnahen Empfehlungen für den Patienten als nächstes zu tun ab.
-- Schreibe auf Deutsch.
-- Verwende eine professionelle, aber verständliche Sprache. Keine Panikmache, aber klar über Risiken aufklären.
-- Die Empfehlungen sollen patientenorientiert sein (z.B. "Bitte lassen Sie... in Ihrer nächsten Arztvisite prüfen lassen", "Besprechen Sie mit Ihrem Arzt...", nicht "verschreiben Sie...")."""
+- Stütze jede Aussage strikt auf die vorliegenden Messwerte: Erfinde oder unterstelle keine Werte, Trends, Diagnosen oder Zustände, die nicht durch die gegebenen Daten belegt sind. Formuliere Verdachtsdiagnosen als Möglichkeit ("passt zu", "vereinbar mit"), nie als Gewissheit. Liegen zu wenige Messungen für eine belastbare Trendaussage vor, sage dies ausdrücklich statt eines Trends zu inferieren.
+- Sicherheitsregel: Wenn der NEUESTE Wert eines Markers akut kritisch ist (weit außerhalb des Referenzbereichs oder als critical markiert), stelle dies an den Anfang und empfehle eine zeitnahe ärztliche Abklärung. Beurteile Dringlichkeit nach dem neuesten Wert, nicht nach historischen Extremen.
+- Betone besorgniserregende Tendenzen, aber nenne ebenso Beruhigendes: welche Systeme sind unauffällig oder gebessert? Eine Gesamtbilanz ohne die gesunden Befunde ist irreführend.
+- Keine Panikmache, aber klar über Risiken aufklären.
+- Schreibe auf Deutsch in professioneller, aber für Laien verständlicher Sprache.
+- Empfehlungen sind patientenorientiert ("Bitte lassen Sie ... bei der nächsten Arztvisite prüfen", "Besprechen Sie mit Ihrem Arzt ..."), niemals Dosierungs- oder Verschreibungsempfehlungen.
+
+ANTWORTFORMAT (Markdown, gesamt 150-300 Wörter):
+## Gesamtbild
+1-2 Sätze: der wichtigste Gesamteindruck des Gesundheitszustands.
+## Systembefunde
+Ein Absatz pro Organsystem/Markergruppe mit Daten (z.B. Blutbild, Schilddrüse, Stoffwechsel, Lipide, Niere, Leber, Elektrolyte, Entzündung) — nur Systeme mit Daten. Je: Status (unauffällig / auffällig / gebessert / verschlechtert) + belegende Werte + ggf. Kreuzkorrelation.
+## Trends & Verlauf
+Nur belegbare Trends; bei dünner Datenlage explizit sagen.
+## Empfehlungen
+1-3 konkrete nächste Schritte (arztorientiert)."""
 
 PATIENT_SUMMARY_SYSTEM_PROMPT_EN = """You are an experienced physician creating a health summary for a patient.
 
-Your task: Create a concise, coherent summary of the patient's health status based on their lab results.
+Your task: Create a structured, coherent assessment of the OVERALL health status based on the lab results. Cross-examine the markers against each other: a single value is rarely meaningful — the combination of markers decides.
+
+INPUT DATA:
+- Patient profile (age, sex, conditions/medication) where available. Reference ranges depend on age and sex; interpret values accordingly (e.g. Hb, creatinine, eGFR, ferritin). Provided clinical context (e.g. "levothyroxine") changes interpretation substantially — use it.
+- Per biomarker a precomputed course: measurement count, latest value with date, deviation from the reference range, trend (first→last measurement), count of measurements outside the reference range. Use these signals instead of estimating yourself.
+- "System-detected patterns": hints from a rule engine, NOT infallible diagnoses. Check each pattern against the raw data: do the values support it (same report, plausible values)? If not, mention it critically instead of adopting it blindly. ACTIVELY identify further correlations the rule set does not name (e.g. MCV+Hb+ferritin for anemia cause, neutrophils/lymphocytes, albumin+creatinine, iron+ferritin+CRP, GGT+ALP+bilirubin).
+- Risk flags with urgency (critical = current value acutely problematic, long_term = observation).
 
 IMPORTANT RULES:
-- The summary should be 100-200 words, maximum 250 words.
-- Focus on the last 2 years of results, but also consider the long-term trend of abnormal values.
-- PRIORITIZE the "Cross-Biomarker Patterns" section: These have been identified by the system as clinically relevant correlations (e.g., CK + Troponin for myocardial injury, TSH + fT3/fT4 for thyroid dysfunction, LDL + HDL for cardiovascular risk). Trust these pre-detected patterns and feature them prominently in the summary.
-- Additionally connect the dots between individual biomarkers: identify common causes or underlying issues (e.g., low iron + high ferritin = possible iron deficiency anemia with inflammation).
-- Highlight concerning trends.
-- Base every statement strictly on the provided measurements: do not invent or assume values, trends, diagnoses, or conditions that are not supported by the given data. If there are too few measurements to establish a trend (or no long-term history is provided), say so explicitly instead of inferring one.
-- Conclude with 1-3 concrete, practical recommendations for the patient on what to do next.
-- Write in English.
-- Use professional yet accessible language. Avoid panic but clearly communicate risks.
-- Recommendations should be patient-oriented (e.g., "Please ask your doctor to check... at your next visit", "Discuss with your physician...", not "prescribe...")."""
+- Base every statement strictly on the provided measurements: do not invent or assume values, trends, diagnoses, or conditions that are not supported by the given data. Phrase suspected diagnoses as possibilities ("consistent with", "compatible with"), never as certainty. If there are too few measurements to establish a trend, say so explicitly instead of inferring one.
+- Safety rule: if the LATEST value of a marker is acutely critical (far outside the reference range or flagged critical), lead with it and recommend prompt medical evaluation. Judge urgency by the latest value, not by historical extremes.
+- Highlight concerning trends, but also state what is reassuring: which systems are unremarkable or improved? An overall picture without the healthy findings is misleading.
+- Avoid panic but clearly communicate risks.
+- Write in English, professional yet accessible to laypeople.
+- Recommendations should be patient-oriented ("Please ask your doctor to check... at your next visit", "Discuss with your physician..."), never dosage or prescribing advice.
+
+ANSWER FORMAT (Markdown, 150-300 words total):
+## Overall picture
+1-2 sentences: the most important overall impression of the health status.
+## Findings by system
+One paragraph per organ system / marker group with data (e.g. blood count, thyroid, metabolism, lipids, kidney, liver, electrolytes, inflammation) — only systems with data. Each: status (unremarkable / abnormal / improved / worsening) + supporting values + cross-correlations if any.
+## Trends & course
+Only supportable trends; explicitly note thin data.
+## Recommendations
+1-3 concrete next steps (doctor-oriented)."""
 
 
 RISK_ASSESSMENT_SYSTEM_PROMPT_DE = """Du bist ein erfahrener Arzt, der Laborbefunde eines Patienten bewertet.
 
-Du erhältst eine nummerierte Liste von Risikofindern (Kategorie + Beschreibung). Deine Aufgabe:
+Du erhältst eine nummerierte Liste von Risikofindern (Kategorie + Beschreibung, oft mit Wert-Kontext: aktueller Wert, Referenzbereich, Abweichung, Messanzahl und Trend). Bewerte die Dringlichkeit anhand dieser Zahlen, nicht nur des Beschreibungstextes. Deine Aufgabe:
 1. Wähle die klinisch relevantesten Befunde aus — maximal 10 Risiken insgesamt.
 2. Ordne sie nach Dringlichkeit: Rang 1 = dringendstes Risiko, dann absteigend.
 3. Klassifiziere jedes Risiko als "critical" oder "long_term":
@@ -975,7 +1001,7 @@ Gib NUR gültiges JSON in genau diesem Format zurück, ohne Markdown oder zusät
 
 RISK_ASSESSMENT_SYSTEM_PROMPT_EN = """You are an experienced physician evaluating a patient's lab results.
 
-You will receive a numbered list of risk findings (category + description). Your task:
+You will receive a numbered list of risk findings (category + description, often with a value context: current value, reference range, deviation, measurement count and trend). Judge urgency from these numbers, not from the description text alone. Your task:
 1. Select the most clinically relevant findings — at most 10 risks in total.
 2. Rank them by urgency: rank 1 = most urgent risk, then descending.
 3. Classify each risk as "critical" or "long_term":
@@ -1012,13 +1038,52 @@ def _normalize_urgency(value) -> str | None:
     return None
 
 
+def _format_finding_context(finding: dict, lang: str) -> str:
+    """Render optional numeric context of a candidate finding for the ranking prompt.
+
+    Returns '' when the finding carries no context keys (older callers).
+    """
+    bits = []
+    value = finding.get("value")
+    if value is not None:
+        unit = finding.get("unit") or ""
+        ref_low = finding.get("ref_low")
+        ref_high = finding.get("ref_high")
+        item = f"{value} {unit}".strip()
+        if ref_low is not None and ref_high is not None:
+            item += f" (Ref {ref_low}–{ref_high})"
+        dev = _fmt_deviation(value, ref_low, ref_high, lang)
+        if dev:
+            item += dev
+        bits.append(item)
+    if finding.get("n_measurements"):
+        n = finding["n_measurements"]
+        first, last = finding.get("trend_first"), finding.get("trend_last")
+        if n >= 2 and first is not None and last is not None:
+            trend_word = "Trend"
+            pct = f" ({(last - first) / abs(first) * 100:+.0f}%)" if first else ""
+            bits.append(f"{n} Messungen | {trend_word} {first}→{last}{pct}"
+                        if lang == "de"
+                        else f"{n} measurements | {trend_word} {first}→{last}{pct}")
+        else:
+            bits.append(f"{n} Messungen" if lang == "de" else f"{n} measurements")
+    if finding.get("latest_date"):
+        bits.append(str(finding["latest_date"]))
+    return "; ".join(bits)
+
+
 def assess_risks(llm: OpenAI, findings_data: list[dict], lang: str | None = None) -> list[dict]:
     """Ask the LLM to find, rank and explain up to 10 risks from candidate findings.
 
     Args:
         llm: OpenAI-compatible client.
-        findings_data: List of {"category": str, "description": str} in input order
-            (1-based index = position in this list).
+        findings_data: List of dicts in input order (1-based index = position).
+            Required keys: "category", "description". Optional context keys
+            ("value", "unit", "ref_low", "ref_high", "latest_date",
+            "n_measurements", "trend_first", "trend_last") are rendered into
+            the prompt: judging urgency from the description text alone is
+            guesswork — the LLM needs the actual numbers, bounds and trend to
+            decide "critical" vs "long_term" reliably.
         lang: 'de' or 'en'.
 
     Returns a list of {"index": int, "urgency": "critical"|"long_term",
@@ -1034,10 +1099,14 @@ def assess_risks(llm: OpenAI, findings_data: list[dict], lang: str | None = None
 
     label_cat = "Kategorie" if lang == "de" else "Category"
     label_desc = "Beschreibung" if lang == "de" else "Description"
-    prompt_parts = [
-        f"{i}. {label_cat}: {f['category']}\n   {label_desc}: {f['description']}"
-        for i, f in enumerate(findings_data, 1)
-    ]
+    label_ctx = "Wert-Kontext" if lang == "de" else "Value context"
+    prompt_parts = []
+    for i, f in enumerate(findings_data, 1):
+        part = f"{i}. {label_cat}: {f['category']}\n   {label_desc}: {f['description']}"
+        ctx = _format_finding_context(f, lang)
+        if ctx:
+            part += f"\n   {label_ctx}: {ctx}"
+        prompt_parts.append(part)
     prompt = "\n\n".join(prompt_parts)
 
     with _llm_semaphore:
@@ -1099,42 +1168,189 @@ def assess_risks(llm: OpenAI, findings_data: list[dict], lang: str | None = None
     return risks
 
 
-def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_flags, lang):
+def _fmt_deviation(value, ref_low, ref_high, lang):
+    """Short human-readable deviation from the reference range, or '' if in range."""
+    if value is None:
+        return ""
+    if ref_high is not None and value > ref_high:
+        if ref_high > 0:
+            dev = (value - ref_high) / ref_high * 100
+            return f" +{dev:.0f}%" + (" über Obergrenze" if lang == "de" else " above upper limit")
+        return " über Obergrenze" if lang == "de" else " above upper limit"
+    if ref_low is not None and value < ref_low:
+        if ref_low > 0:
+            dev = (ref_low - value) / ref_low * 100
+            return f" -{dev:.0f}%" + (" unter Untergrenze" if lang == "de" else " below lower limit")
+        return " unter Untergrenze" if lang == "de" else " below lower limit"
+    return ""
+
+
+def _summarize_biomarker_series(series, lang):
+    """Precompute per-biomarker trend signals from a chronological series.
+
+    ``series`` is a list of (report_date, value, unit, ref_low, ref_high,
+    is_abnormal) tuples for ONE biomarker, oldest first. Returns a compact
+    line the LLM can use directly — small models are unreliable at
+    reconstructing trajectories and doing percentage arithmetic from a flat
+    dump of hundreds of values, so the arithmetic is done here instead.
+
+    Example (de):
+      Kreatinin (mg/dl): 5 Messungen 03.01.2023→12.06.2025 | letzter 1.35
+      (12.06.2025, +15% über Obergrenze, Ref 0.7–1.3) | Trend 0.9→1.35
+      (+50%) | 2/5 Messungen außerhalb Referenz
+    """
+    values = [v for (_d, v, *_r) in series if v is not None]
+    if not values:
+        return ""
+    unit = next((u for (_d, _v, u, *_r) in series if u), "")
+    first_date, last_date = series[0][0], series[-1][0]
+    last_value = values[-1]
+    # Reference bounds of the LATEST measurement — labs reissue ranges and the
+    # current one is what the latest value must be judged against.
+    _ld, _lv, _lu, ref_low, ref_high, _ab = series[-1]
+    n_abn = sum(1 for row in series if row[5])
+
+    d_first = first_date.strftime("%d.%m.%Y") if first_date else "?"
+    d_last = last_date.strftime("%d.%m.%Y") if last_date else "?"
+    ref_str = "—"
+    if ref_low is not None and ref_high is not None:
+        ref_str = f"{ref_low}–{ref_high}"
+    elif ref_high is not None:
+        ref_str = f"< {ref_high}"
+    elif ref_low is not None:
+        ref_str = f"> {ref_low}"
+
+    dev = _fmt_deviation(last_value, ref_low, ref_high, lang)
+    count_word = ("Messung" if len(values) == 1 else "Messungen") if lang == "de" \
+        else ("measurement" if len(values) == 1 else "measurements")
+    parts = [
+        f"{len(values)} {count_word}"
+        + f" {d_first}→{d_last}",
+        ("letzter" if lang == "de" else "latest")
+        + (f" {last_value} ({d_last},{dev}, Ref {ref_str})" if dev
+           else f" {last_value} ({d_last}, Ref {ref_str})"),
+    ]
+    if len(values) >= 2:
+        first_val, last_val = values[0], values[-1]
+        if first_val:
+            pct = (last_val - first_val) / abs(first_val) * 100
+            parts.append(
+                ("Trend" if lang == "de" else "Trend")
+                + f" {first_val}→{last_val} ({pct:+.0f}%)"
+            )
+        else:
+            parts.append(
+                ("Trend" if lang == "de" else "Trend")
+                + f" {first_val}→{last_val}"
+            )
+    parts.append(
+        f"{n_abn}/{len(values)} "
+        + ("außerhalb Referenz" if lang == "de" else "outside reference range")
+    )
+    return " | ".join(parts)
+
+
+def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_flags, lang, profile=None):
     """Build the user prompt for the patient health summary LLM call.
 
     Args:
         patient_name: Patient name
         recent_dps: List of (report_date, canonical_name, value, unit, ref_low, ref_high, is_abnormal) for last 2 years
         historical_dps: List of (report_date, canonical_name, value, unit, ref_low, ref_high, is_abnormal) for chronically abnormal markers
-        risk_flags: List of (category, description) risk flags
+        risk_flags: List of (category, description) tuples, or 4-tuples
+            (category, description, urgency, explanation) as produced by
+            analyzer.refresh_risk_flags() — urgency/explanation let the summary
+            agree with the Risks tab instead of contradicting it.
         lang: 'de' or 'en'
+        profile: optional dict {"age": int|None, "sex": str|None,
+            "clinical_context": str|None} — demographics the LLM needs to
+            interpret age/sex-dependent reference ranges.
     """
     if lang == "de":
         header = f"Gesundheitszusammenfassung für Patient: {patient_name}\n\n"
-        recent_section = "=== Aktuelle Berichte (letzte 2 Jahre) ===\n"
-        historical_section = "\n=== Langzeit-Verlauf chronisch abnormaler Biomarker ===\n"
+        profile_section = "=== Patientenprofil ===\n"
+        recent_section = ("=== Biomarker-Verläufe (letzte 2 Jahre, pro Marker "
+                          "zusammengefasst: Anzahl, letzter Wert, Abweichung, Trend) ===\n")
+        detail_section = "\n=== Letzte Messwerte pro Marker (Details) ===\n"
+        historical_section = "\n=== Langzeit-Verlauf chronisch abnormaler Biomarker (vor 2 Jahren) ===\n"
+        cross_section = "\n=== Vom System erkannte Muster (Regelwerk-Hinweise — an den Rohdaten prüfen, nicht blind übernehmen) ===\n"
         risk_section = "\n=== Risikomarkierungen ===\n"
-        instruction = "Erstelle auf Basis dieser Daten eine zusammenhängende Gesundheitszusammenfassung."
+        instruction = ("Erstelle auf Basis dieser Daten die strukturierte "
+                       "Gesundheitszusammenfassung im vorgegebenen Format.")
+        sex_labels = {"f": "weiblich", "m": "männlich", "d": "divers"}
     else:
         header = f"Health summary for patient: {patient_name}\n\n"
-        recent_section = "=== Recent Reports (last 2 years) ===\n"
-        historical_section = "\n=== Long-term trend of chronically abnormal biomarkers ===\n"
+        profile_section = "=== Patient profile ===\n"
+        recent_section = ("=== Biomarker courses (last 2 years, summarised per marker: "
+                          "count, latest value, deviation, trend) ===\n")
+        detail_section = "\n=== Latest measurement per marker (details) ===\n"
+        historical_section = "\n=== Long-term trend of chronically abnormal biomarkers (older than 2 years) ===\n"
+        cross_section = "\n=== System-detected patterns (rule-engine hints — verify against raw data, do not adopt blindly) ===\n"
         risk_section = "\n=== Risk flags ===\n"
-        instruction = "Based on this data, create a coherent health summary."
+        instruction = "Based on this data, create the structured health summary in the required format."
+        sex_labels = {"f": "female", "m": "male", "d": "diverse"}
 
-    # Format recent data points grouped by report date
-    recent_groups = {}
+    # ── Patient profile section (age / sex / clinical context) ──────────────
+    profile_text = ""
+    if profile:
+        prof_lines = []
+        if profile.get("age") is not None:
+            prof_lines.append(
+                ("Alter: " if lang == "de" else "Age: ") + f"{profile['age']}"
+            )
+        if profile.get("sex") in sex_labels:
+            prof_lines.append(
+                ("Geschlecht: " if lang == "de" else "Sex: ") + sex_labels[profile["sex"]]
+            )
+        if profile.get("clinical_context"):
+            prof_lines.append(
+                ("Klinischer Kontext (Vorerkrankungen/Medikamente): " if lang == "de"
+                 else "Clinical context (conditions/medication): ")
+                + str(profile["clinical_context"]).strip()
+            )
+        if prof_lines:
+            profile_text = profile_section + "\n".join(prof_lines) + "\n"
+
+    # ── Group recent data points per biomarker (chronological) ──────────────
+    # The old prompt dumped every value grouped by report date: for a
+    # multi-year patient that is 1,000+ flat lines the model must reassemble
+    # into trajectories itself. Grouping per biomarker + precomputed signals
+    # serves the cross-examination goal directly and bounds the token count.
+    series_by_marker: dict[tuple[str, str], list] = {}
+    latest_by_marker: dict[tuple[str, str], tuple] = {}
     for rdate, cname, value, unit, ref_low, ref_high, is_abn in recent_dps:
-        date_key = rdate.strftime("%d.%m.%Y") if rdate else "?"
-        if date_key not in recent_groups:
-            recent_groups[date_key] = []
-        abnormal_marker = " [ABNORMAL]" if is_abn else ""
-        ref_str = f" (Ref: {ref_low}-{ref_high} {unit})" if ref_low is not None and ref_high is not None else ""
-        recent_groups[date_key].append(f"  {cname} = {value} {unit}{ref_str}{abnormal_marker}")
+        key = (cname, unit or "")
+        series_by_marker.setdefault(key, []).append(
+            (rdate, value, unit, ref_low, ref_high, is_abn)
+        )
+        prev = latest_by_marker.get(key)
+        if prev is None or (rdate and (prev[0] is None or rdate >= prev[0])):
+            latest_by_marker[key] = (rdate, cname, value, unit, ref_low, ref_high, is_abn)
 
-    recent_text = ""
-    for date_key, entries in sorted(recent_groups.items()):
-        recent_text += f"{date_key}:\n" + "\n".join(entries) + "\n"
+    summary_lines = []
+    for key in sorted(series_by_marker):
+        series = sorted(series_by_marker[key], key=lambda r: r[0] or datetime.min)
+        cname, unit = key
+        line = _summarize_biomarker_series(series, lang)
+        if line:
+            summary_lines.append(f"- {cname}{' (' + unit + ')' if unit else ''}: {line}")
+    recent_text = "\n".join(summary_lines) + "\n" if summary_lines else "(none)\n"
+
+    # ── Compact detail: the latest measurement of every marker ──────────────
+    detail_lines = []
+    for key in sorted(latest_by_marker):
+        rdate, cname, value, unit, ref_low, ref_high, is_abn = latest_by_marker[key]
+        date_str = rdate.strftime("%d.%m.%Y") if rdate else "?"
+        ref_str = ""
+        if ref_low is not None and ref_high is not None:
+            ref_str = f" (Ref: {ref_low}-{ref_high} {unit or ''})".rstrip()
+        elif ref_high is not None:
+            ref_str = f" (Ref: < {ref_high} {unit or ''})".rstrip()
+        elif ref_low is not None:
+            ref_str = f" (Ref: > {ref_low} {unit or ''})".rstrip()
+        marker = " [ABNORMAL]" if is_abn else ""
+        detail_lines.append(f"  {cname} = {value} {unit or ''}{ref_str}{marker} ({date_str})")
+    detail_text = "\n".join(detail_lines) + "\n" if detail_lines else "(none)\n"
 
     # Format historical (chronically abnormal) data
     historical_groups = {}
@@ -1149,35 +1365,48 @@ def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_
         entries = historical_groups[cname]
         historical_text += f"{cname}:\n" + "\n".join(entries) + "\n"
 
-    # Format risk flags — separate cross-biomarker patterns from individual findings
+    # Format risk flags — separate cross-biomarker patterns from individual
+    # findings. Flags may carry the LLM's urgency + clinical explanation from
+    # refresh_risk_flags(); including them keeps the summary consistent with
+    # the Risks tab (same findings, same urgency, no contradiction).
     cross_biomarker_flags = []
     individual_flags = []
-    for category, description in risk_flags:
+    for flag in risk_flags:
+        category, description = flag[0], flag[1]
+        urgency = flag[2] if len(flag) > 2 else None
+        explanation = flag[3] if len(flag) > 3 else None
+        entry = (category, description, urgency, explanation)
         if category == "cross_biomarker_correlation":
-            cross_biomarker_flags.append(description)
+            cross_biomarker_flags.append(entry)
         else:
-            individual_flags.append((category, description))
-
-    if lang == "de":
-        cross_section = "\n=== Kreuz-Biomarker-Muster (klinische Korrelationen) ===\n"
-        risk_section = "\n=== Einzelne Risikomarkierungen ===\n"
-    else:
-        cross_section = "\n=== Cross-Biomarker Patterns (Clinical Correlations) ===\n"
-        risk_section = "\n=== Individual Risk Flags ===\n"
+            individual_flags.append(entry)
 
     # Build cross-biomarker section
     cross_text = ""
-    for desc in cross_biomarker_flags:
+    for _cat, desc, _urg, _expl in cross_biomarker_flags:
         cross_text += f"  ⚠️ {desc}\n"
+    if not cross_text:
+        cross_text = "(none)\n"
 
     # Build individual flags section
     risk_text = ""
-    for category, description in individual_flags:
-        risk_text += f"  [{category}] {description}\n"
+    for category, description, urgency, explanation in individual_flags:
+        line = f"  [{category}]"
+        if urgency:
+            line += f" [{urgency}]"
+        line += f" {description}"
+        risk_text += line + "\n"
+        if explanation:
+            label = "Einordnung" if lang == "de" else "Assessment"
+            risk_text += f"      {label}: {explanation}\n"
+    if not risk_text:
+        risk_text = "(none)\n"
 
     return (
         f"{header}"
+        f"{profile_text}"
         f"{recent_section}{recent_text}"
+        f"{detail_section}{detail_text}"
         f"{historical_section}{historical_text}"
         f"{cross_section}{cross_text}"
         f"{risk_section}{risk_text}"
@@ -1185,7 +1414,7 @@ def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_
     )
 
 
-def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None):
+def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None, profile=None):
     """Generate a patient health summary using the LLM.
 
     Args:
@@ -1193,8 +1422,12 @@ def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk
         patient_name: Patient name
         recent_dps: List of (report_date, canonical_name, value, unit, ref_low, ref_high, is_abnormal)
         historical_dps: List of (report_date, canonical_name, value, unit, ref_low, ref_high, is_abnormal)
-        risk_flags: List of (category, description)
+        risk_flags: List of (category, description) — optionally extended with
+            (urgency, explanation) from the LLM risk assessment
         lang: 'de' or 'en' (defaults to current app language)
+        profile: optional dict {"age", "sex", "clinical_context"} — patient
+            demographics; reference ranges are age/sex dependent, so the LLM
+            needs these to judge values correctly.
 
     Returns:
         The generated summary text, or None on failure.
@@ -1208,7 +1441,7 @@ def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk
         system_prompt = PATIENT_SUMMARY_SYSTEM_PROMPT_EN
 
     user_prompt = build_patient_summary_prompt(
-        patient_name, recent_dps, historical_dps, risk_flags, lang
+        patient_name, recent_dps, historical_dps, risk_flags, lang, profile=profile
     )
 
     with _llm_semaphore:
@@ -1255,6 +1488,7 @@ Berücksichtige:
 - Wie viele Messungen es gibt und wie weit sie zurückreichen
 - Ob Werte außerhalb des Referenzbereichs liegen und wie stark abweichend
 - Klinische Relevanz der gefundenen Muster
+- Falls klinisch verwandte Marker mit angegeben sind: nutze sie zur Einordnung (z.B. MCV + Ferritin bei Anämie, ALT + GGT + Bilirubin bei Leberwerten), aber interpretiere weiterhin nur den genannten Biomarker — die verwandten Werte sind Kontext, nicht Gegenstand der Interpretation
 - Stütze jede Aussage strikt auf die vorliegenden Messwerte: Erfinde oder unterstelle keine Werte, Trends, Diagnosen oder Zustände, die nicht durch die gegebenen Daten belegt sind. Liegen zu wenige Messungen für eine belastbare Trendaussage vor (oder wurde kein Langzeitverlauf bereitgestellt), sage dies ausdrücklich statt eines Trends zu inferieren.
 
 Zeilen mit [ABNORMAL] liegen außerhalb des Referenzbereichs.
@@ -1271,6 +1505,7 @@ Consider:
 - How many measurements exist and how far back they go
 - Whether values are outside the reference range and by how much
 - Clinical relevance of observed patterns
+- If clinically related markers are provided, use them to contextualise (e.g. MCV + ferritin in anaemia, ALT + GGT + bilirubin in liver values) but still interpret only the named biomarker — the related values are context, not the subject of the interpretation
 - Base every statement strictly on the provided measurements: do not invent or assume values, trends, diagnoses, or conditions that are not supported by the given data. If there are too few measurements to establish a trend (or no long-term history is provided), say so explicitly instead of inferring one.
 
 Lines marked [ABNORMAL] are outside the reference range.
@@ -1343,6 +1578,7 @@ def generate_biomarker_interpretation(
     unit: str | None,
     data_points: list[tuple],  # [(report_date, value, ref_low, ref_high), ...]
     lang: str | None = None,
+    context_lines: list[str] | None = None,
 ) -> str | None:
     """Generate a patient-specific medical interpretation of biomarker measurements over time.
 
@@ -1352,6 +1588,12 @@ def generate_biomarker_interpretation(
         unit: Unit of measurement (e.g. 'g/dl')
         data_points: List of (report_date, value, ref_low, ref_high) tuples
         lang: 'de' or 'en'
+        context_lines: optional latest values of clinically related markers
+            (config.RELATED_BIOMARKERS), e.g.
+            ["Ferritin = 8 ng/ml (Ref 30-400) [ABNORMAL] (12.06.2025)"].
+            A single marker in isolation cannot be interpreted correctly
+            (low MCV + low ferritin vs. normal ferritin are different
+            diagnoses), so these anchor the interpretation in the panel.
 
     Returns:
         Generated interpretation text, or None on failure.
@@ -1389,6 +1631,15 @@ def generate_biomarker_interpretation(
         measurements.append(f"  - {label_date}: {date_str}, {label_value}: {value} {unit or ''}, {label_ref}: {ref_str}{marker}")
 
     prompt = header + "\n".join(measurements)
+    if context_lines:
+        ctx_header = (
+            "\n\nAktuelle Werte klinisch verwandter Marker (zur Einordnung — "
+            "nicht selbst Gegenstand der Interpretation):"
+            if lang == "de"
+            else "\n\nLatest values of clinically related markers (context only — "
+            "not the subject of this interpretation):"
+        )
+        prompt += ctx_header + "\n" + "\n".join(f"  - {line}" for line in context_lines)
 
     try:
         with _llm_semaphore:

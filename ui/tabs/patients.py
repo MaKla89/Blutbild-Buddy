@@ -4,11 +4,16 @@ Renders the Patients tab: patient list with report/value counts, rename,
 and merge.
 """
 
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 from sqlalchemy import func
 
-from database import Report, DataPoint, rename_patient, merge_patients, get_session
+from database import (
+    Report, DataPoint, rename_patient, merge_patients, get_session,
+    update_patient_profile,
+)
 from translations import t, _get_lang
 
 
@@ -87,6 +92,59 @@ def render_patients_tab(session, patients):
                 st.error(t("msg_rename_error"))
         elif new_name == selected_for_rename:
             st.info(t("warning_same_name"))
+
+    # Patient profile section (demographics + clinical context).
+    # Feeds the LLM prompts: reference ranges are age/sex dependent and
+    # known conditions/medication change how values must be interpreted.
+    st.divider()
+    st.markdown(f"🧑 **{t('subheader_patient_profile')}**")
+    st.caption(t("caption_patient_profile"))
+
+    profile_name = st.selectbox(
+        t("select_patient"),
+        options=list(patient_options.keys()),
+        key="_profile_patient_select",
+    )
+    profile_patient = next(p for p in patients if p.name == profile_name)
+
+    _SEX_OPTIONS = ["", "f", "m", "d"]
+    _SEX_LABELS = {
+        "": t("sex_none"), "f": t("sex_female"),
+        "m": t("sex_male"), "d": t("sex_diverse"),
+    }
+    col_p1, col_p2 = st.columns(2)
+    with col_p1:
+        birth_val = st.date_input(
+            t("label_birth_date"),
+            value=profile_patient.birth_date.date() if profile_patient.birth_date else None,
+            max_value=datetime.now().date(),
+            key=f"_profile_birth_{profile_patient.id}",
+        )
+    with col_p2:
+        sex_val = st.selectbox(
+            t("label_sex"),
+            options=_SEX_OPTIONS,
+            format_func=lambda s: _SEX_LABELS[s],
+            index=_SEX_OPTIONS.index(profile_patient.sex or ""),
+            key=f"_profile_sex_{profile_patient.id}",
+        )
+    context_val = st.text_area(
+        t("label_clinical_context"),
+        value=profile_patient.clinical_context or "",
+        placeholder=t("placeholder_clinical_context"),
+        height=80,
+        key=f"_profile_context_{profile_patient.id}",
+    )
+    if st.button(t("btn_save"), type="secondary",
+                 width='stretch', key="btn_profile_save"):
+        update_patient_profile(
+            session,
+            profile_patient.id,
+            birth_date=datetime.combine(birth_val, datetime.min.time()) if birth_val else None,
+            sex=sex_val,
+            clinical_context=context_val,
+        )
+        st.success(t("msg_profile_updated"))
 
     # Merge patients section
     st.divider()

@@ -58,6 +58,20 @@ DE = {
     "error_merge_same_patient": "Quell- und Ziel-Patient dürfen nicht identisch sein.",
     "warning_confirm_merge": "⚠️ Achtung: Dies kann nicht rückgängig gemacht werden!",
     "warning_same_name": "Der neue Name ist identisch mit dem alten.",
+
+    # Patient profile (demographics + clinical context for the LLM prompts)
+    "subheader_patient_profile": "Patientenprofil",
+    "caption_patient_profile": "Geburtsdatum, Geschlecht und Vorerkrankungen/Medikamente verbessern die KI-Auswertung — Referenzbereiche sind alters- und geschlechtsabhängig.",
+    "label_birth_date": "Geburtsdatum",
+    "label_sex": "Geschlecht",
+    "sex_none": "—",
+    "sex_female": "weiblich",
+    "sex_male": "männlich",
+    "sex_diverse": "divers",
+    "label_clinical_context": "Vorerkrankungen / Medikamente / Kontext",
+    "placeholder_clinical_context": "z.B. Schilddrüsenunterfunktion (L-Thyroxin 75 µg), Vitamin-D-Mangel …",
+    "msg_profile_updated": "Patientenprofil gespeichert.",
+    "btn_save": "💾 Speichern",
     "warning_invalid_file": "Ungültiger Dateityp — nur PDFs erlaubt",
     "warning_file_too_large": "Datei zu groß",
 
@@ -462,6 +476,20 @@ EN = {
     "error_merge_same_patient": "Source and target patients must be different.",
     "warning_confirm_merge": "⚠️ Warning: This action cannot be undone!",
     "warning_same_name": "The new name is identical to the old one.",
+
+    # Patient profile (demographics + clinical context for the LLM prompts)
+    "subheader_patient_profile": "Patient Profile",
+    "caption_patient_profile": "Birth date, sex and conditions/medication improve the AI analysis — reference ranges depend on age and sex.",
+    "label_birth_date": "Birth date",
+    "label_sex": "Sex",
+    "sex_none": "—",
+    "sex_female": "female",
+    "sex_male": "male",
+    "sex_diverse": "diverse",
+    "label_clinical_context": "Conditions / medication / context",
+    "placeholder_clinical_context": "e.g. hypothyroidism (levothyroxine 75 µg), vitamin D deficiency …",
+    "msg_profile_updated": "Patient profile saved.",
+    "btn_save": "💾 Save",
     "warning_invalid_file": "Invalid file type — only PDFs allowed",
     "warning_file_too_large": "File too large",
 
@@ -876,6 +904,9 @@ _DE_TO_EN_PATTERNS = [
     # ── Cross-biomarker pattern sentences (full-sentence, most specific) ──
     # Whole clinical sentences are translated as a unit so they read naturally
     # instead of word-by-word. These must precede the generic fragments below.
+    # The temporal-alignment prefix names the report the markers share — it is
+    # what makes the correlation meaningful, so it must survive translation.
+    (r"Gemeinsam gemessen am\s+(\d{2}\.\d{2}\.\d{4}):\s", r"Measured together on \1: "),
     (re.escape("Gleichzeitige Erhöhung von CK und Troponin T deutet auf eine Muskelschädigung mit möglicher Beteiligung des Herzmuskels hin. Klinische Korrelation empfohlen."), "Concurrent elevation of CK and Troponin T suggests muscle damage with possible involvement of the heart muscle. Clinical correlation recommended."),
     (re.escape("Isolierte CK-Erhöhung bei normalem Troponin T spricht eher für skelettmuskuläre als für kardiale Ursache."), "Isolated CK elevation with normal Troponin T points more to a skeletal muscle than a cardiac cause."),
     (re.escape("Gleichzeitige Erhöhung von CK-MB und Troponin T ist ein starkes Indiz für eine akute Herzmuskelverletzung. Sofortige klinische Bewertung empfohlen."), "Concurrent elevation of CK-MB and Troponin T is a strong indicator of acute myocardial injury. Immediate clinical assessment recommended."),
