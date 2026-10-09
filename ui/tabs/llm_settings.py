@@ -37,8 +37,16 @@ def render_llm_settings_tab(session):
     dpi_options = [75, 100, 125, 150, 200]
     st.selectbox("DPI", options=dpi_options, format_func=lambda x: f"{x} {'(default)' if x == 150 else ''}", key="pdf_dpi")
 
-    batch_options = [1, 2, 3, 4]
-    st.selectbox(t("label_batch_size"), options=batch_options, format_func=lambda x: f"{x} {'(default)' if x == 1 else ''}", key="pdf_batch_size")
+    # 0 = every page of a report in ONE call ("one report = one LLM call").
+    # Measured on the local endpoint this is both faster and safer than
+    # per-page calls; 1-4 split big reports for weaker models.
+    batch_options = [0, 1, 2, 3, 4]
+    st.selectbox(
+        t("label_batch_size"), options=batch_options,
+        format_func=lambda x: (f"{t('label_batch_all')} (default)" if x == 0
+                               else str(x)),
+        key="pdf_batch_size",
+    )
 
     # Settings are applied live (session state is read on every run) — no save needed.
     st.caption(t("caption_settings_live"))

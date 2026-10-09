@@ -88,7 +88,7 @@ def _capture_config_snapshot() -> dict:
         "model": st.session_state.get("llm_model"),
         "timeout": st.session_state.get("llm_timeout"),
         "dpi": st.session_state.get("pdf_dpi", 150),
-        "batch_size": st.session_state.get("pdf_batch_size", 1),
+        "batch_size": st.session_state.get("pdf_batch_size", 0),
         "lang": _get_lang(),
     }
 
@@ -312,8 +312,11 @@ def _gather_summary_data(session, patient):
 
 
 def _job_process_pdfs(session, cfg, lang, params):
+    def progress(msg, pct):
+        _update_progress(session, getattr(_current_job_id_var, "job_id", None), msg, pct)
+
     processed, errors = process_new_pdfs(
-        session, progress_callback=None,
+        session, progress_callback=progress,
         dpi=cfg.get("dpi"), batch_size=cfg.get("batch_size"),
     )
     if is_job_aborted():

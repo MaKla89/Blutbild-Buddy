@@ -94,14 +94,112 @@ def _is_value_abnormal(value: float | None, ref_low: float | None, ref_high: flo
 
 
 
+_NORMALIZE_CHUNK = 40  # deduplicated name entries per normalization LLM call
+
+
+def _extract_report_pages(llm, b64_pages: list[str], batch_size: int) -> list:
+    """Extract every page of ONE report.
+
+    ``batch_size`` <= 0 → ONE LLM call carrying all pages of the report
+    ("one report = one call"). Measured on the local endpoint: 4 pages in a
+    single request ≈ 60 s, the same 4 pages as 4 separate calls ≈ 200 s —
+    batching is both cheaper and faster, so it is the default.
+    ``batch_size`` >= 1 → that many pages per call, for models that choke on
+    many images at once. A one-page report always uses the single-page call.
+    """
+    if len(b64_pages) == 1:
+        return [extract_page(llm, b64_pages[0])]
+    if batch_size <= 0 or batch_size >= len(b64_pages):
+        return extract_pages_batch(llm, b64_pages)
+    results: list = []
+    for i in range(0, len(b64_pages), batch_size):
+        results.extend(extract_pages_batch(llm, b64_pages[i:i + batch_size]))
+    return results
+
+
+def _apply_global_normalization(
+    session: SASession, llm, entries: list[dict], report_ids: list[int],
+    registry: dict, canonical_names: list[str], progress_callback=None,
+) -> int:
+    """Map extracted names to canonical names in bounded GLOBAL LLM calls.
+
+    Runs AFTER every report has been extracted and committed, so no single
+    request ever carries the whole batch: the deduplicated (name, unit) entries
+    of all newly processed reports are split into chunks of
+    ``_NORMALIZE_CHUNK`` and each chunk gets its own call (the old code sent
+    every entry of every report in one request, which grows unbounded with the
+    number of PDFs and times out). Data points whose canonical name changes get
+    a reference range that came from the registry default re-derived, and their
+    abnormality flag recomputed. Returns the number of updated data points.
+    """
+    if not entries or not report_ids:
+        return 0
+    mappings: list[dict] = []
+    n_chunks = (len(entries) + _NORMALIZE_CHUNK - 1) // _NORMALIZE_CHUNK
+    for ci in range(0, len(entries), _NORMALIZE_CHUNK):
+        if is_job_aborted():
+            break
+        chunk_no = ci // _NORMALIZE_CHUNK + 1
+        if progress_callback:
+            progress_callback(
+                f"Normalizing biomarker names ({chunk_no}/{n_chunks})",
+                0.85 + 0.15 * chunk_no / n_chunks,
+            )
+        try:
+            norm = normalize_names(
+                llm, entries[ci:ci + _NORMALIZE_CHUNK], canonical_names, registry=registry
+            )
+            mappings.extend(norm.mappings)
+        except Exception:
+            # A failed chunk keeps that chunk's deterministic resolution —
+            # strictly better than losing the whole run.
+            continue
+    if not mappings:
+        return 0
+
+    changed = 0
+    dps = session.query(DataPoint).filter(DataPoint.report_id.in_(report_ids)).all()
+    for dp in dps:
+        if not dp.original_name:
+            continue
+        new_canon = _normalize_name(dp.original_name, dp.unit, mappings, canonical_names, registry=registry)
+        if new_canon == dp.canonical_name:
+            continue
+        old_canon = dp.canonical_name
+        dp.canonical_name = new_canon
+        # Only a range that was filled from the registry default (not read off
+        # the PDF) follows the new canonical name; a PDF-provided range stays.
+        d_low, d_high, _du = get_default_ref_range(old_canon, dp.unit, registry=registry)
+        if (dp.ref_low, dp.ref_high) == (d_low, d_high):
+            n_low, n_high, _nu = get_default_ref_range(new_canon, dp.unit, registry=registry)
+            dp.ref_low, dp.ref_high = n_low, n_high
+        dp.is_abnormal = _is_value_abnormal(dp.value, dp.ref_low, dp.ref_high)
+        changed += 1
+    if changed:
+        session.commit()
+    return changed
+
+
 def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False) -> tuple[list[str], list[str]]:
     """Process all unprocessed PDFs in REPORTS_DIR.
+
+    Two phases, so no single LLM request grows with the number of PDFs:
+      Phase 1 — extraction: ONE LLM call per report (all of its pages in one
+        request; ``batch_size`` > 0 splits big reports into page batches).
+        Canonical names are resolved deterministically from the registry and
+        each report is committed immediately, so an abort or restart keeps
+        everything processed so far.
+      Phase 2 — normalization: a global pass over the deduplicated names of all
+        newly processed reports, split into bounded LLM calls, updating the
+        stored data points. Risk assessment and the health summary run
+        afterwards as their own calls (llm_jobs._job_process_pdfs).
 
     Args:
         session: DB session (commits per PDF; rolls back on failure).
         progress_callback: optional callable(msg, pct) for UI/job progress.
         dpi: PDF render DPI; falls back to the app setting (session state).
-        batch_size: pages per LLM call; falls back to the app setting.
+        batch_size: pages per extraction call; 0 = all pages of a report in one
+            call. Falls back to the app setting.
         force: re-extract even when the file hash already exists in the DB.
             The caller must have deleted the old Report rows first (the
             ``file_hash`` unique constraint would otherwise reject the insert);
@@ -123,12 +221,18 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
     if dpi is None:
         dpi = st.session_state.get("pdf_dpi", 100)
     if batch_size is None:
-        batch_size = max(1, st.session_state.get("pdf_batch_size", 3))
+        batch_size = int(st.session_state.get("pdf_batch_size", 0))
+    batch_size = max(0, batch_size)
 
     pdf_dir = Path(REPORTS_DIR)
     pdf_files = sorted(p for p in pdf_dir.glob("*.pdf") if not p.name.startswith("_"))
 
     total = len(pdf_files)
+    # Phase 1 collects the deduplicated (name, unit) entries and the new report
+    # ids so Phase 2 can normalize them in bounded global calls.
+    pending_entries: dict[tuple[str, str], dict] = {}
+    new_report_ids: list[int] = []
+
     for idx, pdf_path in enumerate(pdf_files):
         if is_job_aborted():
             # User aborted the job: stop before starting the next PDF. Partial
@@ -139,12 +243,12 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             existing = session.query(Report).filter(Report.file_hash == fhash).first()
             if existing:
                 if progress_callback:
-                    progress_callback(f"Skipping {pdf_path.name} (duplicate)", (idx + 1) / total)
+                    progress_callback(f"Skipping {pdf_path.name} (duplicate)", (idx + 1) / total * 0.85)
                 continue
 
         try:
             if progress_callback:
-                progress_callback(f"Processing {pdf_path.name} ({idx + 1}/{total})", (idx + 1) / total)
+                progress_callback(f"Processing {pdf_path.name} ({idx + 1}/{total})", (idx + 1) / total * 0.85)
 
             b64_pages = pdf_to_base64_jpeg(pdf_path, dpi=dpi)
 
@@ -153,28 +257,14 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             report_date = None
             panel_type = None
 
-            if batch_size <= 1 or len(b64_pages) <= 1:
-                for b64 in b64_pages:
-                    page_data = extract_page(llm, b64)
-                    if page_data.patient_name and not patient_name:
-                        patient_name = page_data.patient_name
-                    if page_data.report_date and not report_date:
-                        report_date = page_data.report_date
-                    if page_data.panel_type and not panel_type:
-                        panel_type = page_data.panel_type
-                    all_entries.extend(page_data.entries)
-            else:
-                for i in range(0, len(b64_pages), batch_size):
-                    batch = b64_pages[i:i + batch_size]
-                    page_results = extract_pages_batch(llm, batch)
-                    for page_data in page_results:
-                        if page_data.patient_name and not patient_name:
-                            patient_name = page_data.patient_name
-                        if page_data.report_date and not report_date:
-                            report_date = page_data.report_date
-                        if page_data.panel_type and not panel_type:
-                            panel_type = page_data.panel_type
-                        all_entries.extend(page_data.entries)
+            for page_data in _extract_report_pages(llm, b64_pages, batch_size):
+                if page_data.patient_name and not patient_name:
+                    patient_name = page_data.patient_name
+                if page_data.report_date and not report_date:
+                    report_date = page_data.report_date
+                if page_data.panel_type and not panel_type:
+                    panel_type = page_data.panel_type
+                all_entries.extend(page_data.entries)
 
             if not patient_name:
                 parts = pdf_path.stem.split("-")
@@ -183,20 +273,6 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             if not report_date:
                 year_str = pdf_path.stem[:4]
                 report_date = f"{year_str}-01-01" if year_str.isdigit() else None
-
-            # Deduplicate by (name case-insensitive, unit or "") so the LLM
-            # sees units — needed to disambiguate unit-qualified variants.
-            seen: set[tuple[str, str]] = set()
-            raw_entries: list[dict] = []
-            for e in all_entries:
-                if not e.name:
-                    continue
-                key = (e.name.strip().lower(), (e.unit or "").strip())
-                if key in seen:
-                    continue
-                seen.add(key)
-                raw_entries.append({"name": e.name, "unit": e.unit})
-            norm_mapping = normalize_names(llm, raw_entries, canonical_names, registry=registry)
 
             parsed_date = None
             if report_date:
@@ -223,7 +299,9 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             for entry in all_entries:
                 if not entry.name:
                     continue
-                canonical = _normalize_name(entry.name, entry.unit, norm_mapping.mappings, canonical_names, registry=registry)
+                # Deterministic registry resolution only — the LLM name mapping
+                # happens once for ALL reports in Phase 2, not once per PDF.
+                canonical = _normalize_name(entry.name, entry.unit, [], canonical_names, registry=registry)
                 ref_low, ref_high = _parse_reference_range(entry.reference_range)
 
                 # Fallback to default reference ranges (active DB registry) when PDF omits them
@@ -249,7 +327,14 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                 )
                 session.add(dp)
 
+                # Deduplicate by (name case-insensitive, unit or "") so the LLM
+                # sees units — needed to disambiguate unit-qualified variants.
+                key = (entry.name.strip().lower(), (entry.unit or "").strip())
+                if key not in pending_entries:
+                    pending_entries[key] = {"name": entry.name, "unit": entry.unit}
+
             session.commit()
+            new_report_ids.append(report.id)
             processed.append(pdf_path.name)
 
         except Exception as exc:
@@ -257,6 +342,19 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             error_msg = f"{pdf_path.name}: {exc}"
             errors.append(error_msg)
             if progress_callback:
-                progress_callback(f"Error processing {pdf_path.name}", (idx + 1) / total)
+                progress_callback(f"Error processing {pdf_path.name}", (idx + 1) / total * 0.85)
+
+    # Phase 2 — global name normalization in bounded LLM calls (see helper).
+    if new_report_ids and not is_job_aborted():
+        try:
+            _apply_global_normalization(
+                session, llm, list(pending_entries.values()), new_report_ids,
+                registry, canonical_names, progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            # Normalization is a refinement on top of already-committed data —
+            # never fail the whole run for it.
+            session.rollback()
+            errors.append(f"Normalization: {exc}")
 
     return processed, errors

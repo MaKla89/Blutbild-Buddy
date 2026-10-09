@@ -118,6 +118,28 @@ MOCK_NORMALIZATION = {
 }
 
 
+def _fixture_pdf_dir(n_pdfs: int = 1) -> Path:
+    """Create an isolated dir with ``n_pdfs`` minimal PDFs for extractor tests.
+
+    The real REPORTS_DIR is a Docker volume that does not exist in a dev
+    checkout, so extractor tests must not depend on it — they build their own
+    throwaway PDFs and patch extractor.REPORTS_DIR to this dir. The PDF content
+    is irrelevant (extraction is mocked); the files only need to exist so the
+    glob + file_hash steps run.
+    """
+    from fpdf import FPDF
+    d = Path(tempfile.mkdtemp(prefix="bb_reports_"))
+    for i in range(n_pdfs):
+        doc = FPDF(unit="pt", format="A4")
+        for _ in range(2):  # multi-page → exercises the one-call-per-report path
+            doc.add_page()
+            doc.set_font("Helvetica", size=12)
+            doc.set_xy(72, 72)
+            doc.cell(text=f"2024 - Fixture{i} - Blutbild")
+        doc.output(str(d / f"2024 - Fixture{i} - Blutbild.pdf"))
+    return d
+
+
 class TestPDFProcessor(unittest.TestCase):
     """Tests that need a real sample PDF in reports_input/ (gitignored).
 
@@ -210,19 +232,122 @@ class TestExtractorMocked(unittest.TestCase):
     def test_process_new_pdfs(self, mock_batch, mock_norm, mock_extract):
         from schemas import ExtractedPage, NormalizationMapping
         mock_extract.return_value = ExtractedPage(**MOCK_EXTRACTED_PAGE)
-        # Default batch size is 3, so multi-page PDFs take the batch path —
-        # mock it too (one extracted page per input image).
+        # Default batch size is 0 → one call per report carrying all pages.
+        # Mock it to return one extracted page per input image.
         mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**MOCK_EXTRACTED_PAGE) for _ in pages]
         mock_norm.return_value = NormalizationMapping(**MOCK_NORMALIZATION)
 
         from extractor import process_new_pdfs
-        processed, errors = process_new_pdfs(self.session)
-        self.assertGreater(len(processed), 0)
+        pdf_dir = _fixture_pdf_dir(2)
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(processed), 2)
         print(f"  Processed PDFs: {len(processed)}")
 
+        # Each fixture PDF has 2 pages → 2 × 14 mock entries per report.
         dps = self.session.query(database.DataPoint).all()
-        self.assertGreater(len(dps), 5)
+        self.assertEqual(len(dps), 56)
+        # Phase 2 (global normalization) must have applied the LLM mappings.
+        wbc = self.session.query(database.DataPoint).filter_by(canonical_name="Leukozyten (WBC)").all()
+        self.assertEqual(len(wbc), 4)
+        # One extraction call per report (not per page) at the default batch size.
+        self.assertEqual(mock_batch.call_count, 2)
         print(f"  Total data points: {len(dps)}")
+
+
+class TestTwoPhaseExtraction(unittest.TestCase):
+    """Phase 1 = one extraction call per report; Phase 2 = bounded global normalization."""
+
+    def setUp(self):
+        import streamlit as st
+        st.session_state.pdf_dpi = 100
+        st.session_state.pdf_batch_size = 0
+        # Fresh DB per test so file-hash dedup never skips a fixture PDF.
+        self.session = _fresh_db(f"two_phase_{self._testMethodName}.db")
+
+    def tearDown(self):
+        self.session.close()
+
+    @patch("extractor.extract_page")
+    @patch("extractor.normalize_names")
+    @patch("extractor.extract_pages_batch")
+    def test_one_extraction_call_per_report(self, mock_batch, mock_norm, mock_extract):
+        from schemas import ExtractedPage, NormalizationMapping
+        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**MOCK_EXTRACTED_PAGE) for _ in pages]
+        mock_norm.return_value = NormalizationMapping(mappings=[])
+        from extractor import process_new_pdfs
+        pdf_dir = _fixture_pdf_dir(3)  # each fixture PDF has 2 pages
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(processed), 3)
+        # 3 reports × 2 pages, but ONE batch call per report — not per page.
+        self.assertEqual(mock_batch.call_count, 3)
+        # Normalization runs once globally, not once per report.
+        self.assertEqual(mock_norm.call_count, 1)
+
+    @patch("extractor.extract_page")
+    @patch("extractor.normalize_names")
+    @patch("extractor.extract_pages_batch")
+    def test_normalization_is_chunked(self, mock_batch, mock_norm, mock_extract):
+        from schemas import ExtractedPage, NormalizationMapping
+        # 45 unique names → ceil(45 / _NORMALIZE_CHUNK=40) = 2 normalization calls.
+        entries = [{"name": f"Marker {i}", "value": 1.0, "unit": "x", "reference_range": None}
+                   for i in range(45)]
+        page = {"patient_name": "ChunkPatient", "report_date": "2024-01-01",
+                "panel_type": None, "entries": entries}
+        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**page) for _ in pages]
+        mock_norm.return_value = NormalizationMapping(mappings=[])
+        from extractor import process_new_pdfs
+        pdf_dir = _fixture_pdf_dir(1)
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        self.assertEqual(errors, [])
+        self.assertEqual(mock_norm.call_count, 2)
+
+    @patch("extractor.extract_page")
+    @patch("extractor.normalize_names")
+    @patch("extractor.extract_pages_batch")
+    def test_phase2_updates_canonical_and_refs(self, mock_batch, mock_norm, mock_extract):
+        from schemas import ExtractedPage, NormalizationMapping
+        # "FooMarker" is unknown to the registry → phase 1 leaves it unresolved
+        # with no reference range. The phase-2 LLM mapping fixes name + range.
+        page = {"patient_name": "P2", "report_date": "2024-01-01", "panel_type": None,
+                "entries": [{"name": "FooMarker", "value": 6.2, "unit": "%",
+                             "reference_range": None}]}
+        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**page) for _ in pages]
+        mock_norm.return_value = NormalizationMapping(mappings=[
+            {"original": "FooMarker", "unit": "%", "canonical": "HbA1c (%)"}])
+        from extractor import process_new_pdfs
+        pdf_dir = _fixture_pdf_dir(1)
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        self.assertEqual(errors, [])
+        dps = self.session.query(database.DataPoint).all()
+        self.assertTrue(dps)
+        dp = dps[0]
+        self.assertEqual(dp.canonical_name, "HbA1c (%)")
+        # HbA1c (%) default range 4.0–5.7 → 6.2 is abnormal.
+        self.assertEqual((dp.ref_low, dp.ref_high), (4.0, 5.7))
+        self.assertTrue(dp.is_abnormal)
+
+    @patch("extractor.extract_page")
+    @patch("extractor.normalize_names")
+    @patch("extractor.extract_pages_batch")
+    def test_normalization_failure_keeps_extracted_data(self, mock_batch, mock_norm, mock_extract):
+        from schemas import ExtractedPage
+        from llm_client import LLMResponseError
+        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**MOCK_EXTRACTED_PAGE) for _ in pages]
+        mock_norm.side_effect = LLMResponseError("boom")
+        from extractor import process_new_pdfs
+        pdf_dir = _fixture_pdf_dir(1)
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        # Extraction is committed regardless; a failed normalization chunk is
+        # swallowed and keeps the deterministic resolution.
+        self.assertEqual(len(processed), 1)
+        self.assertTrue(self.session.query(database.DataPoint).all())
 
 
 class TestAnalyzer(unittest.TestCase):
@@ -2409,12 +2534,14 @@ class TestOneSidedAbnormality(unittest.TestCase):
         """End-to-end: '<5.0' CRP=5.2 and '<130' LDL=160 must be is_abnormal=True."""
         from schemas import ExtractedPage, NormalizationMapping
         mock_extract.return_value = ExtractedPage(**MOCK_EXTRACTED_PAGE)
-        # Default batch size is 3, so multi-page PDFs take the batch path —
-        # mock it too (one extracted page per input image).
+        # Default batch size is 0 → one call per report carrying all pages.
         mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**MOCK_EXTRACTED_PAGE) for _ in pages]
         mock_norm.return_value = NormalizationMapping(**MOCK_NORMALIZATION)
         from extractor import process_new_pdfs
-        processed, errors = process_new_pdfs(self.session)
+        pdf_dir = _fixture_pdf_dir(1)
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        self.assertEqual(errors, [])
         self.assertGreater(len(processed), 0)
 
         crp = self.session.query(database.DataPoint).filter_by(canonical_name="CRP").first()
@@ -4917,6 +5044,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestPDFProcessor))
     suite.addTests(loader.loadTestsFromTestCase(TestDatabase))
     suite.addTests(loader.loadTestsFromTestCase(TestExtractorMocked))
+    suite.addTests(loader.loadTestsFromTestCase(TestTwoPhaseExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestAnalyzer))
     suite.addTests(loader.loadTestsFromTestCase(TestAnalyzerExtended))
     suite.addTests(loader.loadTestsFromTestCase(TestParseReferenceRange))

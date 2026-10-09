@@ -71,7 +71,7 @@ if "llm_timeout" not in st.session_state:
 if "pdf_dpi" not in st.session_state:
     st.session_state.pdf_dpi = 150
 if "pdf_batch_size" not in st.session_state:
-    st.session_state.pdf_batch_size = 1
+    st.session_state.pdf_batch_size = 0
 
 
 def _generate_summary_for_patient(session, patient, llm):

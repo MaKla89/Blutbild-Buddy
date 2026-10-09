@@ -95,17 +95,23 @@ def _active_job_for(session, kind: str, params: dict | None = None):
 
 
 def _render_job_state(label_key: str, job, button_type: str = "secondary",
-                      width: str | None = None):
+                      width: str | None = None, state_key_prefix: str | None = None):
     """Render the "this job is already running" state: disabled labelled button
     plus a progress bar when the worker reports one.
 
     This is the click feedback for background jobs — without it the button
     looks idle while a worker thread is running, and the user re-clicks.
+
+    ``state_key_prefix`` scopes the widget key to the call site: every tab
+    renders on every rerun, so the same running job surfaced from two tabs
+    (e.g. regen_summary on Overview AND Reports) would otherwise register the
+    same key twice and raise StreamlitDuplicateElementKey.
     """
     kwargs = {} if width is None else {"width": width}
     st.button(
         f"⏳ {t(label_key)} — {t(f'job_status_{job.status}')}",
-        key=f"_job_state_{job.id}", type=button_type, disabled=True, **kwargs,
+        key=f"_job_state_{state_key_prefix or 'shared'}_{job.id}",
+        type=button_type, disabled=True, **kwargs,
     )
     if job.progress_message:
         st.progress(
@@ -147,7 +153,10 @@ def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
     """
     job = _active_job_for(session, kind, params)
     if job is not None:
-        _render_job_state(label_key, job, button_type=button_type, width=width)
+        # The button's own key doubles as the call-site scope for the disabled
+        # state key, keeping both variants of one job kind unique per tab.
+        _render_job_state(label_key, job, button_type=button_type, width=width,
+                          state_key_prefix=key)
         return False
 
     kwargs = {} if width is None else {"width": width}
