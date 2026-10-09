@@ -1024,14 +1024,25 @@ def _build_findings_with_context(session: SASession, flags: list[RiskFlag]) -> l
     # plus a chronological series, for every marker a flag points at.
     marker_keys: set[tuple[int, str]] = set()
     flag_marker: dict[int, tuple[int, str]] = {}
+    # refresh_risk_flags() passes the TRANSIENT flags built by analyze_trends:
+    # they only carry the FK (data_point_id), never the relationship, so
+    # flag.data_point is None on them. Batch-load the DataPoint rows by id.
+    dp_ids = [f.data_point_id for f in flags if f.data_point_id]
+    dp_info: dict[int, tuple[str, int]] = {}
+    if dp_ids:
+        for dp_id, cname, patient_id in (
+            session.query(DataPoint.id, DataPoint.canonical_name, Report.patient_id)
+            .join(Report, DataPoint.report_id == Report.id)
+            .filter(DataPoint.id.in_(dp_ids))
+            .all()
+        ):
+            if cname and patient_id is not None:
+                dp_info[dp_id] = (cname, patient_id)
     for i, flag in enumerate(flags, start=1):
-        dp = flag.data_point
-        if dp is None or not dp.canonical_name:
+        info = dp_info.get(flag.data_point_id) if flag.data_point_id else None
+        if info is None:
             continue
-        report = session.query(Report).filter(Report.id == dp.report_id).first()
-        if report is None or report.patient_id is None:
-            continue
-        key = (report.patient_id, dp.canonical_name)
+        key = (info[1], info[0])
         marker_keys.add(key)
         flag_marker[i] = key
     if not marker_keys:

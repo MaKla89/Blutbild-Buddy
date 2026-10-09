@@ -117,6 +117,10 @@ def render_patients_tab(session, patients):
         birth_val = st.date_input(
             t("label_birth_date"),
             value=profile_patient.birth_date.date() if profile_patient.birth_date else None,
+            # Streamlit's date_input defaults min_value to today-10y — patients
+            # older than 10 would be unselectable ("Date set outside allowed
+            # range"). Set an explicit lower bound.
+            min_value=datetime(1900, 1, 1).date(),
             max_value=datetime.now().date(),
             key=f"_profile_birth_{profile_patient.id}",
         )

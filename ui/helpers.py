@@ -141,7 +141,11 @@ def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
         so the disabled state appears right away instead of after every tab has
         re-rendered;
       * ``preconditions`` is a tuple of (ok: bool, message: str) checks — the
-        first failing one is shown and the job is not submitted;
+        first failing one is shown and the job is not submitted. Evaluated
+        BEFORE the active-job lookup: with params=None the subset match in
+        _active_job_for is vacuous, so a job for ANY patient would otherwise
+        render the disabled "running" state instead of the real reason
+        ("select a patient first") on patient-scoped buttons.
       * ``on_submit`` runs just before the rerun. It must be a callback rather
         than code after the call: ``st.rerun()`` raises, so anything written
         after ``_job_button(...)`` in the caller never executes.
@@ -151,6 +155,13 @@ def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
     raises and the caller's code after this call never runs — which is why
     post-submit side effects go through ``on_submit``.
     """
+    # Preconditions first: a params=None (vacuous) active-job match must not
+    # mask the actual reason the button is unusable (see docstring).
+    for ok, message in preconditions:
+        if not ok:
+            st.warning(message)
+            return False
+
     job = _active_job_for(session, kind, params)
     if job is not None:
         # The button's own key doubles as the call-site scope for the disabled
@@ -165,11 +176,6 @@ def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
     clicked = st.button(t(label_key), key=key, type=button_type, **kwargs)
     if not clicked:
         return False
-
-    for ok, message in preconditions:
-        if not ok:
-            st.warning(message)
-            return False
 
     submitted = submit_job(kind, job_label_key, params=params)
     if submitted is None:

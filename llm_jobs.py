@@ -24,8 +24,11 @@ Worker-thread rules (important):
 """
 
 import json
+import logging
 import threading
 from datetime import datetime, timedelta
+
+_log = logging.getLogger(__name__)
 
 import streamlit as st
 
@@ -130,7 +133,29 @@ def submit_job(kind: str, label_key: str, params: dict | None = None, runner=Non
             with _kind_lock:
                 _active_job_ids.discard(job.id)
     else:
-        threading.Thread(target=_run_job, args=(job.id,), daemon=True).start()
+        try:
+            threading.Thread(target=_run_job, args=(job.id, kind), daemon=True).start()
+        except Exception as e:
+            # Thread creation failed (e.g. OS thread limit): without this the
+            # kind would stay in _active_kinds forever and the row would sit
+            # 'pending' — the kind blocked for the whole process lifetime.
+            with _kind_lock:
+                _active_kinds.discard(kind)
+                _active_job_ids.discard(job.id)
+            try:
+                s = get_session()
+                try:
+                    j = get_llm_job(s, job.id)
+                    if j is not None and j.status == "pending":
+                        j.status = "error"
+                        j.error = f"worker could not start: {e}"
+                        j.finished_at = datetime.utcnow()
+                        s.commit()
+                finally:
+                    s.close()
+            except Exception:
+                _log.exception("could not mark job %s errored after thread start failure", job.id)
+            raise
     return job
 
 
@@ -155,10 +180,16 @@ def abort_job(job_id: int) -> bool:
     return True
 
 
-def _run_job(job_id: int):
-    """Worker entry point: run the job's work function and record the outcome."""
+def _run_job(job_id: int, kind_hint: str = ""):
+    """Worker entry point: run the job's work function and record the outcome.
+
+    ``kind_hint`` is the kind passed by submit_job(): the finally block must
+    release the kind lock even when the DB row vanished before the worker
+    started (job is None → kind never read from the row). Test runners call
+    this as ``runner(job_id)``, so the hint stays optional.
+    """
     session = get_session()
-    kind = ""
+    kind = kind_hint
     lang = "de"  # default; overwritten from the config snapshot below
     try:
         job = get_llm_job(session, job_id)
@@ -214,7 +245,10 @@ def _run_job(job_id: int):
                 j.finished_at = datetime.utcnow()
                 session.commit()
         except Exception:
-            pass
+            # Status write failed (e.g. SQLite lock): the row may stay
+            # 'running' until the next startup stale-marking — log it so the
+            # failure is at least visible in the server output.
+            _log.exception("could not record final status for job %s", job_id)
     finally:
         set_job_config(None)
         _current_job_id_var.job_id = None
@@ -222,6 +256,9 @@ def _run_job(job_id: int):
         clear_job_abort(job_id)
         session.close()
         with _kind_lock:
+            # Unconditional: submit_job() registered the kind BEFORE spawning
+            # this worker, so it must be released even when the job row
+            # vanished and `kind` was never read from it (kind_hint covers).
             if kind:
                 _active_kinds.discard(kind)
             _active_job_ids.discard(job_id)

@@ -267,6 +267,15 @@ def extract_pages_batch(llm: OpenAI, page_images: list[Image.Image] | list[str],
                 f"Refusing to continue with partial data — retry or use batch size 1."
             )
         return results
+    if any(idx is None for idx in indices):
+        # Mixed list: some entries carry page_index, some don't — the response
+        # cannot be verified positionally, and sorted() would raise TypeError
+        # comparing None with int.
+        raise LLMResponseError(
+            f"Batch page extraction returned page_index for only some pages "
+            f"({indices!r}). Refusing to continue with partial data — retry or "
+            f"use batch size 1."
+        )
     if len(results) != len(page_images) or sorted(indices) != expected:
         returned = sorted(i for i in indices if i is not None)
         missing = sorted(set(expected) - set(returned))
