@@ -6,9 +6,16 @@ table every 2 seconds WITHOUT re-running the whole app — cheap, and it keeps
 working while the user sits on any other tab.
 
 When a data-affecting job (see llm_jobs.DATA_AFFECTING_KINDS) transitions
-from pending/running to done/error/interrupted, this tab sets
-``st.session_state._rerun_requested = True`` so main() reloads the data and
-the new results show up in the other tabs.
+from pending/running to done/error/interrupted, this fragment triggers a
+full app rerun (``st.rerun()``) so main() reloads the data and the new
+results show up in the other tabs — the user never has to reload by hand.
+
+Note the deliberate use of ``st.rerun()`` instead of the
+``st.session_state._rerun_requested`` flag used elsewhere: a ``run_every``
+poll re-executes ONLY this fragment, never the rest of the script, so a
+flag set here would sit unconsumed in session state until the user happened
+to click something. An app-scoped ``st.rerun()`` raises out of the fragment
+and is what actually starts the full rerun.
 
 The fragment runs on the main script thread (not in a worker), so reading
 ``st.session_state`` here is safe — the "no session state in workers" rule
@@ -20,6 +27,24 @@ import streamlit as st
 from database import clear_finished_llm_jobs, get_session, list_llm_jobs
 from llm_jobs import DATA_AFFECTING_KINDS, abort_job
 from translations import t
+from ui.helpers import _flash
+
+# Which _flash() keys receive the result message when a job kind finishes.
+# A kind can be started from several tabs, and every tab renders on every
+# rerun, so each entry gets the message. Keys match the flash_key each tab
+# passes to ui.helpers._job_button().
+_FINISH_FLASH_KEYS = {
+    "regen_summary": ("overview_regenerate_summary", "regen_summary"),
+    "gen_description": ("gen_desc",),
+    "gen_interpretation": ("gen_interp",),
+    "process_pdfs": ("process_pdfs",),
+    "reprocess_pdfs": ("reprocess_pdfs",),
+    "refresh_risks": ("refresh_risks",),
+    "bulk_descriptions": ("bulk_desc",),
+    "bulk_interpretations": ("bulk_interp",),
+    "backfill": ("backfill_mapping",),
+    "data_quality_check": ("data_quality_check",),
+}
 
 
 def render_llm_jobs_tab(session):
@@ -41,9 +66,10 @@ def render_llm_jobs_tab(session):
             return
 
         # Transition detection: remember the last-seen status per job id and
-        # request a full app rerun when a data-affecting job finishes.
+        # refresh the app when a data-affecting job finishes.
         prev = dict(st.session_state.get("_llm_job_statuses", {}))
         now = {j.id: j.status for j in jobs}
+        just_finished = []
         for jid, old_status in list(prev.items()):
             new_status = now.get(jid)
             if new_status is None:  # job scrolled out of the list — drop it
@@ -54,8 +80,25 @@ def render_llm_jobs_tab(session):
                     and new_status in ("done", "error", "interrupted")):
                 job = next(j for j in jobs if j.id == jid)
                 if job.kind in DATA_AFFECTING_KINDS:
-                    st.session_state._rerun_requested = True
+                    just_finished.append(job)
+        # Persist the new statuses BEFORE rerunning: otherwise the rerun's
+        # first poll would see the same transition again and rerun forever.
         st.session_state._llm_job_statuses = now
+
+        if just_finished:
+            # Tell the user the job is over (toasts live in the notification
+            # layer, so they survive the rerun below), and queue a result
+            # message for the tab that started the job — the rerun discards
+            # anything rendered in this run, hence _flash().
+            for job in just_finished:
+                st.toast(f"{job.label} — {t(f'job_status_{job.status}')}")
+                if job.status == "done":
+                    # info, not success: the worker's result text already
+                    # carries its own nuance (partial failures included) and the
+                    # toast above shows the ✅/❌ status.
+                    for flash_key in _FINISH_FLASH_KEYS.get(job.kind, ()):
+                        _flash(flash_key, "info", job.result_text or job.label)
+            st.rerun()
 
         for i, job in enumerate(jobs):
             _render_job_row(job)

@@ -18,9 +18,8 @@ from database import (
     get_data_quality_findings, apply_data_quality_finding,
     dismiss_data_quality_finding, clear_resolved_data_quality_findings,
 )
-from llm_jobs import submit_job
 from translations import t
-from ui.helpers import _flash, _show_flash
+from ui.helpers import _flash, _job_button, _show_flash
 
 
 def _fmt_num(v):
@@ -215,27 +214,20 @@ def render_mapping_tab(session, patient, patient_reports):
         # the Berichte-tab button (the kind lock in llm_jobs prevents double
         # execution from either tab).
 
-        @st.fragment
-        def _op_backfill_registry():
-            # Result of the previous click: this run's own message is discarded
-            # by the st.rerun() below, so it is queued via _flash() and shown
-            # here on the following completed run. The work itself runs as a
-            # background job (same kind as the Berichte-tab button — the kind
-            # lock in llm_jobs prevents double execution from either tab).
-            _show_flash("backfill_mapping")
-            if st.button(t("btn_backfill_ref_ranges"), type="secondary", width='stretch'):
-                job = submit_job("backfill", "job_kind_backfill")
-                if job is None:
-                    st.info(t("msg_job_already_running"))
-                else:
-                    _flash("backfill_mapping", "info", t("msg_job_submitted"))
-                st.rerun()
-
         # Contextual backfill: applies registry defaults to missing data points
         # (all patients).
         st.divider()
         st.caption(t("caption_backfill_from_registry"))
-        _op_backfill_registry()
+        # Result of the previous click: queued via _flash() because the helper's
+        # st.rerun() discards anything rendered in the click run.
+        _show_flash("backfill_mapping")
+        _job_button(
+            session,
+            label_key="btn_backfill_ref_ranges", kind="backfill",
+            job_label_key="job_kind_backfill", key="btn_backfill_ref_ranges",
+            flash_key="backfill_mapping",
+            button_type="secondary",
+        )
 
         # --- Data quality check (registry + actual measurements) -----------
         # Feeds the LLM the patient's real data points, so it can flag
@@ -248,21 +240,14 @@ def render_mapping_tab(session, patient, patient_reports):
         st.subheader(t("subheader_data_quality"))
         st.caption(t("caption_data_quality"))
 
-        @st.fragment
-        def _op_data_quality_check(patient_id):
-            _show_flash("data_quality_check")
-            if st.button(t("btn_data_quality_check"), type="primary", width='stretch'):
-                job = submit_job(
-                    "data_quality_check", "job_kind_data_quality_check",
-                    params={"patient_id": patient_id},
-                )
-                if job is None:
-                    st.info(t("msg_job_already_running"))
-                else:
-                    _flash("data_quality_check", "info", t("msg_job_submitted"))
-                st.rerun()
-
-        _op_data_quality_check(patient.id)
+        _show_flash("data_quality_check")
+        _job_button(
+            session,
+            label_key="btn_data_quality_check", kind="data_quality_check",
+            job_label_key="job_kind_data_quality_check", key="btn_data_quality_check",
+            params={"patient_id": patient.id},
+            flash_key="data_quality_check",
+        )
 
         # Render results queued on the previous run. Placed here, OUTSIDE the
         # findings block, so they still show when a finding was just resolved

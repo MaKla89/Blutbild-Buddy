@@ -9,11 +9,9 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-import config
-from database import Report, DataPoint, get_biomarker_info, upsert_biomarker_info, get_session
-from llm_client import _build_client, generate_biomarker_description, generate_biomarker_interpretation
-from translations import t, _get_lang
-from ui.helpers import _flash, _show_flash, _time_range_slider
+from database import Report, DataPoint, get_biomarker_info
+from translations import t
+from ui.helpers import _job_button, _show_flash, _time_range_slider
 
 
 def render_trends_tab(session, patient, patient_reports, min_date, max_date, time_range_key, lang):
@@ -84,41 +82,28 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
             existing_info = get_biomarker_info(session, patient.id, selected_cname)
             desc_text = existing_info.description if existing_info else None
 
-            # --- Description generation (WP5-A) -----------------------------
-            # Self-contained @st.fragment: button + work live together, so a click
-            # re-runs ONLY this fragment. It opens its own DB session via
-            # get_session() (main's session is closed by the time the fragment
-            # re-runs). upsert_biomarker_info commits internally. st.rerun() at the
-            # end escalates to a full app rerun so main reloads existing_info and
-            # shows the new description below — replacing the old flag dance.
-
-            @st.fragment
-            def _op_gen_desc(patient_id, cname, unit):
-                # Result of the previous click: this run's own message is discarded
-                # by the st.rerun() below, so it is queued via _flash() and shown
-                # here on the following completed run.
-                _show_flash("gen_desc")
-                if st.button(t("btn_generate_description"), key="btn_gen_desc", type="primary", width='stretch'):
-                    with get_session() as op_session:
-                        with st.spinner(t("msg_generating_description")):
-                            try:
-                                llm = _build_client()
-                                new_desc = generate_biomarker_description(
-                                    llm, cname, unit,
-                                    config.CANONICAL_BIOMARKERS, _get_lang(),
-                                )
-                                if new_desc:
-                                    upsert_biomarker_info(op_session, patient_id, cname, description=new_desc)
-                                    _flash("gen_desc", "success", t("msg_description_generated"))
-                                else:
-                                    _flash("gen_desc", "error", t("error_summary_generation"))
-                            except Exception as e:
-                                _flash("gen_desc", "error", f"{t('error_summary_generation')}: {e}")
-                    st.rerun()
+            # --- Description generation (WP6-aligned) -----------------------
+            # Was an inline st.spinner() inside a fragment: the LLM call blocked
+            # the whole script for tens of seconds, with no row in the LLM-Jobs
+            # tab and no way to abort. Now a background job via _job_button(), so
+            # this button behaves like every other long-running operation (toast
+            # on submit, disabled "⏳ running" button, progress bar, abort).
+            # When the job finishes, the LLM-Jobs poll fires an app rerun, which
+            # re-queries existing_info above and renders the new description.
+            _show_flash("gen_desc")
 
             col_desc_btn, _ = st.columns([1, 3])
             with col_desc_btn:
-                _op_gen_desc(patient.id, selected_cname, selected_unit)
+                _job_button(
+                    session,
+                    label_key="btn_generate_description",
+                    kind="gen_description", job_label_key="job_kind_gen_description",
+                    key="btn_gen_desc",
+                    params={"patient_id": patient.id,
+                            "canonical_name": selected_cname,
+                            "unit": selected_unit},
+                    flash_key="gen_desc",
+                )
 
             if desc_text:
                 st.markdown(
@@ -175,58 +160,28 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
 
             interp_text = existing_info.interpretation if existing_info else None
 
-            # --- Interpretation generation (WP5-A) --------------------------
-            # Same fragment pattern as description. The interpretation prompt is
-            # built from the data points in the CURRENT time range, so the
-            # fragment re-queries them with its own session using the same date
-            # bounds (passed as args — all hashable scalars) rather than relying
-            # on main's dp_data (whose ORM objects are detached once main's
-            # session closes). st.rerun() refreshes the display below.
-
-            @st.fragment
-            def _op_gen_interp(patient_id, cname, unit, lang_arg, start_date, end_date):
-                # Same flash pattern as the description fragment above.
-                _show_flash("gen_interp")
-                if st.button(t("btn_generate_interpretation"), key="btn_gen_interp", type="primary", width='stretch'):
-                    with get_session() as op_session:
-                        q = (
-                            op_session.query(DataPoint, Report.report_date)
-                            .join(Report)
-                            .filter(
-                                DataPoint.canonical_name == cname,
-                                DataPoint.value.isnot(None),
-                                DataPoint.unit == unit,
-                                DataPoint.is_disabled == False,  # noqa: E712
-                                Report.patient_id == patient_id,
-                            )
-                        )
-                        if start_date is not None:
-                            q = q.filter(Report.report_date >= start_date)
-                        if end_date is not None:
-                            q = q.filter(Report.report_date <= end_date)
-                        rows = q.order_by(Report.report_date).all()
-                        dp_tuples = [
-                            (d.report_date, d.DataPoint.value, d.DataPoint.ref_low, d.DataPoint.ref_high)
-                            for d in rows
-                        ]
-                        with st.spinner(t("msg_generating_interpretation")):
-                            try:
-                                llm = _build_client()
-                                new_interp = generate_biomarker_interpretation(
-                                    llm, cname, unit, dp_tuples, lang_arg,
-                                )
-                                if new_interp:
-                                    upsert_biomarker_info(op_session, patient_id, cname, interpretation=new_interp)
-                                    _flash("gen_interp", "success", t("msg_interpretation_generated"))
-                                else:
-                                    _flash("gen_interp", "error", t("error_summary_generation"))
-                            except Exception as e:
-                                _flash("gen_interp", "error", f"{t('error_summary_generation')}: {e}")
-                    st.rerun()
+            # --- Interpretation generation (WP6-aligned) --------------------
+            # Background job, same pattern as the description above. The time
+            # range the user selected is passed as ISO strings in the job params
+            # (params_json is plain JSON), so the worker reproduces exactly the
+            # window the button was clicked with — it cannot rely on main's
+            # dp_data, which is detached once main's session closes.
+            _show_flash("gen_interp")
 
             col_interp_btn, _ = st.columns([1, 3])
             with col_interp_btn:
-                _op_gen_interp(patient.id, selected_cname, selected_unit, lang, start_date, end_date)
+                _job_button(
+                    session,
+                    label_key="btn_generate_interpretation",
+                    kind="gen_interpretation", job_label_key="job_kind_gen_interpretation",
+                    key="btn_gen_interp",
+                    params={"patient_id": patient.id,
+                            "canonical_name": selected_cname,
+                            "unit": selected_unit,
+                            "start_date": start_date.isoformat() if start_date else None,
+                            "end_date": end_date.isoformat() if end_date else None},
+                    flash_key="gen_interp",
+                )
 
             if interp_text:
                 st.markdown(

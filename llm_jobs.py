@@ -53,7 +53,7 @@ from translations import t, _get_lang
 DATA_AFFECTING_KINDS = {
     "process_pdfs", "reprocess_pdfs", "refresh_risks", "regen_summary",
     "bulk_descriptions", "bulk_interpretations", "backfill",
-    "data_quality_check",
+    "data_quality_check", "gen_description", "gen_interpretation",
 }
 
 # One worker per kind: prevents duplicate submissions of the same operation.
@@ -601,6 +601,10 @@ def _job_regen_summary(session, cfg, lang, params):
     p = session.query(Patient).get(patient_id)
     if p is None:
         return "error", t("error_select_patient", lang=lang)
+    # Early progress message: the Overview button shows this while the (single,
+    # slow) summary LLM call is in flight — without it the job row stays blank.
+    _update_progress(session, getattr(_current_job_id_var, "job_id", None),
+                     t("msg_generating_summary", lang=lang), 0.1)
     llm = _build_client()
     recent, historical, risks = _gather_summary_data(session, p)
     text = generate_patient_summary(llm, p.name, recent, historical, risks, lang)
@@ -707,6 +711,83 @@ def _job_bulk_interpretations(session, cfg, lang, params):
         generate_one=gen_one,
     )
     return _bulk_result(ok, len(items), errors, "msg_all_interpretations_generated", lang)
+
+
+def _job_gen_description(session, cfg, lang, params):
+    """Single-biomarker explanation (Trends tab button).
+
+    Same LLM call as the bulk job, but scoped to one (name, unit) pair so the
+    user gets progress + abort for the one value they are looking at instead of
+    a blocking st.spinner() in the fragment.
+    """
+    patient_id = params.get("patient_id")
+    cname = params.get("canonical_name")
+    unit = params.get("unit")
+    if patient_id is None or not cname:
+        return "error", t("error_select_patient", lang=lang)
+    _update_progress(session, getattr(_current_job_id_var, "job_id", None),
+                     t("msg_generating_description", lang=lang), 0.1)
+    llm = _build_client()
+    text = generate_biomarker_description(
+        llm, cname, unit, config.CANONICAL_BIOMARKERS, lang,
+    )
+    if not text:
+        return "error", t("error_summary_generation", lang=lang)
+    upsert_biomarker_info(session, patient_id, cname, description=text)
+    return "success", t("msg_description_generated", lang=lang)
+
+
+def _job_gen_interpretation(session, cfg, lang, params):
+    """Single-biomarker interpretation (Trends tab button).
+
+    The data-point window is part of the params (ISO date strings — params_json
+    is plain JSON) so the worker reproduces exactly the range the user had
+    selected on the Trends tab when they clicked.
+    """
+    patient_id = params.get("patient_id")
+    cname = params.get("canonical_name")
+    unit = params.get("unit")
+    if patient_id is None or not cname:
+        return "error", t("error_select_patient", lang=lang)
+    _update_progress(session, getattr(_current_job_id_var, "job_id", None),
+                     t("msg_generating_interpretation", lang=lang), 0.1)
+
+    q = (
+        session.query(DataPoint, Report.report_date)
+        .join(Report)
+        .filter(
+            DataPoint.canonical_name == cname,
+            DataPoint.value.isnot(None),
+            DataPoint.unit == unit,
+            DataPoint.is_disabled == False,  # noqa: E712
+            Report.patient_id == patient_id,
+        )
+    )
+    start = _parse_param_date(params.get("start_date"))
+    end = _parse_param_date(params.get("end_date"))
+    if start is not None:
+        q = q.filter(Report.report_date >= start)
+    if end is not None:
+        q = q.filter(Report.report_date <= end)
+    rows = q.order_by(Report.report_date).all()
+    dp_tuples = [(rd, dp.value, dp.ref_low, dp.ref_high) for dp, rd in rows]
+
+    llm = _build_client()
+    text = generate_biomarker_interpretation(llm, cname, unit, dp_tuples, lang)
+    if not text:
+        return "error", t("error_summary_generation", lang=lang)
+    upsert_biomarker_info(session, patient_id, cname, interpretation=text)
+    return "success", t("msg_interpretation_generated", lang=lang)
+
+
+def _parse_param_date(value):
+    """params_json holds plain JSON, so dates arrive as ISO strings."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _job_backfill(session, cfg, lang, params):
@@ -842,6 +923,8 @@ _WORK_FNS = {
     "regen_summary": _job_regen_summary,
     "bulk_descriptions": _job_bulk_descriptions,
     "bulk_interpretations": _job_bulk_interpretations,
+    "gen_description": _job_gen_description,
+    "gen_interpretation": _job_gen_interpretation,
     "backfill": _job_backfill,
     "data_quality_check": _job_data_quality_check,
 }

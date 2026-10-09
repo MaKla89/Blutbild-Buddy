@@ -7,11 +7,12 @@ import config
 
 from database import (
     init_db, get_session, Patient, Report, DataPoint, RiskFlag,
-    get_latest_patient_summary, mark_stale_llm_jobs_interrupted,
+    get_latest_patient_summary,
+    mark_stale_llm_jobs_interrupted,
 )
 from sqlalchemy import func
 from llm_client import generate_patient_summary
-from llm_jobs import submit_job, active_job_ids
+from llm_jobs import active_job_ids
 from translations import t, set_lang, _get_lang
 
 # Shared helpers moved to ui/helpers.py (WP1). Re-exported here so existing
@@ -23,6 +24,7 @@ from ui.helpers import (  # noqa: F401
     _HISTORICAL_MAX_POINTS_PER_BIOMARKER,
     _run_bulk_generation,
     _flash,
+    _job_button,
     _show_flash,
 )
 
@@ -122,23 +124,26 @@ def _render_health_summary(session, patient, t):
 
     Since WP6 the regenerate button submits a background job (llm_jobs)
     instead of blocking the UI — progress is visible in the "LLM-Jobs" tab,
-    and the LLM-Jobs tab triggers a full rerun when the job finishes so the
-    new summary shows up here.
+    and the LLM-Jobs poll fragment fires an app-scope st.rerun() when the
+    job finishes, so the new summary shows up here without a manual reload.
     """
     st.subheader(t("subheader_health_summary"))
 
     # Result of the previous click (queued via _flash, shown on this run).
     _show_flash("overview_regenerate_summary")
 
-    if st.button(t("btn_regenerate_summary"), key="overview_regenerate_summary", type="primary"):
-        job = submit_job(
-            "regen_summary", "job_kind_regen_summary",
-            params={"patient_id": patient.id},
-        )
-        if job is None:
-            st.info(t("msg_job_already_running"))
-        else:
-            _flash("overview_regenerate_summary", "info", t("msg_job_submitted"))
+    # A regen_summary job for THIS patient may already be pending/running — in
+    # this process or started before a page reload. _job_button() detects it in
+    # the DB and renders a disabled "⏳ running" button + progress bar instead of
+    # a live button, so the click registers visibly and cannot double-submit
+    # (the _flash info alone is easy to miss above the fold).
+    _job_button(
+        session,
+        label_key="btn_regenerate_summary", kind="regen_summary",
+        job_label_key="job_kind_regen_summary", key="overview_regenerate_summary",
+        params={"patient_id": patient.id},
+        flash_key="overview_regenerate_summary",
+    )
 
     summary = get_latest_patient_summary(session, patient.id)
 

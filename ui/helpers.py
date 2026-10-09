@@ -9,6 +9,7 @@ Imported by app.py (which re-exports them) and by the ui.tabs.* modules.
 This module must NOT import from app or ui.tabs to avoid circular imports.
 """
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +17,11 @@ import pandas as pd
 import streamlit as st
 
 import config
-from database import Patient, Report, DataPoint, RiskFlag, upsert_biomarker_info
+from database import (
+    Patient, Report, DataPoint, RiskFlag, upsert_biomarker_info,
+    get_active_llm_jobs,
+)
+from llm_jobs import submit_job
 from translations import t
 
 
@@ -68,6 +73,111 @@ def _show_flash(key: str):
     """Pop and render all messages queued by _flash(key, ...) since last run."""
     for level, text in st.session_state.pop(f"_flash_{key}", []):
         getattr(st, level)(text)
+
+
+def _active_job_for(session, kind: str, params: dict | None = None):
+    """The pending/running LlmJob matching ``kind`` and (subset-matched) ``params``.
+
+    Subset matching means a patient-scoped button only sees ITS OWN job: a
+    regen_summary job for another patient must not disable this patient's
+    button. Returns None when nothing is running.
+    """
+    for j in get_active_llm_jobs(session):
+        if j.kind != kind:
+            continue
+        try:
+            jp = json.loads(j.params_json) if j.params_json else {}
+        except Exception:
+            continue
+        if all(jp.get(k) == v for k, v in (params or {}).items()):
+            return j
+    return None
+
+
+def _render_job_state(label_key: str, job, button_type: str = "secondary",
+                      width: str | None = None):
+    """Render the "this job is already running" state: disabled labelled button
+    plus a progress bar when the worker reports one.
+
+    This is the click feedback for background jobs — without it the button
+    looks idle while a worker thread is running, and the user re-clicks.
+    """
+    kwargs = {} if width is None else {"width": width}
+    st.button(
+        f"⏳ {t(label_key)} — {t(f'job_status_{job.status}')}",
+        key=f"_job_state_{job.id}", type=button_type, disabled=True, **kwargs,
+    )
+    if job.progress_message:
+        st.progress(
+            (job.progress_current or 0) / 100.0,
+            # The worker's progress message is already a full sentence — don't
+            # prefix it again.
+            text=job.progress_message,
+        )
+
+
+def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
+                key: str, params: dict | None = None, flash_key: str | None = None,
+                button_type: str = "primary", width: str | None = "stretch",
+                help_key: str | None = None, preconditions: tuple = (),
+                on_submit=None):
+    """One consistent background-job button for every long-running operation.
+
+    Behaviour (identical across the Reports, Mapping, Trends and Overview tabs):
+
+      * while a matching job is pending/running, a disabled "⏳ label — running"
+        button + progress bar is shown instead of the live button, so the click
+        registers visibly and cannot double-submit;
+      * on click, ``submit_job`` spawns a worker and returns immediately — the
+        UI never blocks;
+      * a toast (survives the rerun) plus a ``_flash`` message confirm the
+        submission, and ``st.rerun()`` short-circuits the rest of the script run
+        so the disabled state appears right away instead of after every tab has
+        re-rendered;
+      * ``preconditions`` is a tuple of (ok: bool, message: str) checks — the
+        first failing one is shown and the job is not submitted;
+      * ``on_submit`` runs just before the rerun. It must be a callback rather
+        than code after the call: ``st.rerun()`` raises, so anything written
+        after ``_job_button(...)`` in the caller never executes.
+
+    Returns False when nothing was submitted (job already running, button not
+    clicked, or a precondition failed). When a job IS submitted, ``st.rerun()``
+    raises and the caller's code after this call never runs — which is why
+    post-submit side effects go through ``on_submit``.
+    """
+    job = _active_job_for(session, kind, params)
+    if job is not None:
+        _render_job_state(label_key, job, button_type=button_type, width=width)
+        return False
+
+    kwargs = {} if width is None else {"width": width}
+    if help_key:
+        kwargs["help"] = t(help_key)
+    clicked = st.button(t(label_key), key=key, type=button_type, **kwargs)
+    if not clicked:
+        return False
+
+    for ok, message in preconditions:
+        if not ok:
+            st.warning(message)
+            return False
+
+    submitted = submit_job(kind, job_label_key, params=params)
+    if submitted is None:
+        # Lost a race against another tab/session — the kind lock held.
+        st.info(t("msg_job_already_running"))
+        return False
+    st.toast(t("msg_job_submitted"))
+    if flash_key:
+        _flash(flash_key, "info", t("msg_job_submitted"))
+    if on_submit is not None:
+        on_submit()
+    # st.rerun() raises, so main()'s normal end-of-run session.close() never
+    # runs on this path — release the DB connection here instead of leaking it
+    # per click.
+    session.close()
+    st.rerun()
+
 
 def _time_range_slider(min_date, max_date, value_key, slider_key, label):
     """Robust date-range slider shared by the Overview and Trends tabs.

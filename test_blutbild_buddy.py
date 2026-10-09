@@ -3471,6 +3471,81 @@ class TestLlmJobs(unittest.TestCase):
         with llm_jobs._kind_lock:
             self.assertNotIn("bulk_descriptions", llm_jobs._active_kinds)
 
+    def test_gen_description_single_biomarker(self):
+        import llm_jobs
+        # The Trends-tab single-biomarker explanation job: exactly one LLM call,
+        # scoped to the (name, unit) in params, persisted to BiomarkerInfo.
+        seen = []
+
+        def gen(llm_, name, unit, canonical_list, lang=None):
+            seen.append((name, unit))
+            return f"desc for {name}"
+
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "generate_biomarker_description", side_effect=gen):
+            job = llm_jobs.submit_job(
+                "gen_description", "job_kind_gen_description",
+                params={"patient_id": self.patient.id, "canonical_name": "A", "unit": "mg/l"},
+                runner=llm_jobs._run_job,
+            )
+        self.assertEqual(seen, [("A", "mg/l")])
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done", stored.error)
+        info = database.get_biomarker_info(self.session, self.patient.id, "A")
+        self.assertEqual(info.description, "desc for A")
+
+    def test_gen_interpretation_scopes_to_date_window(self):
+        import llm_jobs
+        # The Trends-tab interpretation job must reproduce the time range the
+        # user had selected — passed as ISO strings in params_json.
+        captured = {}
+
+        def gen(llm_, name, unit, dp_tuples, lang=None):
+            captured["dates"] = [d for (d, *_rest) in dp_tuples]
+            return f"interp for {name}"
+
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "generate_biomarker_interpretation", side_effect=gen):
+            job = llm_jobs.submit_job(
+                "gen_interpretation", "job_kind_gen_interpretation",
+                params={
+                    "patient_id": self.patient.id, "canonical_name": "A", "unit": "mg/l",
+                    "start_date": "2024-01-01T00:00:00", "end_date": "2026-01-01T00:00:00",
+                },
+                runner=llm_jobs._run_job,
+            )
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done", stored.error)
+        # The report (2025-01-01) falls inside the window, so its data point is included.
+        self.assertEqual(captured["dates"], [datetime(2025, 1, 1)])
+        info = database.get_biomarker_info(self.session, self.patient.id, "A")
+        self.assertEqual(info.interpretation, "interp for A")
+
+    def test_gen_interpretation_outside_window_has_no_points(self):
+        import llm_jobs
+        captured = {}
+
+        def gen(llm_, name, unit, dp_tuples, lang=None):
+            captured["n"] = len(dp_tuples)
+            return "interp"
+
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "generate_biomarker_interpretation", side_effect=gen):
+            job = llm_jobs.submit_job(
+                "gen_interpretation", "job_kind_gen_interpretation",
+                params={
+                    "patient_id": self.patient.id, "canonical_name": "A", "unit": "mg/l",
+                    "start_date": "2030-01-01T00:00:00",
+                },
+                runner=llm_jobs._run_job,
+            )
+        self.session.expire_all()
+        _st = database.get_llm_job(self.session, job.id)
+        self.assertEqual(_st.status, "done", _st.error)
+        self.assertEqual(captured["n"], 0)  # window excludes the 2025 report
+
 
 class TestLlmJobAbort(unittest.TestCase):
     """User-initiated job abort (LLM-Jobs tab) + finished-job cleanup."""
