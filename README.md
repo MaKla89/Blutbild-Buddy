@@ -12,6 +12,7 @@ The app is built around **German** lab reports: the biomarker registry, aliases,
 
 - **PDF extraction** — Upload lab report PDFs via the in-app file uploader (or drop them into `reports_input/`) and process them. The app renders each page to an image, sends it to a local LLM (OpenAI-compatible), and extracts structured biomarker data.
 - **Name normalization** — Extracted biomarker names are mapped to canonical names from a built-in master list. You can rename or merge variants later.
+- **Patient profiles** — Store birth date, sex, and free-text clinical context (conditions, medication) per patient. These feed the LLM prompts so summaries and interpretations can account for age- and sex-dependent reference ranges.
 - **Trend charts** — Interactive Plotly line charts showing any biomarker's values over time, with reference ranges overlaid.
 - **Risk flag engine** — Detects critical values, concerning trends, volatility, missing markers, and improvements. Flags are severity-ranked and deduplicated per biomarker.
 - **Health summaries** — The LLM generates a natural-language health summary for each patient based on their data history.
@@ -47,7 +48,7 @@ Severity-ranked risk flags (out-of-range values, concerning trends, cross-biomar
 |------|------|
 | `app.py` | Streamlit UI — sidebar, data tabs (overview / detail / trends / risks / all values) + management tabs (reports / patients / LLM settings / LLM jobs / biomarker mapping), session state management |
 | `llm_jobs.py` | Background LLM job queue: worker threads for long-running ops, kind locks, config snapshots, progress persistence |
-| `extractor.py` | PDF pipeline: hash check → image render → LLM extraction → normalize → DB insert |
+| `extractor.py` | PDF pipeline: hash check → image render → LLM extraction (one call per report) → deterministic + global name normalization → DB insert |
 | `analyzer.py` | Risk flag engine: out-of-range, trending, volatility, missing markers |
 | `llm_client.py` | OpenAI-compatible client calls (extract + normalize + summarize), embedded system prompts |
 | `pdf_processor.py` | pypdfium2 → JPEG images, base64 encoding, SHA-256 hashing |
@@ -146,7 +147,7 @@ The in-app Settings dialog (⚙️) lets you change these at runtime — changes
 All data is stored in `data/blutbild_buddy.db` (SQLite). The schema is:
 
 ```
-Patient (id, name, name_normalized, favorites)
+Patient (id, name, name_normalized, favorites, birth_date, sex, clinical_context)
   └── Report (id, patient_id, filename, file_hash, report_date, panel_type, raw_text)
         ├── DataPoint (id, report_id, canonical_name, original_name, value, unit, ref_low, ref_high, is_abnormal, is_disabled)
         └── RiskFlag (id, report_id, data_point_id, category, severity, rank, description, explanation)
