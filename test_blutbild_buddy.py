@@ -5695,6 +5695,26 @@ class TestChatPersistence(unittest.TestCase):
         # Input is locked while an answer is generating (no double-submit).
         self.assertIn("disabled=pending", src)
 
+    def test_active_conversation_from_state_not_selectbox_return(self):
+        """Regression: clicking "New conversation" switched the picker to the new
+        thread but the next question still landed in the PREVIOUS one, because
+        the send target was derived from the selectbox's return value — which a
+        real browser can report stale (frontend not yet repainted). The active
+        conversation must come from sel_key (the single source of truth), and
+        the selectbox must be a pure view synced to it. AppTest re-derives
+        widget state every run, so it cannot reproduce the stale round-trip —
+        this asserts the invariant at the source level instead."""
+        from pathlib import Path
+        src = Path("ui/tabs/chat.py").read_text(encoding="utf-8")
+        # The conversation is resolved from `selected` (read from sel_key), never
+        # from the selectbox return value.
+        self.assertIn("get_chat_conversation(session, selected)", src)
+        self.assertNotIn("get_chat_conversation(session, choice)", src)
+        # The selectbox return value is not captured into a variable at all.
+        self.assertNotIn("choice = st.selectbox", src)
+        # The picker is synced to sel_key right before rendering (view of state).
+        self.assertIn("st.session_state[widget_key] = selected", src)
+
 
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""

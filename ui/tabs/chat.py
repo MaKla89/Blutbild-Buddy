@@ -246,11 +246,16 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
     # ── Conversation picker (history list, most recently active first) ─────
     patient_id = patient.id
     conversations = list_chat_conversations(session, patient_id)
-    # Two keys: sel_key is plain session state (writable from callbacks AND the
-    # script body), widget_key belongs to the selectbox. Streamlit forbids
-    # writing a *widget* key from the script body once the widget rendered, and
-    # the send path below must be able to select a freshly created
-    # conversation — hence the split, synced by the selectbox's on_change.
+    # sel_key is the SINGLE SOURCE OF TRUTH for the active conversation: plain
+    # session state, readable/writable from the send path and every callback.
+    # widget_key is the selectbox's own key, and the picker is a pure VIEW of
+    # sel_key — the body syncs widget_key = sel_key right before rendering
+    # (legal: before the widget is instantiated), and the selectbox's on_change
+    # writes a manual switch back into sel_key.
+    # `conv` is derived from sel_key, NEVER from the selectbox return value: a
+    # real browser can hand back a stale widget value (the frontend keeps the
+    # previous selection until it repaints), which is exactly the "new
+    # conversation looks selected but the question lands in the old one" bug.
     sel_key = f"chat_conv_{patient.id}"
     widget_key = f"chat_conv_widget_{patient.id}"
     conv = None
@@ -261,31 +266,37 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
         selected = st.session_state.get(sel_key)
         if selected not in ids:
             selected = ids[0]
+            st.session_state[sel_key] = selected
 
         def _remember_conversation():
             st.session_state[sel_key] = st.session_state[widget_key]
 
-        choice = st.selectbox(
+        st.session_state[widget_key] = selected
+        st.selectbox(
             t("chat_conversation_label"), ids, index=ids.index(selected),
             format_func=lambda i: next(
                 (c.title or t("chat_untitled") for c in conversations if c.id == i), ""),
             key=widget_key, on_change=_remember_conversation,
         )
-        conv = get_chat_conversation(session, choice)
+        conv = get_chat_conversation(session, selected)
 
     def _start_new_conversation():
-        # Callback (not body code): popping the selectbox's widget key is only
-        # legal before the widget is instantiated — callbacks run first. Without
-        # the pop the picker would keep showing the old conversation while the
-        # transcript already shows the new empty one.
-        # Own session: callbacks run BEFORE the script body, so the main
-        # run's `session` does not exist yet at this point — and `patient`
-        # comes from the previous run's (closed) session, so only its already
-        # loaded id is safe to touch.
+        # Callback (runs before the body): only sel_key is touched. The body
+        # re-syncs the selectbox to it on the same rerun, so the picker AND the
+        # send target both follow the new conversation immediately.
+        # Own session: the main run's `session` does not exist yet in a
+        # callback, and `patient` is detached from a closed session, so only
+        # its already-loaded id is safe to use.
         with get_session() as s:
+            # Reuse the current conversation if it is still empty — clicking
+            # "New" twice must not litter the history with blank threads.
+            current = st.session_state.get(sel_key)
+            if current is not None \
+                    and get_chat_conversation(s, current) is not None \
+                    and not get_chat_messages(s, current):
+                return
             new_conv = create_chat_conversation(s, patient_id)
-        st.session_state[sel_key] = new_conv.id
-        st.session_state.pop(widget_key, None)
+            st.session_state[sel_key] = new_conv.id
 
     c_new, c_del = st.columns(2)
     c_new.button(t("btn_new_chat"), key=f"chat_new_{patient.id}",
