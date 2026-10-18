@@ -5425,8 +5425,12 @@ class TestChatWithData(unittest.TestCase):
     def test_chat_translation_keys_both_langs(self):
         from translations import DE, EN
         for key in ("tab_chat", "subheader_chat", "caption_chat", "chat_data_context_info",
-                    "chat_input_placeholder", "chat_thinking", "btn_clear_chat",
-                    "chat_no_data", "error_chat_generation", "chat_disclaimer"):
+                    "chat_input_placeholder", "chat_thinking", "chat_no_data",
+                    "chat_disclaimer", "chat_conversation_label", "chat_untitled",
+                    "btn_new_chat", "btn_delete_chat", "chat_no_conversation_hint",
+                    "chat_unanswered_note", "dialog_confirm_delete_chat_title",
+                    "dialog_confirm_delete_chat_text", "job_kind_chat_answer",
+                    "error_chat_no_question", "error_chat_empty_answer"):
             self.assertIn(key, DE)
             self.assertIn(key, EN)
             self.assertNotEqual(DE[key], EN[key])
@@ -5436,6 +5440,260 @@ class TestChatWithData(unittest.TestCase):
         src = Path("app.py").read_text(encoding="utf-8")
         self.assertIn("render_chat_tab", src)
         self.assertIn('t("tab_chat")', src)
+
+
+class TestChatPersistence(unittest.TestCase):
+    """Persisted chat conversations (ChatConversation/ChatMessage) and the
+    background chat_answer job that makes an answer survive tab switches and
+    a page refresh."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = _fresh_db('test_chat_persist.db')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.session.close()
+
+    def test_conversation_crud_roundtrip(self):
+        p = database.get_or_create_patient(self.session, "Persist Patient")
+        conv = database.create_chat_conversation(self.session, p.id, title="Wie ist mein LDL?")
+        self.assertEqual(conv.title, "Wie ist mein LDL?")
+        m1 = database.add_chat_message(self.session, conv.id, "user", "Wie ist mein LDL?")
+        m2 = database.add_chat_message(self.session, conv.id, "assistant", "190 mg/dl.")
+        msgs = database.get_chat_messages(self.session, conv.id)
+        self.assertEqual([m.role for m in msgs], ["user", "assistant"])  # oldest first
+        self.assertEqual([m.id for m in msgs], [m1.id, m2.id])
+        # Title falls back to the first question when the conversation was
+        # created without one.
+        anon = database.create_chat_conversation(self.session, p.id)
+        database.add_chat_message(self.session, anon.id, "user", "Was sagt mein CRP?")
+        self.session.expire_all()
+        self.assertEqual(database.get_chat_conversation(self.session, anon.id).title,
+                         "Was sagt mein CRP?")
+        # Most recently active first.
+        listed = database.list_chat_conversations(self.session, p.id)
+        self.assertEqual([c.id for c in listed][0], anon.id)
+        # Deleting the conversation removes its messages (cascade).
+        self.assertTrue(database.delete_chat_conversation(self.session, anon.id))
+        self.assertEqual(database.get_chat_messages(self.session, anon.id), [])
+        self.assertFalse(database.delete_chat_conversation(self.session, anon.id))
+
+    def test_patient_delete_and_merge_handle_conversations(self):
+        src = database.get_or_create_patient(self.session, "Chat Src")
+        tgt = database.get_or_create_patient(self.session, "Chat Tgt")
+        conv = database.create_chat_conversation(self.session, src.id, title="src chat")
+        database.add_chat_message(self.session, conv.id, "user", "hallo")
+        stats = database.merge_patients(self.session, src.id, tgt.id)
+        self.assertEqual(stats["conversations_moved"], 1)
+        self.session.expire_all()
+        self.assertEqual(database.get_chat_conversation(self.session, conv.id).patient_id,
+                         tgt.id)
+        # Deleting the target drops its conversations via the relationship cascade.
+        target = self.session.query(database.Patient).filter_by(id=tgt.id).one()
+        self.session.delete(target)
+        self.session.commit()
+        self.assertIsNone(database.get_chat_conversation(self.session, conv.id))
+        self.assertEqual(database.get_chat_messages(self.session, conv.id), [])
+
+    def test_latest_chat_answer_job_matches_conversation(self):
+        from ui.tabs.chat import latest_chat_answer_job
+        p = database.get_or_create_patient(self.session, "Job Match")
+        conv = database.create_chat_conversation(self.session, p.id, title="q")
+        other = database.create_chat_conversation(self.session, p.id, title="other")
+        self.assertIsNone(latest_chat_answer_job(self.session, conv.id))
+        j1 = database.create_llm_job(
+            self.session, "chat_answer", "a", params={"conversation_id": conv.id})
+        j2 = database.create_llm_job(
+            self.session, "chat_answer", "b", params={"conversation_id": other.id})
+        # Newest wins, and a job of another kind never matches.
+        self.assertEqual(latest_chat_answer_job(self.session, conv.id).id, j1.id)
+        self.assertEqual(latest_chat_answer_job(self.session, other.id).id, j2.id)
+        database.create_llm_job(self.session, "backfill", "not a chat job")
+        self.assertEqual(latest_chat_answer_job(self.session, conv.id).id, j1.id)
+        # Malformed params_json is skipped, not fatal.
+        bad = database.create_llm_job(self.session, "chat_answer", "bad")
+        bad.params_json = "{not json"
+        self.session.commit()
+        self.assertEqual(latest_chat_answer_job(self.session, conv.id).id, j1.id)
+
+    def test_adopt_chat_answer_is_idempotent(self):
+        from ui.tabs.chat import adopt_chat_answer
+        p = database.get_or_create_patient(self.session, "Adopt Patient")
+        conv = database.create_chat_conversation(self.session, p.id, title="q")
+        database.add_chat_message(self.session, conv.id, "user", "q")
+        job = database.create_llm_job(
+            self.session, "chat_answer", "a", params={"conversation_id": conv.id})
+        # Not finished yet → nothing adopted.
+        self.assertFalse(adopt_chat_answer(self.session, conv.id, job))
+        job.status = "done"
+        job.result_text = "Antwort 1"
+        self.session.commit()
+        self.assertTrue(adopt_chat_answer(self.session, conv.id, job))
+        # Second call (another poll/session) must not duplicate the turn.
+        self.assertFalse(adopt_chat_answer(self.session, conv.id, job))
+        msgs = database.get_chat_messages(self.session, conv.id)
+        self.assertEqual([m.role for m in msgs], ["user", "assistant"])
+        self.assertEqual(msgs[-1].content, "Antwort 1")
+        self.assertEqual(msgs[-1].job_id, job.id)
+
+    def test_build_llm_messages_drops_unanswered_turns(self):
+        from ui.tabs.chat import build_llm_messages
+        p = database.get_or_create_patient(self.session, "Payload Patient")
+        conv = database.create_chat_conversation(self.session, p.id, title="q")
+        database.add_chat_message(self.session, conv.id, "user", "frage 1")
+        database.add_chat_message(self.session, conv.id, "assistant", "antwort 1")
+        database.add_chat_message(self.session, conv.id, "user", "frage 2")  # failed answer
+        database.add_chat_message(self.session, conv.id, "user", "frage 3")
+        msgs = database.get_chat_messages(self.session, conv.id)
+        # "frage 2" is an unanswered turn in the middle → dropped from the LLM
+        # payload; the newest user row is kept (it is the current question).
+        self.assertEqual([m["content"] for m in build_llm_messages(msgs)],
+                         ["frage 1", "antwort 1", "frage 3"])
+        # A conversation ending in a user row keeps exactly one trailing question.
+        self.assertEqual(build_llm_messages(msgs)[-1], {"role": "user", "content": "frage 3"})
+
+    def test_chat_answer_job_worker_stores_answer(self):
+        """The chat_answer worker returns the answer as result_text and touches
+        the conversation, so the tab can adopt it after a refresh."""
+        import llm_jobs
+        st_state = __import__("streamlit").session_state
+        st_state.llm_base_url = "http://test:8888/v1"
+        st_state.llm_api_key = "test-key"
+        st_state.llm_model = "test-model"
+        st_state.llm_timeout = 30
+        st_state._bb_lang = "de"
+        p = database.get_or_create_patient(self.session, "Worker Patient")
+        conv = database.create_chat_conversation(self.session, p.id, title="LDL?")
+        before = database.get_chat_conversation(self.session, conv.id).updated_at
+
+        def fake_chat(llm, data_context, messages, lang=None):
+            captured["context"] = data_context
+            captured["messages"] = messages
+            captured["lang"] = lang
+            return "  Dein LDL liegt bei 190 mg/dl.  "
+
+        captured = {}
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "chat_with_data", side_effect=fake_chat):
+            job = llm_jobs.submit_job(
+                "chat_answer", "job_kind_chat_answer",
+                params={"conversation_id": conv.id,
+                        "messages": [{"role": "user", "content": "LDL?"}],
+                        "data_context": "=== MEASUREMENTS ==="},
+                runner=llm_jobs._run_job,
+            )
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done")
+        self.assertEqual(stored.result_text, "Dein LDL liegt bei 190 mg/dl.")
+        self.assertEqual(captured["lang"], "de")
+        self.assertIn("=== MEASUREMENTS ===", captured["context"])
+        self.assertEqual(captured["messages"], [{"role": "user", "content": "LDL?"}])
+        # Conversation bumped so it sorts to the top of the history list.
+        self.assertGreaterEqual(
+            database.get_chat_conversation(self.session, conv.id).updated_at, before)
+        # And the tab's adoption path turns it into an assistant message.
+        from ui.tabs.chat import adopt_chat_answer
+        self.assertTrue(adopt_chat_answer(self.session, conv.id, stored))
+        self.assertEqual([m.role for m in database.get_chat_messages(self.session, conv.id)],
+                         ["assistant"])
+
+    def test_chat_answer_job_error_is_recorded_not_raised(self):
+        import llm_jobs
+        st_state = __import__("streamlit").session_state
+        st_state.llm_base_url = "http://test:8888/v1"
+        st_state.llm_api_key = "test-key"
+        st_state.llm_model = "test-model"
+        st_state.llm_timeout = 30
+        st_state._bb_lang = "en"
+        p = database.get_or_create_patient(self.session, "Worker Fail")
+        conv = database.create_chat_conversation(self.session, p.id, title="boom")
+        with patch.object(llm_jobs, "_build_client", side_effect=RuntimeError("refused")):
+            job = llm_jobs.submit_job(
+                "chat_answer", "job_kind_chat_answer",
+                params={"conversation_id": conv.id,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "data_context": "ctx"},
+                runner=llm_jobs._run_job,
+            )
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "error")
+        self.assertIn("refused", stored.error or "")
+        # An errored answer is never adopted — the question stays unanswered.
+        from ui.tabs.chat import adopt_chat_answer
+        self.assertFalse(adopt_chat_answer(self.session, conv.id, stored))
+
+    def test_chat_answer_not_data_affecting(self):
+        """A finished chat answer must not trigger an app-wide rerun: that would
+        yank the user back from whatever tab they switched to."""
+        import llm_jobs
+        self.assertNotIn("chat_answer", llm_jobs.DATA_AFFECTING_KINDS)
+
+    def test_clear_finished_jobs_adopts_unseen_answer(self):
+        """The job row is the only copy of a finished answer — clearing finished
+        jobs must adopt it into the conversation, never discard it."""
+        p = database.get_or_create_patient(self.session, "Clear Patient")
+        conv = database.create_chat_conversation(self.session, p.id, title="q")
+        database.add_chat_message(self.session, conv.id, "user", "q")
+        job = database.create_llm_job(
+            self.session, "chat_answer", "a", params={"conversation_id": conv.id})
+        job.status = "done"
+        job.result_text = "Nie gesehene Antwort"
+        self.session.commit()
+        job_id = job.id
+
+        n = database.clear_finished_llm_jobs(self.session)
+        self.session.expire_all()
+        self.assertIsNone(database.get_llm_job(self.session, job_id))
+        self.assertGreaterEqual(n, 1)
+        roles = [m.role for m in database.get_chat_messages(self.session, conv.id)]
+        self.assertEqual(roles, ["user", "assistant"])
+        self.assertEqual(database.get_chat_messages(self.session, conv.id)[-1].content,
+                         "Nie gesehene Antwort")
+
+    def test_clear_finished_jobs_keeps_adopted_and_orphaned(self):
+        """An already-adopted answer is not duplicated; a job whose conversation
+        was deleted is simply dropped."""
+        p = database.get_or_create_patient(self.session, "Clear Patient 2")
+        conv = database.create_chat_conversation(self.session, p.id, title="q")
+        job = database.create_llm_job(
+            self.session, "chat_answer", "a", params={"conversation_id": conv.id})
+        job.status = "done"
+        job.result_text = "Antwort"
+        self.session.commit()
+        from ui.tabs.chat import adopt_chat_answer
+        adopt_chat_answer(self.session, conv.id, job)
+        # A finished job of a deleted conversation: no adoption, just deleted.
+        gone = database.create_chat_conversation(self.session, p.id, title="gone")
+        orphan = database.create_llm_job(
+            self.session, "chat_answer", "o", params={"conversation_id": gone.id})
+        orphan.status = "interrupted"
+        self.session.commit()
+        orphan_id = orphan.id
+        database.delete_chat_conversation(self.session, gone.id)
+
+        n = database.clear_finished_llm_jobs(self.session)
+        self.session.expire_all()
+        self.assertGreaterEqual(n, 2)
+        msgs = database.get_chat_messages(self.session, conv.id)
+        self.assertEqual([m.role for m in msgs], ["assistant"])  # not duplicated
+        self.assertIsNone(database.get_llm_job(self.session, orphan_id))
+
+    def test_chat_tab_renders_from_db_not_session_state(self):
+        """The transcript must come from the DB (refresh-proof) and the answer
+        must be generated by a background job (tab-switch-proof)."""
+        from pathlib import Path
+        src = Path("ui/tabs/chat.py").read_text(encoding="utf-8")
+        self.assertIn("get_chat_messages", src)
+        self.assertIn('submit_job(', src)
+        self.assertIn('"chat_answer"', src)
+        self.assertIn("st.fragment(run_every=2)", src)
+        # No session-state transcript left behind (the old F5-losing pattern).
+        self.assertNotIn("chat_history_", src)
+        # Input is locked while an answer is generating (no double-submit).
+        self.assertIn("disabled=pending", src)
 
 
 def tearDownModule():
@@ -5493,6 +5751,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestHealthInsightPipeline))
     suite.addTests(loader.loadTestsFromTestCase(TestUnitWhitespaceDefenseConfig))
     suite.addTests(loader.loadTestsFromTestCase(TestChatWithData))
+    suite.addTests(loader.loadTestsFromTestCase(TestChatPersistence))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

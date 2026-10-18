@@ -16,6 +16,7 @@ The app is built around **German** lab reports: the biomarker registry, aliases,
 - **Trend charts** — Interactive Plotly line charts showing any biomarker's values over time, with reference ranges overlaid.
 - **Risk flag engine** — Detects critical values, concerning trends, volatility, missing markers, and improvements. Flags are severity-ranked and deduplicated per biomarker.
 - **Health summaries** — The LLM generates a natural-language health summary for each patient based on their data history.
+- **Chat with your data** — Ask free-form questions about your measurements; the assistant answers strictly from the selected time range's data (dates, units, reference ranges). Conversations are saved in the database (multiple per patient, like mainstream chat UIs) and answers are generated as background jobs — switching tabs or refreshing the page (F5) never loses a question or an in-flight answer.
 - **Biomarker mapping & merging** — Rename canonical names, auto-detect variant groups (LLM-suggested), and merge them — or merge manually.
 - **Multi-language UI** — German and English, switchable in the sidebar.
 - **Deduplication** — PDFs are skipped if their SHA-256 hash already exists in the database.
@@ -46,13 +47,13 @@ Severity-ranked risk flags (out-of-range values, concerning trends, cross-biomar
 
 | File | Role |
 |------|------|
-| `app.py` | Streamlit UI — sidebar, data tabs (overview / detail / trends / risks / all values) + management tabs (reports / patients / LLM settings / LLM jobs / biomarker mapping), session state management |
-| `llm_jobs.py` | Background LLM job queue: worker threads for long-running ops, kind locks, config snapshots, progress persistence |
+| `app.py` | Streamlit UI — sidebar, data tabs (overview / detail / trends / risks / all values / chat) + management tabs (reports / patients / LLM settings / LLM jobs / biomarker mapping), session state management |
+| `llm_jobs.py` | Background LLM job queue: worker threads for long-running ops (including chat answers), kind locks, config snapshots, progress persistence |
 | `extractor.py` | PDF pipeline: hash check → image render → LLM extraction (one call per report) → deterministic + global name normalization → DB insert |
 | `analyzer.py` | Risk flag engine: out-of-range, trending, volatility, missing markers |
 | `llm_client.py` | OpenAI-compatible client calls (extract + normalize + summarize), embedded system prompts |
 | `pdf_processor.py` | pypdfium2 → JPEG images, base64 encoding, SHA-256 hashing |
-| `database.py` | SQLAlchemy models: `Patient → Report → DataPoint → RiskFlag` |
+| `database.py` | SQLAlchemy models: `Patient → Report → DataPoint → RiskFlag`, `LlmJob`, `ChatConversation → ChatMessage` |
 | `schemas.py` | Pydantic models for LLM JSON responses |
 | `config.py` | Paths, LLM endpoint, canonical biomarker list, risk thresholds |
 | `translations.py` | DE/EN translation dictionaries and helpers |
@@ -157,7 +158,11 @@ PatientSummary (id, patient_id, report_id, summary_text)                        
 BiomarkerInfo (id, patient_id, canonical_name, description, interpretation)        # per-patient biomarker notes
 LlmJob (id, kind, label, status, progress_*, params_json, result_text, error, aborted, config_json)
 DataQualityFinding (id, ...)                                                       # data-quality check findings
+ChatConversation (id, patient_id, title, created_at, updated_at)                   # saved chat threads (per patient)
+  └── ChatMessage (id, conversation_id, role, content, job_id, created_at)         # turns; job_id links to the chat_answer LlmJob
 ```
+
+Long-running LLM work (PDF extraction, risk refresh, summaries, bulk generation, backfill, **chat answers**) runs in background worker threads tracked in `LlmJob` — progress survives a page refresh, and the "LLM Jobs" tab shows live status with an abort button. Chat answers are adopted into `ChatMessage` rows once the job finishes, so a question or a still-generating answer is never lost to a tab switch or F5.
 
 ## Biomarker Coverage
 

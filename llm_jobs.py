@@ -40,6 +40,7 @@ from database import (
     upsert_biomarker_info, backfill_reference_ranges, create_patient_summary,
     get_registry, patient_age_years,
     DataQualityFinding, clear_patient_data_quality_findings,
+    get_chat_conversation,
 )
 from llm_client import (
     _build_client, set_job_config,
@@ -47,6 +48,7 @@ from llm_client import (
     generate_biomarker_interpretation,
     run_biomarker_quality_check, run_duplicate_check,
     is_job_aborted, request_job_abort, set_current_job_id, clear_job_abort,
+    chat_with_data,
 )
 from analyzer import refresh_risk_flags
 from extractor import process_new_pdfs
@@ -649,6 +651,38 @@ def _job_refresh_risks(session, cfg, lang, params):
     return "success", t("msg_risks_refreshed_all", lang=lang, n=n)
 
 
+def _job_chat_answer(session, cfg, lang, params):
+    """Answer one chat question in the background (see ui/tabs/chat.py).
+
+    The question, the conversation id and the data context are passed in
+    ``params`` (captured at submit time on the UI thread), so the worker never
+    needs Streamlit state. The answer goes into ``result_text`` — the chat tab
+    adopts it into a ChatMessage row once the job is finished, which is what
+    lets an in-flight answer survive a tab switch or a page refresh.
+
+    Deliberately NOT in DATA_AFFECTING_KINDS: the tab polls this job itself, and
+    an app-wide rerun would throw the user off whatever tab they navigated to.
+    """
+    conversation_id = params.get("conversation_id")
+    messages = params.get("messages") or []
+    data_context = params.get("data_context") or ""
+    if not messages:
+        return "error", t("error_chat_no_question", lang=lang)
+    _update_progress(session, getattr(_current_job_id_var, "job_id", None),
+                     t("chat_thinking", lang=lang), 0.3)
+    answer = chat_with_data(_build_client(), data_context, messages, lang=lang)
+    answer = (answer or "").strip()
+    if not answer:
+        return "error", t("error_chat_empty_answer", lang=lang)
+    # Touch the conversation so it bubbles to the top of the history list even
+    # if the user never looked at the tab while the answer was generating.
+    conv = get_chat_conversation(session, conversation_id) if conversation_id else None
+    if conv is not None:
+        conv.updated_at = datetime.utcnow()
+        session.commit()
+    return "success", answer
+
+
 def _job_regen_summary(session, cfg, lang, params):
     patient_id = params.get("patient_id")
     p = session.query(Patient).get(patient_id)
@@ -1047,4 +1081,5 @@ _WORK_FNS = {
     "gen_interpretation": _job_gen_interpretation,
     "backfill": _job_backfill,
     "data_quality_check": _job_data_quality_check,
+    "chat_answer": _job_chat_answer,
 }

@@ -3,7 +3,10 @@ import json
 import logging
 import re
 
-from sqlalchemy import create_engine, Column, Integer, Float, String, Text, DateTime, ForeignKey, Boolean, inspect, text, func, select
+from sqlalchemy import (
+    create_engine, Column, Integer, Float, String, Text, DateTime, ForeignKey,
+    Boolean, inspect, text, func, select, UniqueConstraint,
+)
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session as SASession
 
 import config as _config
@@ -117,6 +120,11 @@ class Patient(Base):
     clinical_context = Column(Text, nullable=True)
 
     reports = relationship("Report", back_populates="patient", cascade="all, delete-orphan")
+    # Deleting a patient also drops its saved chat conversations (and their
+    # messages) — chats are patient data, not shared objects.
+    chat_conversations = relationship(
+        "ChatConversation", back_populates="patient", cascade="all, delete-orphan"
+    )
 
     def __repr__(self):
         return f"<Patient {self.id}: {self.name}>"
@@ -304,6 +312,65 @@ class DataQualityFinding(Base):
         return f"<DataQualityFinding {self.id} {self.category}/{self.target_type} {self.status}>"
 
 
+class ChatConversation(Base):
+    """A saved chat conversation with the patient's data (see ui/tabs/chat.py).
+
+    Chats live in the DB rather than in ``st.session_state`` so a conversation
+    survives a page refresh (F5), a Streamlit restart, and tab switches — and
+    so a patient can keep several conversations, like any mainstream chat UI.
+    The pending LLM answer is NOT stored here: it runs as an ``LlmJob``
+    (kind ``chat_answer``) whose ``result_text`` the tab adopts once finished,
+    which is what makes an in-flight answer survive a refresh too.
+    """
+    __tablename__ = "chat_conversations"
+
+    id = Column(Integer, primary_key=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False, index=True)
+    title = Column(String(255), nullable=False, default="")  # first question, truncated
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, index=True)  # last message — list order
+
+    patient = relationship("Patient", back_populates="chat_conversations")
+    messages = relationship(
+        "ChatMessage", back_populates="conversation",
+        cascade="all, delete-orphan", order_by="ChatMessage.id",
+    )
+
+    def __repr__(self):
+        return f"<ChatConversation {self.id} patient={self.patient_id}>"
+
+
+class ChatMessage(Base):
+    """One turn of a ChatConversation, in insertion order (``id`` ascending).
+
+    ``role`` is "user" or "assistant". An assistant row is written only once
+    the answer is available — an unanswered question stays a lone user row and
+    is surfaced as "no answer" in the UI (mirrors the old inline error).
+
+    ``(conversation_id, job_id)`` is unique — SQLite treats NULL as distinct,
+    so the many job-less user rows are unaffected — which means two sessions
+    polling the same finished answer can never insert the turn twice.
+    """
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "job_id", name="uq_chat_messages_job"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, ForeignKey("chat_conversations.id"), nullable=False, index=True)
+    role = Column(String(20), nullable=False)  # user | assistant
+    content = Column(Text, nullable=False)
+    # The LlmJob that produced this answer — lets the tab detect an answer that
+    # arrived while the user was on another tab and adopt it into this row.
+    job_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    conversation = relationship("ChatConversation", back_populates="messages")
+
+    def __repr__(self):
+        return f"<ChatMessage {self.id} {self.role}>"
+
+
 def init_db():
     """Create tables, run migrations, and seed the biomarker registry.
 
@@ -335,6 +402,7 @@ def init_db():
     _migrate_fix_implausible_ref_ranges(engine)
     _migrate_patient_demographics(engine)
     _migrate_clean_unit_whitespace(engine)
+    _migrate_chat_conversations(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -631,6 +699,21 @@ def _migrate_clean_unit_whitespace(engine):
                     cleaned_any = True
         if cleaned_any:
             conn.commit()
+
+
+def _migrate_chat_conversations(engine):
+    """Create the chat tables (conversations + messages).
+
+    ``Base.metadata.create_all`` already handles a fresh DB; this explicit
+    create keeps existing databases (where create_all ran before the feature
+    existed) on the same code path as every other table here.
+    """
+    inspector = inspect(engine)
+    tables = inspector.get_table_names()
+    if "chat_conversations" not in tables:
+        ChatConversation.__table__.create(engine)
+    if "chat_messages" not in tables:
+        ChatMessage.__table__.create(engine)
 
 
 # ── Registry loader (cached) ─────────────────────────────────────────────────
@@ -1140,6 +1223,14 @@ def merge_patients(session: SASession, source_patient_id: int, target_patient_id
         .update({PatientSummary.patient_id: target_patient_id}, synchronize_session="fetch")
     )
 
+    # Saved chat conversations move with the patient for the same reason as
+    # the summaries above (SQLite does not enforce FKs → orphans otherwise).
+    conversations_moved = (
+        session.query(ChatConversation)
+        .filter(ChatConversation.patient_id == source_patient_id)
+        .update({ChatConversation.patient_id: target_patient_id}, synchronize_session="fetch")
+    )
+
     # BiomarkerInfo is keyed by (patient_id, canonical_name). Where the target
     # already has a row for the same biomarker, the target's row wins and the
     # source row is dropped; otherwise the source row is re-pointed to target.
@@ -1182,6 +1273,7 @@ def merge_patients(session: SASession, source_patient_id: int, target_patient_id
         "flags_moved": flags_moved,
         "summaries_moved": summaries_moved,
         "infos_moved": infos_moved,
+        "conversations_moved": conversations_moved,
         "source_deleted": True,
     }
 
@@ -1321,7 +1413,32 @@ def clear_finished_llm_jobs(session: SASession) -> int:
 
     User action from the LLM-Jobs tab — keeps the list short. Pending/running
     jobs are never touched.
+
+    A finished ``chat_answer`` job whose answer has not been adopted into its
+    conversation yet is adopted FIRST (the chat tab's poll may not have run
+    since the answer landed): the answer text is the only copy, so clearing
+    the job row without this would silently discard it.
     """
+    finished = (
+        session.query(LlmJob)
+        .filter(LlmJob.status.in_(["done", "error", "interrupted"]))
+        .all()
+    )
+    for job in finished:
+        if job.kind != "chat_answer" or job.status != "done" or not job.result_text:
+            continue
+        try:
+            params = json.loads(job.params_json) if job.params_json else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        conv_id = params.get("conversation_id")
+        if conv_id is None:
+            continue
+        if get_chat_conversation(session, conv_id) is None:
+            continue  # conversation deleted — nothing to adopt into
+        if any(m.job_id == job.id for m in get_chat_messages(session, conv_id)):
+            continue
+        add_chat_message(session, conv_id, "assistant", job.result_text, job_id=job.id)
     result = (
         session.query(LlmJob)
         .filter(LlmJob.status.in_(["done", "error", "interrupted"]))
@@ -1329,6 +1446,89 @@ def clear_finished_llm_jobs(session: SASession) -> int:
     )
     session.commit()
     return result
+
+
+# ── Chat conversation CRUD ("chat with your data" — see ui/tabs/chat.py) ─────
+
+# A conversation title is the (truncated) first question — cheap and useful,
+# and matches what mainstream chat UIs show in their history list.
+_CHAT_TITLE_MAX_LEN = 60
+
+
+def create_chat_conversation(session: SASession, patient_id: int, title: str = "") -> ChatConversation:
+    """Insert a new (empty) conversation for a patient and return it."""
+    conv = ChatConversation(
+        patient_id=patient_id,
+        title=(title or "").strip()[:_CHAT_TITLE_MAX_LEN],
+    )
+    session.add(conv)
+    session.commit()
+    session.refresh(conv)
+    return conv
+
+
+def get_chat_conversation(session: SASession, conversation_id: int) -> ChatConversation | None:
+    return session.query(ChatConversation).filter(ChatConversation.id == conversation_id).first()
+
+
+def list_chat_conversations(session: SASession, patient_id: int) -> list[ChatConversation]:
+    """A patient's conversations, most recently active first."""
+    return (
+        session.query(ChatConversation)
+        .filter(ChatConversation.patient_id == patient_id)
+        .order_by(ChatConversation.updated_at.desc(), ChatConversation.id.desc())
+        .all()
+    )
+
+
+def add_chat_message(session: SASession, conversation_id: int, role: str, content: str,
+                     job_id: int | None = None) -> ChatMessage:
+    """Append one turn and bump the conversation's updated_at (list order).
+
+    Concurrent adoption of the SAME answer job (two browser sessions polling)
+    is rejected by the uq_chat_messages_job constraint and surfaces as an
+    IntegrityError — the caller (adopt_chat_answer) treats that as "someone
+    else already wrote it".
+    """
+    msg = ChatMessage(conversation_id=conversation_id, role=role, content=content, job_id=job_id)
+    session.add(msg)
+    conv = get_chat_conversation(session, conversation_id)
+    if conv is not None:
+        conv.updated_at = datetime.utcnow()
+        if role == "user" and not conv.title:
+            conv.title = content.strip()[:_CHAT_TITLE_MAX_LEN]
+    session.commit()
+    session.refresh(msg)
+    return msg
+
+
+def get_chat_messages(session: SASession, conversation_id: int) -> list[ChatMessage]:
+    """All turns of a conversation, oldest first."""
+    return (
+        session.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation_id)
+        .order_by(ChatMessage.id)
+        .all()
+    )
+
+
+def delete_chat_conversation(session: SASession, conversation_id: int) -> bool:
+    """Delete a conversation and its messages. True if the row existed."""
+    conv = get_chat_conversation(session, conversation_id)
+    if conv is None:
+        return False
+    session.delete(conv)
+    session.commit()
+    return True
+
+
+def rename_chat_conversation(session: SASession, conversation_id: int, title: str) -> bool:
+    conv = get_chat_conversation(session, conversation_id)
+    if conv is None:
+        return False
+    conv.title = (title or "").strip()[:_CHAT_TITLE_MAX_LEN]
+    session.commit()
+    return True
 
 
 def mark_stale_llm_jobs_interrupted(session: SASession, exclude_ids=None) -> int:
