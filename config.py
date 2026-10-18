@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
@@ -318,7 +319,7 @@ def get_default_ref_range(canonical_name: str, unit: str | None = None, registry
     ref_low = default_ref.get("low")
     ref_high = default_ref.get("high")
 
-    if unit is None or unit.strip().lower() == ref_unit.strip().lower():
+    if unit is None or _norm_unit(unit) == _norm_unit(ref_unit):
         # Unit matches (or no unit specified) — return as-is
         return ref_low, ref_high, ref_unit
 
@@ -363,8 +364,14 @@ _LINEAR_CONVERSIONS = [
 
 
 def _norm_unit(unit: str) -> str:
-    """Normalize a unit string for conversion-table lookup (lower-case, µ→u)."""
-    return unit.strip().lower().replace("µ", "u")
+    """Normalize a unit string for conversion-table lookup.
+
+    Collapses internal whitespace (so 'ml/ min' == 'ml/min'), lower-cases and
+    maps µ→u. Lab units never contain meaningful internal spaces, so collapsing
+    every whitespace run is safe and keeps the conversion/equivalence tables
+    free of per-spacing band-aids.
+    """
+    return re.sub(r"\s+", "", unit).lower().replace("µ", "u")
 
 
 # Notation variants of the SAME physical unit. Keys are _norm_unit() forms;
@@ -388,9 +395,9 @@ _UNIT_EQUIV: dict[str, str] = {
     "miu/l": "miu_per_l",
     "uiu/ml": "miu_per_l",
     "ulu/ml": "miu_per_l",
-    # Flow: ml per minute (spacing variants)
+    # Flow: ml per minute. Spacing variants ('ml/ min', 'ml /min') are handled
+    # by _norm_unit collapsing whitespace, so only the canonical form is listed.
     "ml/min": "ml_per_min",
-    "ml/ min": "ml_per_min",
 }
 
 

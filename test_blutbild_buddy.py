@@ -349,6 +349,29 @@ class TestTwoPhaseExtraction(unittest.TestCase):
         self.assertEqual(len(processed), 1)
         self.assertTrue(self.session.query(database.DataPoint).all())
 
+    @patch("extractor.extract_page")
+    @patch("extractor.normalize_names")
+    @patch("extractor.extract_pages_batch")
+    def test_ingestion_collapses_unit_whitespace(self, mock_batch, mock_norm, mock_extract):
+        """A unit with a stray internal space ('ml/ min') is cleaned to
+        'ml/min' at ingestion, so future runs never re-create the duplicate."""
+        from schemas import ExtractedPage, NormalizationMapping
+        page = {"patient_name": "UnitClean", "report_date": "2024-01-01", "panel_type": None,
+                "entries": [{"name": "eGFR (CKD-EPI)", "value": 85.0, "unit": "ml/ min",
+                             "reference_range": None}]}
+        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**page) for _ in pages]
+        mock_norm.return_value = NormalizationMapping(mappings=[])
+        from extractor import process_new_pdfs
+        pdf_dir = _fixture_pdf_dir(1)
+        with patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session)
+        self.assertEqual(errors, [])
+        dps = self.session.query(database.DataPoint).all()
+        self.assertTrue(dps)
+        for dp in dps:
+            self.assertEqual(dp.canonical_name, "eGFR (CKD-EPI)")
+            self.assertEqual(dp.unit, "ml/min")  # cleaned at ingestion
+
 
 class TestAnalyzer(unittest.TestCase):
     @classmethod
@@ -1281,6 +1304,38 @@ class TestBiomarkerMerge(unittest.TestCase):
         units = {dp.unit for dp in dps}
         self.assertNotIn("MG/dl", units, "MG/dl should be merged to mg/dl")
 
+    def test_apply_merge_plan_cleans_target_unit(self):
+        """A spaced suggested_unit in a plan is never written to the DB."""
+        session = self.session
+        patient = self._add_patient_with_reports(
+            session, "TestPatient_PlanUnitSpace", [
+                ("2024-01-01", [
+                    {"name": "ClearX", "value": 85, "unit": "ml/min", "reference_range": ""},
+                ]),
+                ("2024-02-01", [
+                    {"name": "ClearX", "value": 88, "unit": "ML/MIN", "reference_range": ""},
+                ]),
+            ]
+        )
+        plan = [
+            {
+                "variants": [
+                    {"name": "ClearX", "unit": "ml/min", "count": 1},
+                    {"name": "ClearX", "unit": "ML/MIN", "count": 1},
+                ],
+                "suggested_target": "ClearX (std)",
+                "suggested_unit": "ml/ min",  # LLM echoed the typo back
+            }
+        ]
+        database.apply_merge_plan(session, patient.id, plan)
+        dps = session.query(database.DataPoint).join(database.Report).filter(
+            database.Report.patient_id == patient.id
+        ).all()
+        self.assertTrue(dps)
+        for dp in dps:
+            self.assertNotIn(" ", dp.unit, f"spaced unit written: {dp.unit!r}")
+        self.assertEqual({dp.unit for dp in dps}, {"ml/min"})
+
     def test_auto_merge_detects_groups(self):
         """auto_merge_biomarkers should detect groups with different name casing."""
         session = self.session
@@ -1411,6 +1466,114 @@ class TestBiomarkerMerge(unittest.TestCase):
         self.assertEqual(database.normalize_unit("MG/dl"), "mg/dl")
         self.assertEqual(database.normalize_unit("Mg/DL"), "mg/dl")
         self.assertIsNone(database.normalize_unit(None))
+
+    def test_normalize_unit_collapses_internal_whitespace(self):
+        """A stray space inside a unit must not split it from its clean form.
+
+        Regression: 'ml/ min' vs 'ml/min' produced two merge groups (the
+        grouping key includes the unit), so eGFR showed up twice.
+        """
+        self.assertEqual(database.normalize_unit("ml/ min"), "ml/min")
+        self.assertEqual(database.normalize_unit("ml /min"), "ml/min")
+        self.assertEqual(database.normalize_unit("ml/min"), "ml/min")
+        self.assertEqual(database.normalize_unit(" mL/min "), "ml/min")
+        self.assertEqual(database.normalize_unit("ml/ min"), database.normalize_unit("ml/min"))
+
+    def test_clean_unit_collapses_whitespace_preserves_case(self):
+        """clean_unit removes internal spaces (for storage) but keeps case."""
+        self.assertEqual(database.clean_unit("ml/ min"), "ml/min")
+        self.assertEqual(database.clean_unit("ml /min"), "ml/min")
+        self.assertEqual(database.clean_unit(" MG/dL "), "MG/dL")
+        self.assertEqual(database.clean_unit("ml/min"), "ml/min")
+        self.assertIsNone(database.clean_unit(None))
+        self.assertIsNone(database.clean_unit("   "))  # all-whitespace → None
+
+    def test_same_name_unit_whitespace_diff_should_group(self):
+        """Same canonical name, unit differing only by an internal space, must
+        form ONE merge group (previously two, so eGFR appeared twice)."""
+        session = self.session
+        patient = self._add_patient_with_reports(
+            session, "TestPatient_UnitSpace", [
+                ("2024-01-01", [
+                    {"name": "eGFR (CKD-EPI)", "value": 88, "unit": "ml/min", "reference_range": ">60"},
+                ]),
+                ("2024-02-01", [
+                    {"name": "eGFR (CKD-EPI)", "value": 85, "unit": "ml/ min", "reference_range": ">60"},
+                ]),
+            ]
+        )
+        groups = database.get_unique_biomarker_groups(session, patient.id)
+        self.assertEqual(len(groups), 1, "ml/min and ml/ min must group together")
+        units = {v["unit"] for v in groups[0]["variants"]}
+        self.assertEqual(units, {"ml/min", "ml/ min"})
+
+    def test_genuinely_different_units_stay_separate(self):
+        """Whitespace collapse must NOT merge genuinely different units
+        (mg/dl vs mmol/l for the same marker stay in separate groups)."""
+        session = self.session
+        patient = self._add_patient_with_reports(
+            session, "TestPatient_DiffUnits", [
+                ("2024-01-01", [
+                    {"name": "Glukose (nüchtern)", "value": 90, "unit": "mg/dl", "reference_range": "70-100"},
+                ]),
+                ("2024-02-01", [
+                    {"name": "Glukose (nüchtern)", "value": 5.0, "unit": "mmol/l", "reference_range": "3.9-5.5"},
+                ]),
+            ]
+        )
+        groups = database.get_unique_biomarker_groups(session, patient.id)
+        self.assertEqual(len(groups), 0, "mg/dl and mmol/l are different units — no group")
+
+    def test_migrate_clean_unit_whitespace(self):
+        """The one-time migration rewrites stored units with stray spaces and
+        is idempotent."""
+        session = self.session
+        patient = database.get_or_create_patient(session, "MigrateUnitSpace")
+        report = database.Report(
+            patient_id=patient.id, filename="mu.pdf",
+            file_hash=f"mu_{self._next_hash()}", report_date=datetime(2024, 1, 1),
+        )
+        session.add(report)
+        session.flush()
+        session.add(database.DataPoint(
+            report_id=report.id, canonical_name="eGFR (CKD-EPI)",
+            original_name="eGFR", value=85.0, unit="ml/ min",
+            ref_low=None, ref_high=None, is_abnormal=False,
+        ))
+        session.commit()
+
+        from database import _migrate_clean_unit_whitespace
+        _migrate_clean_unit_whitespace(database._get_engine())
+        session.expire_all()
+        dp = session.query(database.DataPoint).filter_by(canonical_name="eGFR (CKD-EPI)").one()
+        self.assertEqual(dp.unit, "ml/min")
+        # Idempotent: running again changes nothing.
+        _migrate_clean_unit_whitespace(database._get_engine())
+        session.expire_all()
+        self.assertEqual(session.query(database.DataPoint).filter_by(canonical_name="eGFR (CKD-EPI)").one().unit, "ml/min")
+
+    def test_migrate_clean_unit_whitespace_registry(self):
+        """The migration also cleans spaced units in the registry (JSON list +
+        ref_unit) and dedups, and is idempotent."""
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="CRP").one())
+        row.units = json.dumps(["mg/l", "mg/ l", "MG/L"])
+        row.ref_unit = "mg/ l"
+        self.session.commit()
+
+        from database import _migrate_clean_unit_whitespace
+        _migrate_clean_unit_whitespace(database._get_engine())
+        self.session.expire_all()
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="CRP").one())
+        self.assertEqual(json.loads(row.units), ["mg/l"])  # cleaned + deduped
+        self.assertEqual(row.ref_unit, "mg/l")
+        # Idempotent: second run leaves it untouched.
+        _migrate_clean_unit_whitespace(database._get_engine())
+        self.session.expire_all()
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="CRP").one())
+        self.assertEqual(json.loads(row.units), ["mg/l"])
 
     def test_merge_canonical_names_no_match(self):
         """merge_canonical_names should return 0 when no names match."""
@@ -3301,6 +3464,12 @@ class TestParseRefRange(unittest.TestCase):
         self.assertEqual(_parse_ref_range(""), (None, None, None))
         self.assertEqual(_parse_ref_range("kein Bereich"), (None, None, None))
 
+    def test_unit_whitespace_cleaned(self):
+        """Parsed units never keep stray internal spaces ('ml/ min' → 'ml/min')."""
+        from database import _parse_ref_range
+        self.assertEqual(_parse_ref_range("90–120 ml/ min"), (90.0, 120.0, "ml/min"))
+        self.assertEqual(_parse_ref_range("< 5.2 mg/ dl"), (None, 5.2, "mg/dl"))
+
 
 class TestUpdateBiomarkerRegistry(unittest.TestCase):
     """update_biomarker_registry: manual edits share LLM-accept semantics."""
@@ -3360,6 +3529,16 @@ class TestUpdateBiomarkerRegistry(unittest.TestCase):
         units = json.loads(row.units)
         self.assertEqual(len(units), 2)
         self.assertEqual([u.lower() for u in units], ["pg", "pg/cell"])
+
+    def test_unit_whitespace_replaces_not_duplicates(self):
+        """'pg /cell' must replace 'pg/cell', not accumulate a spaced variant."""
+        database.update_biomarker_registry(self.session, "MCH", "unit", "pg/cell")
+        out = database.update_biomarker_registry(self.session, "MCH", "unit", "pg /cell")
+        self.assertEqual(out["status"], "applied")
+        row = self._row("MCH")
+        units = json.loads(row.units)
+        self.assertEqual(units, ["pg", "pg/cell"])  # cleaned, no 'pg /cell' added
+        self.assertTrue(all(" " not in u for u in units))
 
     def test_name_rename_global_with_alias(self):
         # A second patient proves the rename is global, not per-patient.
@@ -4346,6 +4525,34 @@ class TestApplyDataQualityFinding(unittest.TestCase):
         self.assertEqual(wbc.unit, "10^3/µl")
         self.assertEqual((wbc.ref_low, wbc.ref_high), (4.0, 11.0))
 
+    def test_set_unit_cleans_whitespace_in_target(self):
+        """A spaced target unit ('ml/ min') is stored cleaned ('ml/min')."""
+        egfr = database.DataPoint(
+            report_id=self.crp.report_id, canonical_name="eGFR (CKD-EPI)",
+            original_name="eGFR", value=85.0, unit="ML/ MIN",
+        )
+        self.session.add(egfr)
+        self.session.commit()
+        fid = self._add_finding("data_point", "eGFR (CKD-EPI)", action="set_unit",
+                                params={"unit": "ml/ min"},
+                                data_point_ids=[egfr.id], category="unit")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(egfr.unit, "ml/min")  # no space written to DB
+        self.assertEqual(egfr.value, 85.0)  # same unit modulo spacing → no conversion
+
+    def test_set_ref_range_unit_whitespace_matches_no_conversion(self):
+        """Proposed range unit 'mg/ l' matches a 'mg/l' point → bounds applied as-is."""
+        fid = self._add_finding("data_point", "CRP", action="set_ref_range",
+                                params={"low": 0.0, "high": 10.0, "unit": "mg/ l"},
+                                data_point_ids=[self.crp.id])
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.crp.ref_high, 10.0)  # no conversion, no skip
+        self.assertFalse(self.crp.is_abnormal)
+
     def test_set_unit_dimensionless_target(self):
         """Target unit 'none' strips the unit label without touching the value."""
         qpo2 = database.DataPoint(
@@ -5032,6 +5239,205 @@ class TestHealthInsightPipeline(unittest.TestCase):
         self.assertEqual(_related_context_lines(self.session, p.id, "Nicht Existierend"), [])
 
 
+class TestUnitWhitespaceDefenseConfig(unittest.TestCase):
+    """config.py unit normalization collapses whitespace everywhere."""
+
+    def test_norm_unit_collapses_whitespace(self):
+        self.assertEqual(config._norm_unit("ml/ min"), "ml/min")
+        self.assertEqual(config._norm_unit(" MG/ DL "), "mg/dl")
+        self.assertEqual(config._norm_unit("µmol/l"), "umol/l")
+
+    def test_units_equivalent_spacing_variants(self):
+        # The 'ml/ min' band-aid was removed from _UNIT_EQUIV; equivalence now
+        # works generically because _norm_unit collapses spaces.
+        self.assertTrue(config._units_equivalent("ml/ min", "ml/min"))
+        self.assertTrue(config._units_equivalent("ml /min", "ML/MIN"))
+        self.assertNotIn("ml/ min", config._UNIT_EQUIV)
+
+    def test_convert_ref_range_spacing_passthrough(self):
+        # 'mg/ dl' normalizes to the table's 'mg/dl' → identity passthrough.
+        low, high = config._convert_ref_range("Glukose (nüchtern)", 70.0, 100.0,
+                                              "mg/ dl", "mg/dl")
+        self.assertEqual((low, high), (70.0, 100.0))
+
+    def test_get_default_ref_range_matches_spaced_unit(self):
+        # Default ref is stored in mg/dl; a spaced request unit must still match.
+        low, high, unit = config.get_default_ref_range("Glukose (nüchtern)", "mg/ dl")
+        self.assertEqual((low, high), (70.0, 100.0))
+        self.assertEqual(unit, "mg/dl")
+
+
+class TestChatWithData(unittest.TestCase):
+    """Tests for the "chat with your data" tab: date-range window collection,
+    prompt context formatting, and the chat_with_data LLM call."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = _fresh_db('test_chat.db')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.session.close()
+
+    def _add_report(self, patient, name, date, markers, undated=False):
+        report = database.Report(
+            patient_id=patient.id, filename=f'{name}.pdf',
+            file_hash=f'chat_{name}', report_date=None if undated else date,
+        )
+        self.session.add(report)
+        self.session.flush()
+        for m in markers:
+            canonical, value, unit, ref_low, ref_high = m[:5]
+            kwargs = {}
+            if len(m) > 5 and not m[5]:
+                kwargs["is_disabled"] = True
+            self.session.add(database.DataPoint(
+                report_id=report.id, canonical_name=canonical, original_name=canonical,
+                value=value, unit=unit, ref_low=ref_low, ref_high=ref_high, **kwargs,
+            ))
+        self.session.commit()
+        return report
+
+    # ── collect_chat_measurements ───────────────────────────────────────────
+
+    def test_collect_excludes_disabled_null_undated_and_out_of_range(self):
+        from ui.tabs.chat import collect_chat_measurements
+        p = database.get_or_create_patient(self.session, "Chat Patient")
+        # Inside the selected range (2021-10-15 .. 2026-10-15):
+        self._add_report(p, "c_recent", datetime(2025, 6, 1),
+                         [("LDL", 190.0, "mg/dl", 0, 130, True),
+                          ("HDL", 45.0, "mg/dl", 35, 80),
+                          ("CRP", None, "mg/l", None, 5)])  # null value → excluded
+        # Disabled value → excluded:
+        self._add_report(p, "c_disabled", datetime(2025, 6, 1),
+                         [("Kalium", 9.9, "mmol/l", 3.5, 5.0, False)])
+        # Before the selected start date → excluded:
+        self._add_report(p, "c_old", datetime(2019, 1, 1),
+                         [("ALT", 90.0, "U/l", 10, 50, True)])
+        # After the selected end date → excluded:
+        self._add_report(p, "c_future", datetime(2027, 1, 1),
+                         [("Cholesterin", 200.0, "mg/dl", 0, 200)])
+        # Report without date → excluded (no timestamp to place in the range):
+        self._add_report(p, "c_undated", None,
+                         [("Glukose", 99.0, "mg/dl", 70, 110)], undated=True)
+
+        rows = collect_chat_measurements(
+            self.session, p.id,
+            start_date=datetime(2021, 10, 15), end_date=datetime(2026, 10, 15))
+        names = {r[1] for r in rows}
+        self.assertEqual(names, {"LDL", "HDL"})
+        # Oldest first (both share one report date), tuple shape matches the
+        # summary pipeline:
+        self.assertEqual({r[:3] for r in rows},
+                         {(datetime(2025, 6, 1), "LDL", 190.0), (datetime(2025, 6, 1), "HDL", 45.0)})
+        self.assertTrue(all(len(r) == 7 for r in rows))
+
+    # ── format_chat_data_context ────────────────────────────────────────────
+
+    def test_format_context_de_groups_and_marks_abnormal(self):
+        from ui.tabs.chat import format_chat_data_context
+        p = database.get_or_create_patient(self.session, "Chat Format")
+        self.session.query(database.Patient).filter_by(id=p.id).update(
+            {"sex": "f", "clinical_context": "Hypertonie"})
+        self.session.commit()
+        self.session.expire_all()
+        p = self.session.query(database.Patient).filter_by(id=p.id).one()
+        measurements = [
+            (datetime(2025, 6, 1), "LDL", 190.0, "mg/dl", 0.0, 130.0, True),
+            (datetime(2023, 4, 3), "LDL", 130.0, "mg/dl", 0.0, 130.0, False),
+            (datetime(2025, 6, 1), "HDL", 45.0, "mg/dl", None, 80.0, False),
+        ]
+        ctx = format_chat_data_context(p, measurements, "de",
+                                       range_label="01.01.2023 – 31.12.2025")
+        self.assertIn("=== PATIENTENPROFIL ===", ctx)
+        self.assertIn("Geschlecht: weiblich", ctx)
+        self.assertIn("Klinischer Kontext (Vorerkrankungen/Medikamente): Hypertonie", ctx)
+        self.assertIn("=== MESSWERTE 01.01.2023 – 31.12.2025", ctx)
+        # Grouped per biomarker, chronological within the group:
+        self.assertIn("LDL (mg/dl):", ctx)
+        ldl_block = ctx.split("LDL (mg/dl):")[1].split("HDL")[0]
+        self.assertLess(ldl_block.index("03.04.2023"), ldl_block.index("01.06.2025"))
+        self.assertIn("01.06.2025: 190.0 mg/dl (Ref: 0.0-130.0 mg/dl) [ABNORMAL]", ctx)
+        # One-sided upper bound:
+        self.assertIn("(Ref: < 80.0 mg/dl)", ctx)
+
+    def test_format_context_en_without_profile(self):
+        from ui.tabs.chat import format_chat_data_context
+        p = database.Patient(id=999999, name="John", sex=None, clinical_context=None)
+        ctx = format_chat_data_context(
+            p, [(datetime(2025, 1, 1), "Ferritin", 8.0, "ng/ml", 30.0, 400.0, True)], "en",
+            range_label="01.01.2025 – 31.12.2025")
+        self.assertNotIn("=== PATIENT PROFILE ===", ctx)  # no profile data → no section
+        self.assertIn("=== MEASUREMENTS 01.01.2025 – 31.12.2025", ctx)
+        self.assertIn("01.01.2025: 8.0 ng/ml (Ref: 30.0-400.0 ng/ml) [ABNORMAL]", ctx)
+
+    # ── chat_with_data LLM call ─────────────────────────────────────────────
+
+    def test_chat_with_data_sends_context_and_history(self):
+        import llm_client
+        captured = {}
+
+        class CapturingCompletions:
+            def create(self, *a, **kw):
+                captured["messages"] = kw.get("messages") or (a[0] if a else None)
+                return _MockLLMResponse("  Deine LDL-Werte sind gestiegen.  ")
+
+        class CapturingLLM:
+            chat = type("_C", (), {"completions": CapturingCompletions()})()
+
+        history = [
+            {"role": "user", "content": "Wie hat sich mein LDL entwickelt?"},
+            {"role": "assistant", "content": "Frage bitte präzisieren."},
+            {"role": "user", "content": "seit 2023"},
+        ]
+        with patch.object(llm_client, "_get_model", return_value="m"), \
+             patch.object(llm_client, "_get_timeout", return_value=30):
+            answer = llm_client.chat_with_data(
+                CapturingLLM(), "=== MEASUREMENTS ===\nLDL = 190", history, lang="en")
+
+        self.assertEqual(answer, "Deine LDL-Werte sind gestiegen.")  # stripped
+        msgs = captured["messages"]
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("=== MEASUREMENTS ===", msgs[0]["content"])  # data in system prompt
+        self.assertIn("medical assistant", msgs[0]["content"])     # EN system prompt
+        # History passed through unchanged, ending with the new question:
+        self.assertEqual(msgs[1:], history)
+
+    def test_chat_errors_propagate(self):
+        """Unlike summary/interpretation helpers, chat errors must NOT be swallowed —
+        the tab renders them inline."""
+        import llm_client
+
+        class BoomCompletions:
+            def create(self, *a, **kw):
+                raise RuntimeError("connection refused")
+
+        class BoomLLM:
+            chat = type("_C", (), {"completions": BoomCompletions()})()
+
+        with patch.object(llm_client, "_get_model", return_value="m"), \
+             patch.object(llm_client, "_get_timeout", return_value=30):
+            with self.assertRaises(RuntimeError):
+                llm_client.chat_with_data(BoomLLM(), "ctx", [{"role": "user", "content": "hi"}], lang="en")
+
+    # ── Translation keys + wiring ───────────────────────────────────────────
+
+    def test_chat_translation_keys_both_langs(self):
+        from translations import DE, EN
+        for key in ("tab_chat", "subheader_chat", "caption_chat", "chat_data_context_info",
+                    "chat_input_placeholder", "chat_thinking", "btn_clear_chat",
+                    "chat_no_data", "error_chat_generation", "chat_disclaimer"):
+            self.assertIn(key, DE)
+            self.assertIn(key, EN)
+            self.assertNotEqual(DE[key], EN[key])
+
+    def test_app_wires_chat_tab(self):
+        from pathlib import Path
+        src = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("render_chat_tab", src)
+        self.assertIn('t("tab_chat")', src)
+
+
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""
     if TEST_DIR.exists():
@@ -5085,6 +5491,8 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestApplyDataQualityFinding))
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityJob))
     suite.addTests(loader.loadTestsFromTestCase(TestHealthInsightPipeline))
+    suite.addTests(loader.loadTestsFromTestCase(TestUnitWhitespaceDefenseConfig))
+    suite.addTests(loader.loadTestsFromTestCase(TestChatWithData))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

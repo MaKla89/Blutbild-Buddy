@@ -38,6 +38,7 @@ from ui.tabs.detail import render_detail_tab  # noqa: F401
 from ui.tabs.trends import render_trends_tab  # noqa: F401
 from ui.tabs.risks import render_risks_tab  # noqa: F401
 from ui.tabs.all_values import render_all_values_tab  # noqa: F401
+from ui.tabs.chat import render_chat_tab  # noqa: F401
 from ui.tabs.mapping import render_mapping_tab  # noqa: F401
 from ui.tabs.llm_jobs import render_llm_jobs_tab  # noqa: F401
 from ui.cards import inject_card_css
@@ -252,6 +253,7 @@ def main():
         t("tab_trends"),
         t("tab_risks"),
         t("tab_all_values"),
+        t("tab_chat"),
     ]
     
     management_tabs = [
@@ -270,7 +272,7 @@ def main():
     if has_patient:
         top_tabs = st.tabs(data_tabs + [t("tab_management")])
         (data_tab_overview, data_tab_detail, data_tab_trends,
-         data_tab_risks, data_tab_all_values, mgmt_tab) = top_tabs
+         data_tab_risks, data_tab_all_values, data_tab_chat, mgmt_tab) = top_tabs
         with mgmt_tab:
             mgmt_subtabs = st.tabs(management_tabs)
     else:
@@ -352,6 +354,11 @@ def main():
     # --- TAB: Alle Werte ---
     with data_tab_all_values:
         render_all_values_tab(session, patient, patient_reports)
+
+    # --- TAB: Chat mit Daten ("chat with your data") ---
+    with data_tab_chat:
+        render_chat_tab(session, patient, lang, min_date, max_date,
+                        f"chat_time_range_{patient.id}")
 
     # --- TAB: Biomarker Mapping (management sub-tab) ---
     with mgmt_subtabs[4]:

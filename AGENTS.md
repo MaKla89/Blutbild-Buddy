@@ -17,17 +17,17 @@ docker compose up -d                        # Docker deployment
 - **LLM env vars are read lazily** in `config.py` (via getter functions). Changes to `os.environ` after import *are* picked up. This is intentional for the in-app Settings dialog.
 - **Risk flags are idempotent**: `refresh_risk_flags()` does DELETE + INSERT from scratch each call.
 - **Patient names normalize to "LastName, FirstName"** via `database.normalize_patient_name()`. Handles formats like `Doe J.` → `J., Doe`, underscores, commas.
-- **Biomarker merge groups** are keyed by `(case-insensitive base name, case-insensitive unit)`. Different units (e.g. `mg/dl` vs `mmol/l`) prevent grouping even for the same biomarker.
+- **Biomarker merge groups** are keyed by `(case-insensitive base name, normalized unit)`. `normalize_unit()` lowercases AND collapses internal whitespace, so `ml/ min` == `ml/min` (a stray OCR space no longer splits one marker into two). Genuinely different units (e.g. `mg/dl` vs `mmol/l`) still prevent grouping. `clean_unit()` (storage-side) strips all whitespace runs; the extractor cleans units at ingestion, and `_migrate_clean_unit_whitespace()` fixes legacy rows once. Every other unit-writing path also cleans first (`clean_unit`): `set_unit`/`set_ref_range` data-quality fixes, `apply_merge_plan` target units, `_parse_ref_range`, registry `unit` edits (`_mutate_registry_row`). `config._norm_unit()` also collapses whitespace, so the conversion/equivalence tables need no per-spacing entries (`_UNIT_EQUIV` has no `ml/ min` band-aid).
 
 ## Architecture (one file per concern)
 
 | File | Role |
 |------|------|
-| `app.py` | Streamlit UI — sidebar, data tabs (overview/detail/trends/risks/all_values) + management tabs (reports/patients/llm_settings/llm_jobs/mapping; nested under a "Verwaltung" tab when a patient is selected), session state management |
+| `app.py` | Streamlit UI — sidebar, data tabs (overview/detail/trends/risks/all_values/chat) + management tabs (reports/patients/llm_settings/llm_jobs/mapping; nested under a "Verwaltung" tab when a patient is selected), session state management |
 | `llm_jobs.py` | Background LLM job queue: worker threads for all long-running ops, kind locks, config snapshots, progress persistence |
 | `extractor.py` | PDF pipeline: hash check → pypdfium2 render → LLM extract → normalize → DB insert |
 | `analyzer.py` | Risk flag engine: out-of-range, trending, volatility, missing markers, cross-biomarker correlation rules |
-| `llm_client.py` | OpenAI-compatible client calls (extract + normalize + summarize), embedded system prompts |
+| `llm_client.py` | OpenAI-compatible client calls (extract + normalize + summarize + chat), embedded system prompts |
 | `pdf_processor.py` | pypdfium2 → JPEG images, base64 encoding, SHA-256 hashing |
 | `database.py` | SQLAlchemy models: `Patient → Report → DataPoint → RiskFlag`, `LlmJob`. Also: merge logic, migrations, patient name normalization |
 | `schemas.py` | Pydantic models for LLM JSON responses |
@@ -42,6 +42,7 @@ docker compose up -d                        # Docker deployment
 - **Cross-biomarker patterns**: Config-driven rules in `RISK_CONFIG["cross_biomarker_rules"]` detect correlated abnormalities (e.g., CK + Troponin → cardiac pattern). Severity can be upgraded or downgraded based on the pattern.
 - **Deduplication**: PDFs skipped if SHA-256 hash already exists in `Report.file_hash`.
 - **Auto-merge**: `database.auto_merge_biomarkers()` uses LLM to suggest canonical targets for variant groups; `apply_merge_plan()` executes (only merges when units are compatible).
+- **Chat with your data** (`ui/tabs/chat.py`): free-form LLM Q&A per patient. A date-range slider (shared `_time_range_slider` helper, chat-scoped value key `chat_time_range_{patient.id}` so it's independent of the Trends/Overview slider; default = patient's full range) selects the window. `collect_chat_measurements()` returns ALL non-disabled, non-null measurements in that range (undated reports excluded) — deliberately uncapped, unlike the summary's `_collect_historical_data`. `format_chat_data_context()` renders profile + per-(biomarker,unit) chronological series into the system prompt; `llm_client.chat_with_data()` does NOT swallow errors (the tab shows them inline and drops the unanswered question from history). Transcript lives in `st.session_state[f"chat_history_{patient.id}"]`.
 - **Background LLM jobs** (`llm_jobs.py`): All long-running operations (process_pdfs, refresh_risks, regen_summary, bulk_descriptions, bulk_interpretations, backfill) run in daemon worker threads, NOT inline in the UI. Buttons call `submit_job(kind, label_key, params=...)` and return immediately; progress is persisted to the `llm_jobs` table and polled by the "LLM-Jobs" tab (`ui/tabs/llm_jobs.py`, `@st.fragment(run_every=2)`). Rules:
   - **Worker threads must NEVER touch `st.session_state`** — settings are captured as a snapshot at submit time into `LlmJob.config_json` and applied via `llm_client.set_job_config()` (thread-local); translations use `t(key, lang=...)` with the language from the snapshot.
   - **Kind locks**: one job per kind at a time (`_active_kinds`), so duplicate buttons across tabs (e.g. backfill in Reports + Mapping) can't double-run; `submit_job` returns `None` → UI shows `msg_job_already_running`.

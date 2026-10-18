@@ -5,7 +5,7 @@ import streamlit as st
 from sqlalchemy.orm import Session as SASession
 
 from config import REPORTS_DIR, resolve_canonical, get_default_ref_range
-from database import Report, DataPoint, Patient, get_or_create_patient, _canonical_base, get_registry
+from database import Report, DataPoint, Patient, get_or_create_patient, _canonical_base, get_registry, clean_unit
 from pdf_processor import pdf_to_base64_jpeg, file_hash
 from llm_client import _build_client, extract_page, extract_pages_batch, is_job_aborted, normalize_names
 
@@ -299,14 +299,21 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             for entry in all_entries:
                 if not entry.name:
                     continue
+                # Collapse stray internal whitespace in the unit ('ml/ min' →
+                # 'ml/min') BEFORE anything uses it. OCR/LLM extraction emits
+                # these, and because merge grouping keys on the unit a stray
+                # space splits one biomarker into two entries that never merge.
+                # Cleaning at ingestion keeps every downstream consumer
+                # (registry lookup, ref-range default, dedup, storage) aligned.
+                unit = clean_unit(entry.unit)
                 # Deterministic registry resolution only — the LLM name mapping
                 # happens once for ALL reports in Phase 2, not once per PDF.
-                canonical = _normalize_name(entry.name, entry.unit, [], canonical_names, registry=registry)
+                canonical = _normalize_name(entry.name, unit, [], canonical_names, registry=registry)
                 ref_low, ref_high = _parse_reference_range(entry.reference_range)
 
                 # Fallback to default reference ranges (active DB registry) when PDF omits them
                 if ref_low is None and ref_high is None:
-                    def_ref_low, def_ref_high, def_unit = get_default_ref_range(canonical, entry.unit, registry=registry)
+                    def_ref_low, def_ref_high, def_unit = get_default_ref_range(canonical, unit, registry=registry)
                     if def_ref_low is not None or def_ref_high is not None:
                         ref_low = def_ref_low
                         ref_high = def_ref_high
@@ -320,18 +327,20 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                     canonical_name=canonical,
                     original_name=entry.name,
                     value=entry.value,
-                    unit=entry.unit,
+                    unit=unit,
                     ref_low=ref_low,
                     ref_high=ref_high,
                     is_abnormal=is_abnormal,
                 )
                 session.add(dp)
 
-                # Deduplicate by (name case-insensitive, unit or "") so the LLM
-                # sees units — needed to disambiguate unit-qualified variants.
-                key = (entry.name.strip().lower(), (entry.unit or "").strip())
+                # Deduplicate by (name case-insensitive, cleaned unit or "") so
+                # the LLM sees units — needed to disambiguate unit-qualified
+                # variants. The cleaned unit also collapses 'ml/min' vs 'ml/ min'
+                # into one pending entry.
+                key = (entry.name.strip().lower(), unit or "")
                 if key not in pending_entries:
-                    pending_entries[key] = {"name": entry.name, "unit": entry.unit}
+                    pending_entries[key] = {"name": entry.name, "unit": unit}
 
             session.commit()
             new_report_ids.append(report.id)

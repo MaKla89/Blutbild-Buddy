@@ -334,6 +334,7 @@ def init_db():
     _migrate_data_quality_findings(engine)
     _migrate_fix_implausible_ref_ranges(engine)
     _migrate_patient_demographics(engine)
+    _migrate_clean_unit_whitespace(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -552,6 +553,86 @@ def _migrate_fix_implausible_ref_ranges(engine):
         conn.commit()
 
 
+def _migrate_clean_unit_whitespace(engine):
+    """One-time cleanup of units with stray internal whitespace.
+
+    OCR/LLM extraction sometimes emits a unit with a space inside it
+    ('ml/ min' instead of 'ml/min'). Because biomarker merge grouping keys on
+    the unit (get_unique_biomarker_groups) and the trends/all-values tabs list
+    DISTINCT (canonical_name, unit), such a typo shows the SAME biomarker twice
+    (e.g. "eGFR (CKD-EPI) (ml/min)" and "eGFR (CKD-EPI) (ml/ min)") and the
+    auto-merge never groups them.
+
+    Lab units never contain meaningful internal spaces, so collapsing every
+    whitespace run is safe. Only rows whose cleaned form differs are touched,
+    so the migration is idempotent (once fixed, no row matches). The cleaned
+    rows then share one (canonical_name, unit) and collapse to a single entry
+    in every view.
+    """
+    inspector = inspect(engine)
+    if "data_points" not in inspector.get_table_names():
+        return
+    with engine.connect() as conn:
+        # LIKE '% %' matches any unit containing a space; leading/trailing-only
+        # spaces are already handled by normalize_unit, but clean them too.
+        rows = conn.execute(text(
+            "SELECT id, unit FROM data_points "
+            "WHERE unit IS NOT NULL AND unit LIKE '% %'"
+        )).fetchall()
+        cleaned_any = False
+        for dp_id, unit in rows:
+            cleaned = clean_unit(unit)
+            if cleaned is not None and cleaned != unit:
+                _logger.info(
+                    "Cleaning unit on data_point %s: %r -> %r", dp_id, unit, cleaned
+                )
+                conn.execute(
+                    text("UPDATE data_points SET unit = :u WHERE id = :i"),
+                    {"u": cleaned, "i": dp_id},
+                )
+                cleaned_any = True
+
+        # The registry can carry spaced units too: accepted LLM 'registry_unit'
+        # proposals (pre-fix) and merged unit lists. Clean the JSON list and the
+        # ref_unit column so registry-side comparisons never see 'ml/ min'.
+        if "biomarker_registry" in inspector.get_table_names():
+            reg_rows = conn.execute(text(
+                "SELECT id, units, ref_unit FROM biomarker_registry "
+                "WHERE units LIKE '% %' OR ref_unit LIKE '% %'"
+            )).fetchall()
+            for reg_id, units_json, ref_unit in reg_rows:
+                try:
+                    units = json.loads(units_json) if units_json else []
+                except (json.JSONDecodeError, TypeError):
+                    units = []
+                if not isinstance(units, list):
+                    units = []
+                new_units = []
+                seen = set()
+                for u in units:
+                    cu = clean_unit(str(u))
+                    if cu is None:
+                        continue
+                    if cu.lower() in seen:
+                        continue
+                    seen.add(cu.lower())
+                    new_units.append(cu)
+                new_ref_unit = clean_unit(ref_unit)
+                if new_units != units or new_ref_unit != ref_unit:
+                    _logger.info(
+                        "Cleaning units on biomarker_registry %s: %r -> %r, ref %r -> %r",
+                        reg_id, units_json, new_units, ref_unit, new_ref_unit,
+                    )
+                    conn.execute(
+                        text("UPDATE biomarker_registry SET units = :u, "
+                             "ref_unit = :r WHERE id = :i"),
+                        {"u": json.dumps(new_units), "r": new_ref_unit, "i": reg_id},
+                    )
+                    cleaned_any = True
+        if cleaned_any:
+            conn.commit()
+
+
 # ── Registry loader (cached) ─────────────────────────────────────────────────
 
 _registry_cache_key = None
@@ -660,11 +741,33 @@ def normalize_canonical_name(name: str) -> str:
     return _canonical_base(name.strip().lower())
 
 
-def normalize_unit(unit: str | None) -> str | None:
-    """Normalize a unit for case-insensitive comparison."""
+def clean_unit(unit: str | None) -> str | None:
+    """Collapse stray internal whitespace in a unit for storage.
+
+    OCR/LLM extraction sometimes emits a unit with a space inside it
+    ('ml/ min' instead of 'ml/min'). Lab units never contain meaningful
+    internal spaces, so removing every whitespace run is safe. Case is
+    preserved for display (case-insensitive matching is normalize_unit's
+    job); an all-whitespace unit becomes None.
+    """
     if unit is None:
         return None
-    return unit.strip().lower()
+    cleaned = re.sub(r"\s+", "", unit)
+    return cleaned or None
+
+
+def normalize_unit(unit: str | None) -> str | None:
+    """Normalize a unit for case-insensitive comparison.
+
+    Lower-cases AND collapses internal whitespace, so 'ml/ min', 'ml /min'
+    and 'ml/min' all compare equal. Without the whitespace collapse a stray
+    space inside a unit splits one biomarker into two merge groups (the
+    grouping key in get_unique_biomarker_groups includes the unit), so the
+    auto-merge never even sees them as candidates.
+    """
+    if unit is None:
+        return None
+    return re.sub(r"\s+", "", unit).lower()
 
 
 def get_unique_biomarker_groups(session: SASession, patient_id: int) -> list[dict]:
@@ -807,7 +910,9 @@ def auto_merge_biomarkers(session: SASession, patient_id: int, llm_client=None) 
         units = list({v["unit"] for v in group["variants"] if v["unit"]})
         if suggestion is not None:
             target = suggestion["target"]
-            target_unit = suggestion["unit"]
+            # The LLM may echo a unit with a stray internal space; clean it so
+            # the merge target matches the (already cleaned) stored units.
+            target_unit = clean_unit(suggestion.get("unit")) or ""
         else:
             # Fallback: use the most common variant's base name matched to canonical list
             target = _fallback_target([v["name"] for v in group["variants"]], canonical_names)
@@ -894,7 +999,9 @@ def apply_merge_plan(session: SASession, patient_id: int, merge_plan: list[dict]
         variants = plan["variants"]
         source_units = [v["unit"] for v in variants if v["unit"]]
         target = plan["suggested_target"]
-        target_unit = plan.get("suggested_unit", "")
+        # Clean the target unit so a stray internal space in a plan (LLM- or
+        # caller-supplied) can never be written into the DB.
+        target_unit = clean_unit(plan.get("suggested_unit", "")) or ""
 
         # Validate unit compatibility before merging
         if source_units and not _units_compatible(source_units):
@@ -1314,6 +1421,7 @@ def _parse_ref_range(proposed: str) -> tuple[float | None, float | None, str | N
             val = float(num.replace(",", "."))
         except ValueError:
             return (None, None, None)
+        unit = clean_unit(unit)
         return ((None, val, unit) if op == "<" else (val, None, unit))
     m = re.match(r"^([\d.,]+)\s*[–\-~]\s*([\d.,]+)\s*(.*)$", s)
     if m:
@@ -1322,7 +1430,7 @@ def _parse_ref_range(proposed: str) -> tuple[float | None, float | None, str | N
             high = float(m.group(2).replace(",", "."))
         except ValueError:
             return (None, None, None)
-        return (low, high, m.group(3).strip() or None)
+        return (low, high, clean_unit(m.group(3).strip()))
     return (None, None, None)
 
 
@@ -1343,12 +1451,15 @@ def _mutate_registry_row(session: SASession, row: BiomarkerRegistry, field: str,
         if unit:
             row.ref_unit = unit
     elif field == "unit":
+        proposed = clean_unit(proposed) or ""
+        if not proposed:
+            return False, "unit is empty after cleaning whitespace"
         units = json.loads(row.units) if row.units else []
         if not isinstance(units, list):
             units = []
-        # Case-insensitive replace-or-append so re-applying a corrected unit
-        # doesn't accumulate duplicates.
-        new_units = [u for u in units if str(u).strip().lower() != proposed.lower()]
+        # Whitespace/case-insensitive replace-or-append so re-applying a
+        # corrected unit doesn't accumulate duplicates ('ml/ min' == 'ml/min').
+        new_units = [u for u in units if normalize_unit(str(u)) != normalize_unit(proposed)]
         new_units.append(proposed)
         row.units = json.dumps(new_units)
     elif field == "name":
@@ -1747,7 +1858,7 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
     if action == "set_ref_range":
         low = params.get("low")
         high = params.get("high")
-        unit = str(params.get("unit", "") or "").strip()
+        unit = clean_unit(str(params.get("unit", "") or "")) or ""
         if low is None and high is None:
             return False, "no ref range bounds provided"
         import config as _config
@@ -1757,7 +1868,7 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
             # If the proposed range is in a different unit than this data point,
             # convert it (name-aware). An unsupported conversion skips the point
             # rather than stamping a range in the wrong unit.
-            if unit and dp.unit and unit.lower() != dp.unit.strip().lower():
+            if unit and dp.unit and normalize_unit(unit) != normalize_unit(dp.unit):
                 conv_low, conv_high = _config._convert_ref_range(
                     dp.canonical_name, low, high, unit, dp.unit
                 )
@@ -1775,13 +1886,13 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
         return True, f"{updated} data point(s) updated"
 
     if action == "set_unit":
-        new_unit = str(params.get("unit", "") or "").strip()
+        new_unit = clean_unit(str(params.get("unit", "") or "")) or ""
         if not new_unit:
             return False, "no target unit provided"
         import config as _config
         updated = 0
         for dp in dps:
-            old_unit = (dp.unit or "").strip()
+            old_unit = clean_unit(dp.unit) or ""
             if old_unit and old_unit.lower() == new_unit.lower():
                 # Same unit — nothing to convert, just normalize the label.
                 dp.unit = new_unit

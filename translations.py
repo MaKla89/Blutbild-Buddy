@@ -89,7 +89,19 @@ DE = {
     "tab_risks": "⚠️ Risiken",
     "tab_mapping": "🔗 Biomarker-Einstellungen",
     "tab_all_values": "📋 Alle Werte",
+    "tab_chat": "💬 Chat mit Daten",
     "tab_management": "⚙️ Verwaltung",
+
+    # Chat tab ("chat with your data")
+    "subheader_chat": "💬 Chat mit Ihren Laborwerten",
+    "caption_chat": "Stellen Sie freie Fragen zu Ihren Messwerten im gewählten Zeitraum. Der Assistent erhält alle nicht deaktivierten Messwerte inklusive Messdaten, Einheiten und Referenzbereichen und antwortet ausschließlich auf Basis dieser Daten.",
+    "chat_data_context_info": "📚 Kontext für den Assistenten: {n} Messwerte von {markers} Biomarkern vom {first} bis {last}.",
+    "chat_input_placeholder": "Fragen Sie etwas über Ihre Werte… (z.B. 'Wie hat sich mein LDL entwickelt?')",
+    "chat_thinking": "Assistent antwortet…",
+    "btn_clear_chat": "🧹 Gesprächsverlauf löschen",
+    "chat_no_data": "Keine Messwerte im gewählten Zeitraum — der Chat kann keine Fragen beantworten. Laden Sie Berichte hoch oder erweitern Sie den Zeitraum.",
+    "error_chat_generation": "❌ Fehler bei der Antwortgenerierung: {error}",
+    "chat_disclaimer": "⚠️ KI-generierte Antworten ersetzen keine ärztliche Beratung.",
 
     # Reports tab
     "subheader_reports_manage": "Berichte verwalten",
@@ -508,7 +520,19 @@ EN = {
     "tab_risks": "⚠️ Risks",
     "tab_mapping": "🔗 Biomarker Settings",
     "tab_all_values": "📋 All Values",
+    "tab_chat": "💬 Chat with Data",
     "tab_management": "⚙️ Management",
+
+    # Chat tab ("chat with your data")
+    "subheader_chat": "💬 Chat with Your Lab Values",
+    "caption_chat": "Ask free-form questions about your measurements in the selected time range. The assistant receives all non-disabled measurements including dates, units and reference ranges and answers strictly based on that data.",
+    "chat_data_context_info": "📚 Context for the assistant: {n} measurements of {markers} biomarkers from {first} to {last}.",
+    "chat_input_placeholder": "Ask something about your values… (e.g. 'How has my LDL developed?')",
+    "chat_thinking": "Assistant is answering…",
+    "btn_clear_chat": "🧹 Clear conversation",
+    "chat_no_data": "No measurements in the selected time range — the chat cannot answer questions. Upload reports or widen the time range.",
+    "error_chat_generation": "❌ Error generating the answer: {error}",
+    "chat_disclaimer": "⚠️ AI-generated answers do not replace medical advice.",
 
     # Reports tab
     "subheader_reports_manage": "Manage Reports",
