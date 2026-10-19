@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session as SASession
 from sqlalchemy import func
 
 from config import RISK_CONFIG, get_critical_direction
-from database import Patient, Report, DataPoint, RiskFlag, normalize_canonical_name, normalize_unit
+from database import Patient, Report, DataPoint, RiskFlag, ReportArtifact, normalize_canonical_name, normalize_unit
 from translations import t
 
 
@@ -875,6 +875,51 @@ def _detect_missing_markers(
     return flags
 
 
+def _detect_report_artifacts(session: SASession, patient_id: int) -> list[RiskFlag]:
+    """Turn each ENABLED report artifact into a candidate risk flag.
+
+    Artifacts are the qualitative / narrative findings pulled from a report's
+    written text (see ReportArtifact). They carry no numeric value, so the
+    biomarker detectors never see them — this gives them a voice in the risk
+    ranking so the LLM can weigh e.g. "patient reports persistent fatigue"
+    alongside the numbers.
+
+    Disabled artifacts are excluded (same rule as disabled values), so toggling
+    one off in the Detail tab removes its flag on the next refresh. The flag
+    keeps its source report_id (so per-patient refresh can clear it) and points
+    at no data point. The description embeds the verbatim source excerpt and
+    page so the user can trace the flag back to the report wording.
+    """
+    flags = []
+    rows = (
+        session.query(ReportArtifact)
+        .join(Report, ReportArtifact.report_id == Report.id)
+        .filter(
+            Report.patient_id == patient_id,
+            ReportArtifact.is_disabled == False,  # noqa: E712
+        )
+        .order_by(Report.report_date.asc(), ReportArtifact.id.asc())
+        .all()
+    )
+    for art in rows:
+        detail = art.text
+        provenance = []
+        if art.source_excerpt:
+            provenance.append(f'{t("risk_artifact_source")}: "{art.source_excerpt}"')
+        if art.source_page:
+            provenance.append(f'{t("risk_artifact_page")} {art.source_page}')
+        if provenance:
+            detail = f"{detail} ({', '.join(provenance)})"
+        flags.append(RiskFlag(
+            report_id=art.report_id,
+            data_point_id=None,
+            category="report_artifact",
+            severity=2,
+            description=f"📝 {art.category}: {detail}",
+        ))
+    return flags
+
+
 def _analyze_patient(session: SASession, patient: Patient) -> list[RiskFlag]:
     """Run all per-patient detection (pre-dedup) for a single patient.
 
@@ -942,6 +987,10 @@ def _analyze_patient(session: SASession, patient: Patient) -> list[RiskFlag]:
     flags.extend(
         _detect_missing_markers(session, patient.id, latest_report_date)
     )
+
+    # 4. Report artifacts (qualitative / narrative findings from the written
+    # text) become candidate flags so the LLM ranking can weigh them too.
+    flags.extend(_detect_report_artifacts(session, patient.id))
 
     return flags
 

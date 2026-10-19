@@ -30,7 +30,7 @@ import streamlit as st
 
 from database import (
     Report, DataPoint, LlmJob, patient_age_years, get_session,
-    ChatMessage,
+    ChatMessage, collect_report_artifacts,
     create_chat_conversation, get_chat_conversation, list_chat_conversations,
     add_chat_message, get_chat_messages, delete_chat_conversation,
 )
@@ -78,7 +78,19 @@ def collect_chat_measurements(session, patient_id, start_date=None, end_date=Non
     ]
 
 
-def format_chat_data_context(patient, measurements, lang, range_label=""):
+def collect_chat_artifacts(session, patient_id, start_date=None, end_date=None):
+    """Enabled report artifacts of a patient within [start_date, end_date].
+
+    Thin wrapper over the shared ``collect_report_artifacts`` so the chat uses
+    exactly the same enable/disable + date-window rules as the summary and risk
+    paths. Returns ``(report_date, category, text, source_excerpt, source_page)``
+    tuples, oldest first. Excluded: disabled artifacts, and — when a window is
+    applied — artifacts on undated reports (no timestamp to place in the range).
+    """
+    return collect_report_artifacts(session, patient_id, start_date, end_date)
+
+
+def format_chat_data_context(patient, measurements, lang, range_label="", artifacts=None):
     """Format the patient dataset injected into the chat system prompt.
 
     Two sections, following the conventions of the summary/interpretation
@@ -136,11 +148,34 @@ def format_chat_data_context(patient, measurements, lang, range_label=""):
         blocks.append(f"{title}:\n" + "\n".join(lines))
 
     span = f" {range_label}" if range_label else ""
-    header = (f"=== MESSWERTE{span} "
-              "(gruppiert nach Biomarker, chronologisch) ===" if de else
-              f"=== MEASUREMENTS{span} "
-              "(grouped per biomarker, chronological) ===")
-    parts.append(header + "\n" + "\n".join(blocks))
+    if measurements:
+        header = (f"=== MESSWERTE{span} "
+                  "(gruppiert nach Biomarker, chronologisch) ===" if de else
+                  f"=== MEASUREMENTS{span} "
+                  "(grouped per biomarker, chronological) ===")
+        parts.append(header + "\n" + "\n".join(blocks))
+
+    # ── Report artifacts (qualitative / narrative findings from the text) ───
+    # Enabled artifacts within the chat's date window (disabled ones are
+    # excluded upstream). Omitted entirely when there are none, so a patient
+    # with only measurements — or only artifacts — still gets a clean context.
+    if artifacts:
+        art_lines = []
+        for rdate, category, text, excerpt, page in artifacts:
+            date_str = rdate.strftime("%d.%m.%Y") if rdate else "?"
+            line = f"  - {date_str} [{category}]: {text}"
+            provenance = []
+            if excerpt:
+                provenance.append(f'({("Quelle" if de else "Source")}: "{excerpt}")')
+            if page:
+                provenance.append(f'({("Seite" if de else "page")} {page})')
+            if provenance:
+                line += " " + " ".join(provenance)
+            art_lines.append(line)
+        art_header = ("=== QUALITATIVE BEFUNDE UND BERICTNOTIZEN ===" if de else
+                      "=== QUALITATIVE FINDINGS AND REPORT NOTES ===")
+        parts.append(art_header + "\n" + "\n".join(art_lines))
+
     return "\n\n".join(parts)
 
 
@@ -229,19 +264,23 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
     )
 
     measurements = collect_chat_measurements(session, patient.id, start_date, end_date)
-    if not measurements:
+    artifacts = collect_chat_artifacts(session, patient.id, start_date, end_date)
+    if not measurements and not artifacts:
         st.info(t("chat_no_data"))
         return
 
     # Transparency: show exactly what window the LLM is answering from.
-    n_markers = len({(m[1], m[3] or "") for m in measurements})
-    st.caption(t(
-        "chat_data_context_info",
-        n=len(measurements),
-        markers=n_markers,
-        first=measurements[0][0].strftime("%d.%m.%Y"),
-        last=measurements[-1][0].strftime("%d.%m.%Y"),
-    ))
+    if measurements:
+        n_markers = len({(m[1], m[3] or "") for m in measurements})
+        st.caption(t(
+            "chat_data_context_info",
+            n=len(measurements),
+            markers=n_markers,
+            first=measurements[0][0].strftime("%d.%m.%Y"),
+            last=measurements[-1][0].strftime("%d.%m.%Y"),
+        ))
+    if artifacts:
+        st.caption(t("chat_artifacts_context_info", n=len(artifacts)))
 
     # ── Conversation picker (history list, most recently active first) ─────
     patient_id = patient.id
@@ -352,7 +391,9 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
             f"{start_date.strftime('%d.%m.%Y')} – {end_date.strftime('%d.%m.%Y')}"
             if start_date and end_date else ""
         )
-        context = format_chat_data_context(patient, measurements, lang, range_label=range_label)
+        context = format_chat_data_context(
+            patient, measurements, lang, range_label=range_label, artifacts=artifacts,
+        )
         submitted = submit_job(
             "chat_answer", "job_kind_chat_answer",
             params={

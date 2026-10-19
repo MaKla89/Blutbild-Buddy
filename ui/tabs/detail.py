@@ -8,15 +8,31 @@ import pandas as pd
 import streamlit as st
 
 from analyzer import refresh_patient_risk_flags
-from database import DataPoint, set_data_point_disabled
-from translations import t
+from database import DataPoint, ReportArtifact, set_data_point_disabled, set_report_artifact_disabled
+from translations import t, _get_lang
 from ui.helpers import _flash, _show_flash
+
+
+# Friendly label + icon per artifact category (the extractor's free-form labels).
+_ARTIFACT_CATEGORY_LABELS = {
+    "qualitative_result": ("🔬", "Qualitativer Befund", "Qualitative result"),
+    "clinical_observation": ("👀", "Klinische Beobachtung", "Clinical observation"),
+    "condition": ("🩺", "Zustand / Medikation", "Condition / medication"),
+    "general_insight": ("💡", "Allgemeiner Hinweis", "General insight"),
+}
+
+
+def _artifact_category_label(category: str, de: bool) -> str:
+    icon, de_label, en_label = _ARTIFACT_CATEGORY_LABELS.get(
+        (category or "").lower(), ("📝", category, category))
+    return f"{icon} {de_label if de else en_label}"
 
 
 def render_detail_tab(session, patient, patient_reports):
     # Confirmation for the last enable/disable toggle (queued via _flash on
     # the run where the checkbox was flipped; that run ends in st.rerun()).
     _show_flash("dp_toggle")
+    _show_flash("artifact_toggle")
 
     if patient_reports:
         report_options = {
@@ -135,5 +151,55 @@ def render_detail_tab(session, patient, patient_reports):
                 }
         else:
             st.info(t("info_no_data_points"))
+
+        # ── Report artifacts: qualitative / narrative findings from the text ──
+        # A bullet list, one checkbox per artifact. Disabling an artifact
+        # excludes it from every LLM analysis (summary, risk, chat) — the same
+        # rule as disabling a measurement. The checkbox's own widget state is
+        # the source of truth for the toggle; a mismatch against the DB row
+        # means the user flipped it this run.
+        st.divider()
+        st.markdown(f"**{t('subheader_report_artifacts')}**")
+        st.caption(t("caption_report_artifacts"))
+        artifacts_detail = (
+            session.query(ReportArtifact)
+            .filter(ReportArtifact.report_id == selected_report.id)
+            .order_by(ReportArtifact.id)
+            .all()
+        )
+        if artifacts_detail:
+            de = _get_lang() == "de"
+            changed_artifacts = False
+            for art in artifacts_detail:
+                col_cb, col_txt = st.columns([1, 12])
+                now_enabled = col_cb.checkbox(
+                    t("col_active"), value=not art.is_disabled,
+                    key=f"art_active_{art.id}", label_visibility="collapsed",
+                )
+                label = _artifact_category_label(art.category, de)
+                body = f"**{label}:** {art.text}"
+                prov = []
+                if art.source_excerpt:
+                    prov.append(
+                        f'{("Quelle" if de else "Source")}: "{art.source_excerpt}"')
+                if art.source_page:
+                    prov.append(f'{("Seite" if de else "page")} {art.source_page}')
+                if prov:
+                    body += f"\n\n:grey[{' · '.join(prov)}]"
+                if art.is_disabled:
+                    body = f"⛔ {body}"
+                col_txt.markdown(body)
+                if now_enabled == art.is_disabled:
+                    # Checkbox disagrees with the stored state → user toggled it.
+                    updated = set_report_artifact_disabled(session, art.id, not now_enabled)
+                    if updated is not None:
+                        refresh_patient_risk_flags(session, patient.id)
+                    msg = t("msg_artifact_enabled") if now_enabled else t("msg_artifact_disabled")
+                    _flash("artifact_toggle", "success", f"{msg} ({label})")
+                    changed_artifacts = True
+            if changed_artifacts:
+                st.session_state._rerun_requested = True
+        else:
+            st.info(t("info_no_artifacts"))
     else:
         st.info(t("info_no_reports"))

@@ -7,7 +7,7 @@ import config
 
 from database import (
     init_db, get_session, Patient, Report, DataPoint, RiskFlag,
-    get_latest_patient_summary, patient_age_years,
+    get_latest_patient_summary, patient_age_years, collect_report_artifacts,
     mark_stale_llm_jobs_interrupted,
 )
 from sqlalchemy import func
@@ -103,6 +103,7 @@ def _generate_summary_for_patient(session, patient, llm):
     # pre-cutoff values of markers that are also abnormal recently — no
     # overlap with the recent window, capped per biomarker).
     historical_data = _collect_historical_data(session, patient.id, cutoff)
+    artifacts = collect_report_artifacts(session, patient.id, start_date=cutoff)
 
     # Risk flags — include urgency + LLM explanation so the summary agrees
     # with the Risks tab (same findings, same urgency) instead of re-guessing.
@@ -129,7 +130,7 @@ def _generate_summary_for_patient(session, patient, llm):
     try:
         return generate_patient_summary(
             llm, patient.name, recent_data, historical_data, risk_data, lang,
-            profile=profile,
+            profile=profile, artifacts=artifacts,
         )
     except Exception:
         return None

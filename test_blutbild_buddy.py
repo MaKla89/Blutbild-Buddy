@@ -231,10 +231,18 @@ class TestExtractorMocked(unittest.TestCase):
     @patch("extractor.extract_pages_batch")
     def test_process_new_pdfs(self, mock_batch, mock_norm, mock_extract):
         from schemas import ExtractedPage, NormalizationMapping
-        mock_extract.return_value = ExtractedPage(**MOCK_EXTRACTED_PAGE)
+        extraction_page = {
+            **MOCK_EXTRACTED_PAGE,
+            "artifacts": [{
+                "category": "clinical_observation",
+                "text": "Patient reports persistent fatigue",
+                "source_excerpt": "persistent fatigue",
+            }],
+        }
+        mock_extract.return_value = ExtractedPage(**extraction_page)
         # Default batch size is 0 → one call per report carrying all pages.
         # Mock it to return one extracted page per input image.
-        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**MOCK_EXTRACTED_PAGE) for _ in pages]
+        mock_batch.side_effect = lambda llm, pages, **kw: [ExtractedPage(**extraction_page) for _ in pages]
         mock_norm.return_value = NormalizationMapping(**MOCK_NORMALIZATION)
 
         from extractor import process_new_pdfs
@@ -251,6 +259,10 @@ class TestExtractorMocked(unittest.TestCase):
         # Phase 2 (global normalization) must have applied the LLM mappings.
         wbc = self.session.query(database.DataPoint).filter_by(canonical_name="Leukozyten (WBC)").all()
         self.assertEqual(len(wbc), 4)
+        artifacts = self.session.query(database.ReportArtifact).all()
+        self.assertEqual(len(artifacts), 2)
+        self.assertTrue(all(a.source_page == 1 for a in artifacts))
+        self.assertTrue(all(a.source_excerpt == "persistent fatigue" for a in artifacts))
         # One extraction call per report (not per page) at the default batch size.
         self.assertEqual(mock_batch.call_count, 2)
         print(f"  Total data points: {len(dps)}")
@@ -502,6 +514,39 @@ class TestAnalyzerExtended(unittest.TestCase):
         flags = self.session.query(database.RiskFlag).all()
         for f in flags:
             self.assertIsNone(f.explanation)
+
+    def test_artifact_risk_findings_are_refreshed_and_disableable(self):
+        from analyzer import refresh_patient_risk_flags, refresh_risk_flags
+        patient = database.get_or_create_patient(self.session, "Artifact Risk Patient")
+        report = database.Report(
+            patient_id=patient.id, filename="artifact_risk.pdf",
+            file_hash="artifact_risk_hash", report_date=datetime.now(),
+        )
+        self.session.add(report)
+        self.session.flush()
+        artifact = database.ReportArtifact(
+            report_id=report.id, category="clinical_observation",
+            text="Persistent symptom recorded", source_excerpt="persistent symptom", source_page=4,
+        )
+        self.session.add(artifact)
+        self.session.commit()
+
+        refresh_risk_flags(self.session, llm=None)
+        risk = self.session.query(database.RiskFlag).filter_by(
+            report_id=report.id, category="report_artifact",
+        ).one()
+        self.assertIn("persistent symptom", risk.description)
+        self.assertIn("Seite 4", risk.description)
+
+        artifact.is_disabled = True
+        self.session.commit()
+        refresh_patient_risk_flags(self.session, patient.id)
+        self.assertEqual(
+            self.session.query(database.RiskFlag).filter_by(
+                report_id=report.id, category="report_artifact",
+            ).count(),
+            0,
+        )
 
 
 class TestParseReferenceRange(unittest.TestCase):
@@ -3223,7 +3268,7 @@ class TestDisabledMeasurements(unittest.TestCase):
 
         captured = {}
 
-        def fake_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None, profile=None):
+        def fake_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None, profile=None, artifacts=None):
             captured["recent"] = list(recent_dps)
             return "ok"
 
@@ -5331,6 +5376,64 @@ class TestChatWithData(unittest.TestCase):
         self.assertEqual({r[:3] for r in rows},
                          {(datetime(2025, 6, 1), "LDL", 190.0), (datetime(2025, 6, 1), "HDL", 45.0)})
         self.assertTrue(all(len(r) == 7 for r in rows))
+
+    def test_collect_chat_artifacts_honors_enabled_state_and_date_range(self):
+        from ui.tabs.chat import collect_chat_artifacts
+        p = database.get_or_create_patient(self.session, "Chat Artifact Patient")
+        inside = self._add_report(p, "ca_inside", datetime(2025, 6, 1), [])
+        old = self._add_report(p, "ca_old", datetime(2019, 1, 1), [])
+        undated = self._add_report(p, "ca_undated", None, [], undated=True)
+        self.session.add_all([
+            database.ReportArtifact(
+                report_id=inside.id, category="qualitative_result",
+                text="Urine culture negative", source_excerpt="no growth", source_page=2,
+            ),
+            database.ReportArtifact(
+                report_id=inside.id, category="clinical_observation",
+                text="Patient takes medication X", is_disabled=True,
+            ),
+            database.ReportArtifact(
+                report_id=old.id, category="clinical_observation", text="Old note",
+            ),
+            database.ReportArtifact(
+                report_id=undated.id, category="clinical_observation", text="Undated note",
+            ),
+        ])
+        self.session.commit()
+
+        rows = collect_chat_artifacts(
+            self.session, p.id,
+            datetime(2021, 1, 1), datetime(2026, 1, 1),
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1:], (
+            "qualitative_result", "Urine culture negative", "no growth", 2,
+        ))
+
+    def test_chat_context_supports_artifacts_without_measurements(self):
+        from ui.tabs.chat import format_chat_data_context
+        p = database.Patient(id=999998, name="Artifact only", sex=None, clinical_context=None)
+        context = format_chat_data_context(
+            p, [], "en", artifacts=[(
+                datetime(2025, 6, 1), "qualitative_result", "Culture negative", "no growth", 2,
+            )],
+        )
+        self.assertNotIn("=== MEASUREMENTS", context)
+        self.assertIn("=== QUALITATIVE FINDINGS AND REPORT NOTES ===", context)
+        self.assertIn('01.06.2025 [qualitative_result]: Culture negative (Source: "no growth") (page 2)', context)
+
+    def test_summary_prompt_includes_report_artifacts(self):
+        from llm_client import build_patient_summary_prompt
+        prompt = build_patient_summary_prompt(
+            "John", [], [], [], "en",
+            artifacts=[(
+                datetime(2025, 6, 1), "clinical_observation",
+                "Persistent cough noted", "reports persistent cough", 3,
+            )],
+        )
+        self.assertIn("=== Qualitative findings and notes from reports (last 2 years) ===", prompt)
+        self.assertIn('01.06.2025 [clinical_observation]: Persistent cough noted', prompt)
+        self.assertIn('(Source: "reports persistent cough") (page 3)', prompt)
 
     # ── format_chat_data_context ────────────────────────────────────────────
 

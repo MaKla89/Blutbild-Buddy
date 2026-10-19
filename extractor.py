@@ -5,7 +5,7 @@ import streamlit as st
 from sqlalchemy.orm import Session as SASession
 
 from config import REPORTS_DIR, resolve_canonical, get_default_ref_range
-from database import Report, DataPoint, Patient, get_or_create_patient, _canonical_base, get_registry, clean_unit
+from database import Report, DataPoint, Patient, ReportArtifact, get_or_create_patient, _canonical_base, get_registry, clean_unit
 from pdf_processor import pdf_to_base64_jpeg, file_hash
 from llm_client import _build_client, extract_page, extract_pages_batch, is_job_aborted, normalize_names
 
@@ -256,8 +256,13 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             patient_name = None
             report_date = None
             panel_type = None
+            # Non-numeric findings from the written text, deduplicated per
+            # report by (category, text) — the same note often repeats across
+            # pages of one report, and we want ONE artifact carrying the first
+            # page it appeared on. Key → (text, source_excerpt, page).
+            artifact_by_key: dict[tuple[str, str], tuple[str, str | None, int]] = {}
 
-            for page_data in _extract_report_pages(llm, b64_pages, batch_size):
+            for page_idx, page_data in enumerate(_extract_report_pages(llm, b64_pages, batch_size)):
                 if page_data.patient_name and not patient_name:
                     patient_name = page_data.patient_name
                 if page_data.report_date and not report_date:
@@ -265,6 +270,16 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                 if page_data.panel_type and not panel_type:
                     panel_type = page_data.panel_type
                 all_entries.extend(page_data.entries)
+                page_no = page_idx + 1  # 1-based, matches how pages are shown to the user
+                for art in getattr(page_data, "artifacts", []) or []:
+                    text = (art.text or "").strip()
+                    if not text:
+                        continue
+                    category = (art.category or "general_insight").strip() or "general_insight"
+                    key = (category.lower(), text.lower())
+                    if key not in artifact_by_key:
+                        excerpt = (art.source_excerpt or "").strip() or None
+                        artifact_by_key[key] = (category, text, excerpt, page_no)
 
             if not patient_name:
                 parts = pdf_path.stem.split("-")
@@ -341,6 +356,16 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                 key = (entry.name.strip().lower(), unit or "")
                 if key not in pending_entries:
                     pending_entries[key] = {"name": entry.name, "unit": unit}
+
+            # Store the deduplicated written-text findings for this report.
+            for category, text_val, excerpt, page_no in artifact_by_key.values():
+                session.add(ReportArtifact(
+                    report_id=report.id,
+                    category=category,
+                    text=text_val,
+                    source_excerpt=excerpt,
+                    source_page=page_no,
+                ))
 
             session.commit()
             new_report_ids.append(report.id)

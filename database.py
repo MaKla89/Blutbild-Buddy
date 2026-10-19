@@ -145,6 +145,7 @@ class Report(Base):
     patient = relationship("Patient", back_populates="reports")
     data_points = relationship("DataPoint", back_populates="report", cascade="all, delete-orphan")
     risk_flags = relationship("RiskFlag", back_populates="report", cascade="all, delete-orphan")
+    artifacts = relationship("ReportArtifact", back_populates="report", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<Report {self.id}: {self.filename}>"
@@ -191,6 +192,41 @@ class RiskFlag(Base):
 
     def __repr__(self):
         return f"<RiskFlag {self.category} severity={self.severity}>"
+
+
+class ReportArtifact(Base):
+    """A non-biomarker artifact extracted from a report's written text.
+
+    Qualitative results ("Urinkultur negativ"), clinical observations,
+    conditions or general health insights that carry no numeric value and
+    therefore do not fit the DataPoint model. Each artifact is tied to the
+    report it came from (so its date/provenance are the report's) and can be
+    individually disabled — disabled artifacts are excluded from every LLM
+    analysis (summary, risk assessment, chat), exactly like disabled values.
+
+    ``category`` is a free-form label from the extractor
+    ("qualitative_result", "clinical_observation", "condition", ...).
+    ``source_excerpt`` / ``source_page`` preserve the report wording the
+    artifact was derived from, so the user can verify it and the LLM can see
+    the original phrasing rather than only a paraphrase.
+    """
+    __tablename__ = "report_artifacts"
+
+    id = Column(Integer, primary_key=True)
+    report_id = Column(Integer, ForeignKey("reports.id"), nullable=False)
+    category = Column(String(60), nullable=False)
+    text = Column(Text, nullable=False)
+    source_excerpt = Column(Text, nullable=True)
+    source_page = Column(Integer, nullable=True)
+    # Disabled artifacts are excluded from all LLM analyses (same rule as
+    # DataPoint.is_disabled for measurements).
+    is_disabled = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    report = relationship("Report", back_populates="artifacts")
+
+    def __repr__(self):
+        return f"<ReportArtifact {self.category}: {self.text[:30]}>"
 
 
 class CustomBiomarker(Base):
@@ -403,6 +439,7 @@ def init_db():
     _migrate_patient_demographics(engine)
     _migrate_clean_unit_whitespace(engine)
     _migrate_chat_conversations(engine)
+    _migrate_report_artifacts(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -716,6 +753,18 @@ def _migrate_chat_conversations(engine):
         ChatMessage.__table__.create(engine)
 
 
+def _migrate_report_artifacts(engine):
+    """Create the report_artifacts table (qualitative / narrative findings).
+
+    Same explicit-create pattern as the chat tables: fresh DBs get it from
+    ``Base.metadata.create_all``; existing DBs (created before the feature)
+    need the table added here.
+    """
+    inspector = inspect(engine)
+    if "report_artifacts" not in inspector.get_table_names():
+        ReportArtifact.__table__.create(engine)
+
+
 # ── Registry loader (cached) ─────────────────────────────────────────────────
 
 _registry_cache_key = None
@@ -789,6 +838,30 @@ def set_data_point_disabled(session, dp_id: int, disabled: bool) -> DataPoint | 
         session.query(RiskFlag).filter(RiskFlag.data_point_id == dp_id).delete()
     session.commit()
     return dp
+
+
+def set_report_artifact_disabled(session, artifact_id: int, disabled: bool) -> ReportArtifact | None:
+    """Enable/disable a single report artifact.
+
+    Disabled artifacts are excluded from every LLM analysis (summary, risk
+    assessment, chat) — the same rule as disabled measurements. Any
+    artifact-derived risk flag is removed immediately so the Risks tab reflects
+    the change without waiting for a full refresh.
+    """
+    art = session.get(ReportArtifact, artifact_id)
+    if art is None:
+        return None
+    art.is_disabled = bool(disabled)
+    if disabled:
+        # Drop the flag this artifact produced (category report_artifact, tied
+        # to the same report). Match by report + category since artifact flags
+        # carry no data_point_id.
+        session.query(RiskFlag).filter(
+            RiskFlag.report_id == art.report_id,
+            RiskFlag.category == "report_artifact",
+        ).delete(synchronize_session=False)
+    session.commit()
+    return art
 
 
 def get_custom_biomarkers(session: SASession) -> list[str]:
@@ -1362,6 +1435,42 @@ def create_patient_summary(session: SASession, patient_id: int, report_id: int |
     session.add(summary)
     session.commit()
     return summary
+
+
+def collect_report_artifacts(
+    session: SASession, patient_id: int,
+    start_date=None, end_date=None,
+) -> list[tuple]:
+    """Enabled report artifacts of a patient, as (date, category, text, excerpt, page).
+
+    The shared source for every LLM analysis (health summary, risk assessment,
+    chat). Mirrors the disabled-value rule used everywhere else: a disabled
+    artifact is excluded from all analyses. When a date window is given, only
+    artifacts whose REPORT date falls inside it are returned — an artifact's
+    date is its report's date (artifacts have no date of their own), and an
+    artifact on an undated report is excluded whenever a window is applied
+    (there is no timestamp to place it). Ordered oldest-first.
+
+    Returns ``(report_date, category, text, source_excerpt, source_page)``
+    tuples — the shape every prompt builder consumes.
+    """
+    query = (
+        session.query(ReportArtifact, Report.report_date)
+        .join(Report, ReportArtifact.report_id == Report.id)
+        .filter(
+            Report.patient_id == patient_id,
+            ReportArtifact.is_disabled == False,  # noqa: E712
+        )
+    )
+    if start_date is not None:
+        query = query.filter(Report.report_date >= start_date)
+    if end_date is not None:
+        query = query.filter(Report.report_date <= end_date)
+    rows = query.order_by(Report.report_date).all()
+    return [
+        (rd, a.category, a.text, a.source_excerpt, a.source_page)
+        for a, rd in rows
+    ]
 
 
 # ── LlmJob CRUD (background jobs — see llm_jobs.py) ─────────────────────────

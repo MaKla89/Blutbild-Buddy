@@ -16,7 +16,8 @@ The app is built around **German** lab reports: the biomarker registry, aliases,
 - **Trend charts** — Interactive Plotly line charts showing any biomarker's values over time, with reference ranges overlaid.
 - **Risk flag engine** — Detects critical values, concerning trends, volatility, missing markers, and improvements. Flags are severity-ranked and deduplicated per biomarker.
 - **Health summaries** — The LLM generates a natural-language health summary for each patient based on their data history.
-- **Chat with your data** — Ask free-form questions about your measurements; the assistant answers strictly from the selected time range's data (dates, units, reference ranges). Conversations are saved in the database (multiple per patient, like mainstream chat UIs) and answers are generated as background jobs — switching tabs or refreshing the page (F5) never loses a question or an in-flight answer.
+- **Qualitative report artifacts** — Besides numeric biomarkers, the extractor also captures the *written text* of a report: qualitative results ("trace", "negative"), clinical observations, known conditions, and general insights. Each artifact is individually toggleable (active/disabled) in the report detail view, and all active artifacts in the relevant time frame feed the health summary, the risk flag engine, and the chat — see [Qualitative Report Artifacts](#-qualitative-report-artifacts "📝 Qualitative Report Artifacts").
+- **Chat with your data** — Ask free-form questions about your measurements; the assistant answers strictly from the selected time range's data (dates, units, reference ranges) plus the qualitative findings from that window. Conversations are saved in the database (multiple per patient, like mainstream chat UIs) and answers are generated as background jobs — switching tabs or refreshing the page (F5) never loses a question or an in-flight answer.
 - **Biomarker mapping & merging** — Rename canonical names, auto-detect variant groups (LLM-suggested), and merge them — or merge manually.
 - **Multi-language UI** — German and English, switchable in the sidebar.
 - **Deduplication** — PDFs are skipped if their SHA-256 hash already exists in the database.
@@ -49,11 +50,11 @@ Severity-ranked risk flags (out-of-range values, concerning trends, cross-biomar
 |------|------|
 | `app.py` | Streamlit UI — sidebar, data tabs (overview / detail / trends / risks / all values / chat) + management tabs (reports / patients / LLM settings / LLM jobs / biomarker mapping), session state management |
 | `llm_jobs.py` | Background LLM job queue: worker threads for long-running ops (including chat answers), kind locks, config snapshots, progress persistence |
-| `extractor.py` | PDF pipeline: hash check → image render → LLM extraction (one call per report) → deterministic + global name normalization → DB insert |
-| `analyzer.py` | Risk flag engine: out-of-range, trending, volatility, missing markers |
+| `extractor.py` | PDF pipeline: hash check → image render → LLM extraction (one call per report) → deterministic + global name normalization → DB insert (data points **and qualitative artifacts**) |
+| `analyzer.py` | Risk flag engine: out-of-range, trending, volatility, missing markers, qualitative artifact flags |
 | `llm_client.py` | OpenAI-compatible client calls (extract + normalize + summarize), embedded system prompts |
 | `pdf_processor.py` | pypdfium2 → JPEG images, base64 encoding, SHA-256 hashing |
-| `database.py` | SQLAlchemy models: `Patient → Report → DataPoint → RiskFlag`, `LlmJob`, `ChatConversation → ChatMessage` |
+| `database.py` | SQLAlchemy models: `Patient → Report → DataPoint / ReportArtifact → RiskFlag`, `LlmJob`, `ChatConversation → ChatMessage` |
 | `schemas.py` | Pydantic models for LLM JSON responses |
 | `config.py` | Paths, LLM endpoint, canonical biomarker list, risk thresholds |
 | `translations.py` | DE/EN translation dictionaries and helpers |
@@ -151,6 +152,7 @@ All data is stored in `data/blutbild_buddy.db` (SQLite). The schema is:
 Patient (id, name, name_normalized, favorites, birth_date, sex, clinical_context)
   └── Report (id, patient_id, filename, file_hash, report_date, panel_type, raw_text)
         ├── DataPoint (id, report_id, canonical_name, original_name, value, unit, ref_low, ref_high, is_abnormal, is_disabled)
+        ├── ReportArtifact (id, report_id, category, text, source_excerpt, source_page, is_disabled)
         └── RiskFlag (id, report_id, data_point_id, category, severity, rank, description, explanation)
 
 BiomarkerRegistry (id, name, units, aliases, ref_low, ref_high, ref_unit, source)   # canonical list + LLM/manual overrides
@@ -182,6 +184,18 @@ The canonical list in `config.py` covers ~94 biomarkers across these categories:
 - **Urin** — pH, specific gravity, protein, glucose, ketones, bilirubin, urobilinogen, nitrite, leukocytes
 
 Custom biomarkers can be added through the UI and are persisted in the database.
+
+## 📝 Qualitative Report Artifacts
+
+Lab reports contain more than numbers — the written text often mentions qualitative results ("trace", "negative", "within limits"), clinical observations, known conditions, and general insights. The extractor captures these as **report artifacts** alongside the numeric data points, each with a category, the finding text, the source excerpt, and the page it came from (deduplicated per report).
+
+Artifacts are a first-class input to everything the LLM does:
+
+- **Health summaries** — active artifacts from the last two years are injected into the summary prompt as a "qualitative findings" section.
+- **Risk flags** — each active artifact also surfaces as an informational (severity 2) risk flag with a 📝 marker, so qualitative findings appear in the Risks tab next to numeric abnormalities.
+- **Chat with your data** — the selected time range's artifacts are added to the chat context, so the assistant can answer questions about conditions and observations, not just measurements. A chat window with only artifacts (no measurements yet) still works.
+
+**You stay in control:** every artifact has an active/disabled toggle in the *Bericht-Details* tab. Disabling an artifact excludes it from all three analyses and removes the risk flags derived from it; re-enabling brings it back on the next risk refresh. The **Berichte** overview table shows an "Artefakte" count per report (including disabled ones, like the "Biomarker" column counts all data points), and re-processing PDFs preserves your disable choices.
 
 ## Tests
 

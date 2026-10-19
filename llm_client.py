@@ -100,8 +100,14 @@ Also extract:
 - report_date (the date on the report in ISO format YYYY-MM-DD, e.g. "2025-08-12", converted from whatever format is printed; null if no date can be determined)
 - panel_type (what kind of panel this is, like "Blutbild", "Leberwerte", etc.)
 
+Also extract NON-NUMERIC findings from the report's WRITTEN TEXT (not the numeric lab table). These are qualitative results, clinical observations, conditions/medications, or general health remarks. For each, provide:
+- category: one of "qualitative_result" (a non-numeric test result, e.g. "Urinkultur: negativ"), "clinical_observation" (a finding/observation stated in the text), "condition" (a diagnosed/pre-existing condition or medication mentioned), or "general_insight" (an overall remark about the patient's health)
+- text: a concise, faithful one-line statement of the finding (do NOT invent or interpret — restate what the report says)
+- source_excerpt: a short verbatim snippet from the report the finding came from (null if none)
+Return an empty "artifacts" list if the report contains no such written-text findings.
+
 Return ONLY valid JSON matching this structure, no markdown or explanation:
-{"patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null"}]}"""
+{"patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null"}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}"""
 
 EXTRACTION_SYSTEM_PROMPT_BATCH = """You are a medical data extraction assistant. Your task is to extract structured data from lab report PDF page images. You will receive multiple page images in a single request.
 
@@ -117,8 +123,14 @@ Also extract for each page:
 - panel_type (what kind of panel this is, like "Blutbild", "Leberwerte", etc.)
 - page_index (the 0-based position of that page image in the order you received them: first image = 0, second = 1, ...)
 
+Also extract NON-NUMERIC findings from each page's WRITTEN TEXT (not the numeric lab table): qualitative results, clinical observations, conditions/medications, or general health remarks. For each, provide:
+- category: one of "qualitative_result", "clinical_observation", "condition", or "general_insight"
+- text: a concise, faithful one-line statement of the finding (do NOT invent or interpret — restate what the report says)
+- source_excerpt: a short verbatim snippet from the report the finding came from (null if none)
+Return an empty "artifacts" list for a page with no such findings.
+
 Return ONLY valid JSON matching this structure, no markdown or explanation:
-{"pages": [{"page_index": 0, "patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null"}]}]}"""
+{"pages": [{"page_index": 0, "patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null"}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}]}"""
 
 NORMALIZATION_SYSTEM_PROMPT = """You are a medical terminology normalization assistant. You will be given a list of extracted biomarker entries (name plus measurement unit where known) from lab reports and a canonical registry of standard biomarkers.
 
@@ -941,6 +953,7 @@ EINGABEDATEN:
 - Patientenprofil (Alter, Geschlecht, Vorerkrankungen/Medikamente) — soweit vorhanden. Referenzbereiche sind alters- und geschlechtsabhängig; ordne Werte entsprechend ein (z.B. Hb, Kreatinin, eGFR, Ferritin). Ein bereitgestellter klinischer Kontext (z.B. "L-Thyroxin") verändert die Interpretation deutlich — beziehe ihn ein.
 - Pro Biomarker ein vorberechneter Verlauf: Anzahl der Messungen, letzter Wert mit Datum, Abweichung vom Referenzbereich, Trend (erste→letzte Messung), Anzahl der Messungen außerhalb des Referenzbereichs. Nutze diese Signale, statt selbst zu schätzen.
 - "Vom System erkannte Muster": Hinweise eines Regelwerks, KEINE unfehlbare Diagnose. Prüfe jedes Muster an den Rohdaten: Stützen die Werte das Muster (gleicher Bericht, plausible Werte)? Wenn nicht, erwähne es kritisch statt es blind zu übernehmen. Identifiziere AKTIV weitere Korrelationen, die das Regelwerk nicht nennt (z.B. MCV+Hb+Ferritin für Anämie-Ursache, Neutrophile/Lymphozyten, Albumin+Kreatinin, Eisen+Ferritin+CRP, GGT+ALP+Bilirubin).
+- "Qualitative Befunde und Notizen aus Berichten": textliche Befunde aus dem Fließtext des Berichts (z.B. "Urinkultur negativ", beobachtete Symptome, Vorerkrankungen, Medikamente). Beziehe diese explizit in die Beurteilung ein — sie ergänzen die Zahlenwerte. Behandle sie als vom Bericht überliefert, nicht als eigene Diagnose.
 - Risikomarkierungen mit Dringlichkeit (critical = aktueller Wert akut problematisch, long_term = Beobachtung).
 
 WICHTIGE REGELN:
@@ -969,6 +982,7 @@ INPUT DATA:
 - Patient profile (age, sex, conditions/medication) where available. Reference ranges depend on age and sex; interpret values accordingly (e.g. Hb, creatinine, eGFR, ferritin). Provided clinical context (e.g. "levothyroxine") changes interpretation substantially — use it.
 - Per biomarker a precomputed course: measurement count, latest value with date, deviation from the reference range, trend (first→last measurement), count of measurements outside the reference range. Use these signals instead of estimating yourself.
 - "System-detected patterns": hints from a rule engine, NOT infallible diagnoses. Check each pattern against the raw data: do the values support it (same report, plausible values)? If not, mention it critically instead of adopting it blindly. ACTIVELY identify further correlations the rule set does not name (e.g. MCV+Hb+ferritin for anemia cause, neutrophils/lymphocytes, albumin+creatinine, iron+ferritin+CRP, GGT+ALP+bilirubin).
+- "Qualitative findings and notes from reports": textual findings from the report's prose (e.g. "urine culture negative", observed symptoms, pre-existing conditions, medication). Explicitly incorporate these into the assessment — they complement the numeric values. Treat them as reported by the document, not as your own diagnosis.
 - Risk flags with urgency (critical = current value acutely problematic, long_term = observation).
 
 IMPORTANT RULES:
@@ -1259,7 +1273,7 @@ def _summarize_biomarker_series(series, lang):
     return " | ".join(parts)
 
 
-def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_flags, lang, profile=None):
+def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_flags, lang, profile=None, artifacts=None):
     """Build the user prompt for the patient health summary LLM call.
 
     Args:
@@ -1274,6 +1288,12 @@ def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_
         profile: optional dict {"age": int|None, "sex": str|None,
             "clinical_context": str|None} — demographics the LLM needs to
             interpret age/sex-dependent reference ranges.
+        artifacts: optional list of (report_date, category, text, source_excerpt,
+            source_page) tuples — the ENABLED report artifacts (qualitative
+            results / clinical observations / conditions / general insights)
+            from the report's written text, within the summary's time window.
+            Only enabled artifacts are passed (disabled ones are excluded from
+            every analysis).
     """
     if lang == "de":
         header = f"Gesundheitszusammenfassung für Patient: {patient_name}\n\n"
@@ -1282,6 +1302,7 @@ def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_
                           "zusammengefasst: Anzahl, letzter Wert, Abweichung, Trend) ===\n")
         detail_section = "\n=== Letzte Messwerte pro Marker (Details) ===\n"
         historical_section = "\n=== Langzeit-Verlauf chronisch abnormaler Biomarker (vor 2 Jahren) ===\n"
+        artifact_section = "\n=== Qualitative Befunde und Notizen aus Berichten (letzte 2 Jahre) ===\n"
         cross_section = "\n=== Vom System erkannte Muster (Regelwerk-Hinweise — an den Rohdaten prüfen, nicht blind übernehmen) ===\n"
         risk_section = "\n=== Risikomarkierungen ===\n"
         instruction = ("Erstelle auf Basis dieser Daten die strukturierte "
@@ -1294,6 +1315,7 @@ def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_
                           "count, latest value, deviation, trend) ===\n")
         detail_section = "\n=== Latest measurement per marker (details) ===\n"
         historical_section = "\n=== Long-term trend of chronically abnormal biomarkers (older than 2 years) ===\n"
+        artifact_section = "\n=== Qualitative findings and notes from reports (last 2 years) ===\n"
         cross_section = "\n=== System-detected patterns (rule-engine hints — verify against raw data, do not adopt blindly) ===\n"
         risk_section = "\n=== Risk flags ===\n"
         instruction = "Based on this data, create the structured health summary in the required format."
@@ -1411,19 +1433,38 @@ def build_patient_summary_prompt(patient_name, recent_dps, historical_dps, risk_
     if not risk_text:
         risk_text = "(none)\n"
 
+    # Build the report-artifacts section (qualitative / narrative findings from
+    # the written text). Only ENABLED artifacts within the window are passed in;
+    # when there are none the whole section is omitted (keeps the prompt lean).
+    artifact_text = ""
+    for rdate, category, text, excerpt, page in (artifacts or []):
+        date_str = rdate.strftime("%d.%m.%Y") if rdate else "?"
+        line = f"  {date_str} [{category}]: {text}"
+        provenance = []
+        if excerpt:
+            provenance.append(f'({("Quelle" if lang == "de" else "Source")}: "{excerpt}")')
+        if page:
+            provenance.append(f'({("Seite" if lang == "de" else "page")} {page})')
+        if provenance:
+            line += " " + " ".join(provenance)
+        artifact_text += line + "\n"
+
+    artifact_block = f"{artifact_section}{artifact_text}" if artifact_text else ""
+
     return (
         f"{header}"
         f"{profile_text}"
         f"{recent_section}{recent_text}"
         f"{detail_section}{detail_text}"
         f"{historical_section}{historical_text}"
+        f"{artifact_block}"
         f"{cross_section}{cross_text}"
         f"{risk_section}{risk_text}"
         f"\n{instruction}"
     )
 
 
-def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None, profile=None):
+def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk_flags, lang=None, profile=None, artifacts=None):
     """Generate a patient health summary using the LLM.
 
     Args:
@@ -1437,6 +1478,10 @@ def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk
         profile: optional dict {"age", "sex", "clinical_context"} — patient
             demographics; reference ranges are age/sex dependent, so the LLM
             needs these to judge values correctly.
+        artifacts: optional list of (report_date, category, text, source_excerpt,
+            source_page) — the ENABLED report artifacts (qualitative results /
+            clinical observations / conditions / general insights) within the
+            summary window; disabled artifacts are excluded upstream.
 
     Returns:
         The generated summary text, or None on failure.
@@ -1450,7 +1495,8 @@ def generate_patient_summary(llm, patient_name, recent_dps, historical_dps, risk
         system_prompt = PATIENT_SUMMARY_SYSTEM_PROMPT_EN
 
     user_prompt = build_patient_summary_prompt(
-        patient_name, recent_dps, historical_dps, risk_flags, lang, profile=profile
+        patient_name, recent_dps, historical_dps, risk_flags, lang, profile=profile,
+        artifacts=artifacts,
     )
 
     with _llm_semaphore:
@@ -1676,6 +1722,7 @@ CHAT_SYSTEM_PROMPT_DE = """Du bist ein medizinischer Assistent, der einem Patien
 Du erhältst als Kontext:
 - Patientenprofil (Alter, Geschlecht, Vorerkrankungen/Medikamente) — soweit vorhanden. Referenzbereiche sind alters- und geschlechtsabhängig; ordne Werte entsprechend ein.
 - Alle nicht deaktivierten Messwerte des Patienten der letzten 5 Jahre, gruppiert nach Biomarker: Messdatum, Wert, Einheit und Referenzbereich. Mit [ABNORMAL] markierte Werte liegen außerhalb des Referenzbereichs.
+- Qualitative Befunde und Notizen aus dem Berichtstext (z. B. "Urinkultur negativ", beobachtete Symptome, Vorerkrankungen), falls vorhanden — nur aktivierte. Beziehe sie in die Antwort ein; behandle sie als vom Bericht überliefert, nicht als eigene Diagnose.
 - Die bisherige Unterhaltung und die aktuelle Frage.
 
 REGELN:
@@ -1693,6 +1740,7 @@ CHAT_SYSTEM_PROMPT_EN = """You are a medical assistant answering a patient's que
 You are given as context:
 - Patient profile (age, sex, conditions/medication) where available. Reference ranges depend on age and sex; interpret values accordingly.
 - All non-disabled measurements of the patient from the last 5 years, grouped per biomarker: measurement date, value, unit, and reference range. Lines marked [ABNORMAL] are outside the reference range.
+- Qualitative findings and notes from the report prose (e.g. "urine culture negative", observed symptoms, pre-existing conditions), when present — only enabled ones. Incorporate them into your answer; treat them as reported by the document, not as your own diagnosis.
 - The conversation so far and the current question.
 
 RULES:

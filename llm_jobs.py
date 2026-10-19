@@ -38,9 +38,9 @@ from database import (
     Patient, Report, DataPoint, RiskFlag, PatientSummary, BiomarkerInfo,
     get_session, create_llm_job, get_llm_job,
     upsert_biomarker_info, backfill_reference_ranges, create_patient_summary,
-    get_registry, patient_age_years,
+    get_registry, patient_age_years, collect_report_artifacts,
     DataQualityFinding, clear_patient_data_quality_findings,
-    get_chat_conversation,
+    get_chat_conversation, ReportArtifact,
 )
 from llm_client import (
     _build_client, set_job_config,
@@ -309,7 +309,6 @@ def _gather_summary_data(session, patient):
     """Collect recent (2y) + historical data points, risk flags and the patient
     profile for the summary prompt. Same logic as app._generate_summary_for_patient."""
     cutoff = datetime.now() - timedelta(days=2 * 365)
-
     recent_dps = (
         session.query(DataPoint, Report.report_date)
         .join(Report)
@@ -347,7 +346,10 @@ def _gather_summary_data(session, patient):
         "sex": patient.sex,
         "clinical_context": patient.clinical_context,
     }
-    return recent_data, historical_data, risk_data, profile
+    # Enabled report artifacts within the summary's recent window (same 2-year
+    # cutoff as the recent data points). Disabled artifacts are excluded.
+    artifacts = collect_report_artifacts(session, patient.id, start_date=cutoff)
+    return recent_data, historical_data, risk_data, profile, artifacts
 
 
 def _job_process_pdfs(session, cfg, lang, params):
@@ -376,9 +378,10 @@ def _job_process_pdfs(session, cfg, lang, params):
         if p:
             try:
                 llm = _build_client()
-                recent, historical, risks, profile = _gather_summary_data(session, p)
+                recent, historical, risks, profile, artifacts = _gather_summary_data(session, p)
                 text = generate_patient_summary(
-                    llm, p.name, recent, historical, risks, lang, profile=profile
+                    llm, p.name, recent, historical, risks, lang, profile=profile,
+                    artifacts=artifacts,
                 )
                 if text:
                     _save_patient_summary(session, p.id, text)
@@ -431,7 +434,18 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
         (filename, dp.original_name or "", dp.unit or ""): True
         for dp, filename in dq.all()
     }
-    return {"reports": reports, "disabled": disabled}
+    # Disabled artifacts, matched back after re-extraction by
+    # (filename, category, text) — the stable identity of a written-text finding.
+    aq = session.query(ReportArtifact, Report.filename).join(
+        Report, ReportArtifact.report_id == Report.id,
+    ).filter(ReportArtifact.is_disabled == True)  # noqa: E712
+    if patient_id is not None:
+        aq = aq.filter(Report.patient_id == patient_id)
+    disabled_artifacts = {
+        (filename, art.category or "", art.text or ""): True
+        for art, filename in aq.all()
+    }
+    return {"reports": reports, "disabled": disabled, "disabled_artifacts": disabled_artifacts}
 
 
 def _diff_reprocess(before: dict, session, filenames: list[str]) -> dict:
@@ -520,6 +534,35 @@ def _restore_disabled(session, disabled: dict) -> int:
     return restored
 
 
+def _restore_disabled_artifacts(session, disabled: dict) -> int:
+    """Re-apply the user's manual artifact disabling after a reprocess.
+
+    Matches (filename, category, text); a re-extraction that reproduces the
+    same finding keeps the user's disabled state. Findings the new extraction
+    no longer produces simply disappear (nothing to restore).
+    """
+    if not disabled:
+        return 0
+    restored = 0
+    for filename, category, text in disabled:
+        arts = (
+            session.query(ReportArtifact)
+            .join(Report, ReportArtifact.report_id == Report.id)
+            .filter(
+                Report.filename == filename,
+                ReportArtifact.category == category,
+                ReportArtifact.text == text,
+            )
+            .all()
+        )
+        for art in arts:
+            if not art.is_disabled:
+                art.is_disabled = True
+                restored += 1
+    session.commit()
+    return restored
+
+
 def _job_reprocess_pdfs(session, cfg, lang, params):
     """Re-extract existing reports with the current LLM + registry.
 
@@ -554,6 +597,7 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         from database import PatientSummary, RiskFlag
         session.query(RiskFlag).filter(RiskFlag.report_id.in_(report_ids)).delete()
         session.query(DataPoint).filter(DataPoint.report_id.in_(report_ids)).delete()
+        session.query(ReportArtifact).filter(ReportArtifact.report_id.in_(report_ids)).delete()
         session.query(PatientSummary).filter(PatientSummary.report_id.in_(report_ids)).delete()
         session.query(Report).filter(Report.id.in_(report_ids)).delete()
         session.commit()
@@ -608,6 +652,7 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
 
     # Restore the user's manual disabling (matched by filename+name+unit).
     disabled_restored = _restore_disabled(session, before["disabled"])
+    artifact_restored = _restore_disabled_artifacts(session, before.get("disabled_artifacts", {}))
 
     if is_job_aborted():
         return "info", t("job_aborted_note", lang=lang)
@@ -632,6 +677,8 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         parts.append(t("reprocess_diff_none", lang=lang))
     if disabled_restored:
         parts.append(t("reprocess_disabled_restored", lang=lang, n=disabled_restored))
+    if artifact_restored:
+        parts.append(t("reprocess_artifacts_restored", lang=lang, n=artifact_restored))
     if diff["patient_moves"]:
         parts.append(t("reprocess_patient_pinned", lang=lang, n=diff["patient_moves"]))
     for fn in diff["missing"][:5]:
@@ -693,9 +740,10 @@ def _job_regen_summary(session, cfg, lang, params):
     _update_progress(session, getattr(_current_job_id_var, "job_id", None),
                      t("msg_generating_summary", lang=lang), 0.1)
     llm = _build_client()
-    recent, historical, risks, profile = _gather_summary_data(session, p)
+    recent, historical, risks, profile, artifacts = _gather_summary_data(session, p)
     text = generate_patient_summary(
-        llm, p.name, recent, historical, risks, lang, profile=profile
+        llm, p.name, recent, historical, risks, lang, profile=profile,
+        artifacts=artifacts,
     )
     if not text:
         return "error", t("error_summary_generation", lang=lang)

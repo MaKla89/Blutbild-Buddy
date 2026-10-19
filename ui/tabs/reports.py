@@ -18,7 +18,7 @@ from sqlalchemy import func
 
 import config
 from database import (
-    Report, DataPoint, RiskFlag, get_session,
+    Report, DataPoint, RiskFlag, ReportArtifact, get_session,
 )
 from llm_jobs import submit_job
 from translations import t, _get_lang
@@ -230,6 +230,15 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
             .group_by(DataPoint.report_id)
             .all()
         )
+        # Artifact counts (qualitative / narrative findings) per report — shown
+        # next to the biomarker count so the user sees at a glance which reports
+        # yielded written-text findings. Counts ALL artifacts (like the biomarker
+        # column counts all data points), disabled included.
+        artifact_counts = dict(
+            session.query(ReportArtifact.report_id, func.count(ReportArtifact.id))
+            .group_by(ReportArtifact.report_id)
+            .all()
+        )
         report_data = []
         # Unprocessed uploads first — they are waiting for "Alle PDFs verarbeiten".
         for fn in unprocessed:
@@ -240,19 +249,31 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
                 "status": t("status_not_processed"),
                 "file_present": "✅",
                 "biomarker_count": 0,
+                "artifact_count": 0,
                 "report_id": None,
             })
         for r in reports:
             dp_count = dp_counts.get(r.id, 0)
-            has_data = dp_count > 0
+            art_count = artifact_counts.get(r.id, 0)
+            # A DB row only exists after successful extraction, so every DB
+            # report counts as processed — including pure narrative reports
+            # (MRT, endoscopy, OP notes) that yield zero biomarkers but only
+            # qualitative artifacts. Only "processed yet the LLM found nothing
+            # at all" is flagged, as that hints at a failed extraction.
+            status = (
+                t("status_processed")
+                if dp_count or art_count
+                else t("status_processed_empty")
+            )
             patient_name = r.patient.name if r.patient else "?"
             report_data.append({
                 "filename": r.filename,
                 "report_date": r.report_date.strftime("%d.%m.%Y") if r.report_date else "?",
                 "patient": patient_name,
-                "status": t("status_processed") if has_data else t("status_not_processed"),
+                "status": status,
                 "file_present": "✅" if (pdf_dir / r.filename).exists() else "❌",
                 "biomarker_count": dp_count,
+                "artifact_count": art_count,
                 "report_id": r.id,
             })
 
@@ -272,6 +293,11 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
                 "biomarker_count": st.column_config.NumberColumn(
                     t("col_biomarker_count"),
                     format="%d",
+                ),
+                "artifact_count": st.column_config.NumberColumn(
+                    t("col_artifact_count"),
+                    format="%d",
+                    help=t("help_col_artifact_count"),
                 ),
             },
             hide_index=True,
