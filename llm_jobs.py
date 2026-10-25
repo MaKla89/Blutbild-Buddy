@@ -810,10 +810,13 @@ def _job_bulk_descriptions(session, cfg, lang, params):
     if not items:
         return "info", t("info_no_biomarker_data", lang=lang)
     llm = _build_client()
+    # Active registry (honors accepted proposals) for the per-biomarker
+    # unit/ref-range context line — the former full canonical list is gone.
+    registry = get_registry(session)
     ok, errors = _run_bulk(
         session, patient_id, llm, items, "description",
         generate_one=lambda llm_, item: generate_biomarker_description(
-            llm_, item[0], item[1], config.CANONICAL_BIOMARKERS, lang,
+            llm_, item[0], item[1], lang, registry=registry,
         ),
     )
     return _bulk_result(ok, len(items), errors, "msg_all_descriptions_generated", lang)
@@ -929,7 +932,7 @@ def _job_gen_description(session, cfg, lang, params):
                      t("msg_generating_description", lang=lang), 0.1)
     llm = _build_client()
     text = generate_biomarker_description(
-        llm, cname, unit, config.CANONICAL_BIOMARKERS, lang,
+        llm, cname, unit, lang, registry=get_registry(session),
     )
     if not text:
         return "error", t("error_summary_generation", lang=lang)

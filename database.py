@@ -2307,6 +2307,47 @@ def _apply_registry_fix(session: SASession, finding: DataQualityFinding, params:
             target_row.updated_at = datetime.utcnow()
         return ok, detail
 
+    if finding.action == "register_biomarker":
+        # Promote a marker the extraction pipeline kept verbatim (no registry
+        # row) to a proper canonical entry, so it gets a default reference
+        # range and enters risk detection (critical values, trends, patterns).
+        # Only names that actually have measurements qualify — a name with no
+        # data points at all is a hallucination (mirrors the merge-target
+        # guard above).
+        name = (finding.biomarker or "").strip()
+        if not name:
+            return False, "no biomarker name"
+        existing = (
+            session.query(BiomarkerRegistry)
+            .filter(func.lower(BiomarkerRegistry.canonical_name) == name.lower())
+            .first()
+        )
+        if existing is not None:
+            return False, f"'{name}' already has a registry row"
+        has_measurements = (
+            session.query(DataPoint.id)
+            .filter(func.lower(DataPoint.canonical_name) == name.lower())
+            .first()
+            is not None
+        )
+        if not has_measurements:
+            return False, f"'{name}' has no measurements — refusing to register"
+        row = BiomarkerRegistry(
+            canonical_name=name, units="[]", aliases="[]",
+            source="llm_accepted", updated_at=datetime.utcnow(),
+        )
+        # Optional ref-range hint from the LLM ("0.5–5.0 mg/l"). Unparseable
+        # hints are ignored — the row is still worth creating without a range.
+        hint = str(params.get("ref_range", "") or "").strip()
+        detail = f"registered '{name}'"
+        if hint:
+            low, high, unit = _parse_ref_range(hint)
+            if low is not None or high is not None:
+                row.ref_low, row.ref_high, row.ref_unit = low, high, unit or None
+                detail = f"registered '{name}' (ref {hint})"
+        session.add(row)
+        return True, detail
+
     field_map = {
         "registry_ref_range": ("ref_range", str(params.get("proposed", "") or "")),
         "registry_unit": ("unit", str(params.get("proposed", "") or "")),

@@ -2904,6 +2904,58 @@ class TestNormalizeNamesFallback(unittest.TestCase):
         mapping = {m["original"]: m["canonical"] for m in result.mappings}
         self.assertEqual(mapping.get("Leukozyten"), "Leukozyten (WBC)")
 
+    def test_hallucinated_canonical_is_dropped(self):
+        """A canonical the LLM was never shown must not reach the caller.
+
+        Without this guard the invented name would be written straight into
+        DataPoint.canonical_name as a phantom biomarker that bypasses the
+        registry, ref-range defaults and merge grouping.
+        """
+        from llm_client import normalize_names
+        raw = {"mappings": [
+            {"original": "Leukozyten", "unit": None, "canonical": "Leukozyten (WBC)"},
+            {"original": "CRP", "unit": "mg/l", "canonical": "C-reaktives Protein (Hochsensitiv)"},
+        ]}
+        result = normalize_names(
+            _MockLLM(json.dumps(raw)),
+            [{"name": "Leukozyten", "unit": None}, {"name": "CRP", "unit": "mg/l"}],
+            ["Leukozyten (WBC)", "CRP"],
+        )
+        mapping = {m["original"]: m["canonical"] for m in result.mappings}
+        self.assertEqual(mapping.get("Leukozyten"), "Leukozyten (WBC)")
+        self.assertNotIn("CRP", mapping, "hallucinated target must be dropped")
+
+    def test_faithful_unknown_name_echo_is_kept(self):
+        """The prompt's "no good match → use the original name as-is" echo is
+        NOT a hallucination: an unknown-but-faithful marker must survive so it
+        can be surfaced and promoted later."""
+        from llm_client import normalize_names
+        raw = {"mappings": [
+            {"original": "Cystatin C", "unit": "mg/l", "canonical": "Cystatin C"},
+        ]}
+        result = normalize_names(
+            _MockLLM(json.dumps(raw)),
+            [{"name": "Cystatin C", "unit": "mg/l"}],
+            ["Kreatinin", "Harnsäure"],
+        )
+        mapping = {m["original"]: m["canonical"] for m in result.mappings}
+        self.assertEqual(mapping.get("Cystatin C"), "Cystatin C")
+
+    def test_blank_canonical_is_dropped(self):
+        from llm_client import normalize_names
+        raw = {"mappings": [
+            {"original": "Leukozyten", "unit": None, "canonical": ""},
+            {"original": "CRP", "unit": None, "canonical": "CRP"},
+        ]}
+        result = normalize_names(
+            _MockLLM(json.dumps(raw)),
+            [{"name": "Leukozyten", "unit": None}, {"name": "CRP", "unit": None}],
+            ["CRP"],
+        )
+        mapping = {m["original"]: m["canonical"] for m in result.mappings}
+        self.assertNotIn("Leukozyten", mapping)
+        self.assertEqual(mapping.get("CRP"), "CRP")
+
 
 class TestUnitAwareNormalization(unittest.TestCase):
     """Same name with different units must map to the right unit-qualified variant."""
@@ -3490,6 +3542,21 @@ class TestBiomarkerRegistry(unittest.TestCase):
         names = database.get_registry_names(self.session)
         self.assertEqual(names, sorted(names))
 
+    def test_unregistered_markers_detection(self):
+        """Mapping tab helper: names the extractor kept verbatim (no registry
+        match at any tier) must surface as unregistered; alias and base-name
+        matches (the extractor's own fallback tiers) must not."""
+        from ui.tabs.mapping import _unregistered_markers
+        reg = database.get_registry(self.session)
+        # 'CRP' is canonical, 'C-reaktives Protein' an alias, 'Hämoglobin' the
+        # base of the canonical 'Hämoglobin (Hb)' — all registered.
+        # 'Schmetterlingsindex' matches no canonical/alias/base → unregistered.
+        found = _unregistered_markers(
+            ["CRP", "C-reaktives Protein", "H\u00e4moglobin", "Schmetterlingsindex"],
+            reg,
+        )
+        self.assertEqual(found, ["Schmetterlingsindex"])
+
 
 class TestParseRefRange(unittest.TestCase):
     """database._parse_ref_range: two-sided, one-sided, comma decimals."""
@@ -3800,7 +3867,7 @@ class TestLlmJobs(unittest.TestCase):
         import llm_jobs
         calls = []
 
-        def gen(llm_, name, unit, canonical_list, lang=None):
+        def gen(llm_, name, unit, lang=None, registry=None):
             calls.append(name)
             if name == "B":
                 raise RuntimeError("boom")
@@ -3833,7 +3900,7 @@ class TestLlmJobs(unittest.TestCase):
         # scoped to the (name, unit) in params, persisted to BiomarkerInfo.
         seen = []
 
-        def gen(llm_, name, unit, canonical_list, lang=None):
+        def gen(llm_, name, unit, lang=None, registry=None):
             seen.append((name, unit))
             return f"desc for {name}"
 
@@ -3965,7 +4032,7 @@ class TestLlmJobAbort(unittest.TestCase):
         import llm_jobs
         calls = []
 
-        def gen(llm_, name, unit, canonical_list, lang=None):
+        def gen(llm_, name, unit, lang=None, registry=None):
             calls.append(name)
             return f"desc {name}"
 
@@ -4410,6 +4477,21 @@ class TestDataQualityParsing(unittest.TestCase):
         self.assertEqual(len(result["findings"]), 1)
         self.assertEqual(result["findings"][0]["biomarker"], "B")
 
+    def test_duplicate_check_accepts_unknown_register_finding(self):
+        """Fix B: the duplicate check also surfaces markers with no registry
+        entry (category 'unknown' → register_biomarker). The finding needs no
+        params — the biomarker name itself is what gets registered."""
+        raw = json.dumps({"findings": [
+            {"category": "unknown", "target_type": "registry",
+             "biomarker": "Schmetterlingsindex", "description": "not in registry",
+             "action": "register_biomarker", "params": {}},
+        ]})
+        result = self._dup(raw)
+        self.assertEqual(len(result["findings"]), 1)
+        f = result["findings"][0]
+        self.assertEqual(f["category"], "unknown")
+        self.assertEqual(f["action"], "register_biomarker")
+
     def test_duplicate_check_invalid_json_raises(self):
         from llm_client import LLMResponseError
         with self.assertRaises(LLMResponseError):
@@ -4821,6 +4903,79 @@ class TestApplyDataQualityFinding(unittest.TestCase):
         # Source data point untouched.
         self.assertEqual(src.canonical_name, "FooVariant")
 
+    # ── register_biomarker (fix B: promote unknown markers) ────────────
+
+    def test_register_biomarker_creates_row(self):
+        """Accepting an 'unknown' finding creates a registry row for a marker
+        that only has data points — enabling default ref ranges + risk detection."""
+        dp = database.DataPoint(
+            report_id=self.crp.report_id, canonical_name="Schmetterlingsindex",
+            original_name="Schmetterlingsindex", value=30.0, unit="fL",
+        )
+        self.session.add(dp)
+        self.session.commit()
+
+        fid = self._add_finding("registry", "Schmetterlingsindex",
+                                action="register_biomarker", params={},
+                                category="unknown")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="Schmetterlingsindex").one())
+        self.assertEqual(row.source, "llm_accepted")
+        self.assertIsNone(row.ref_low)
+        self.assertIsNone(row.ref_high)
+
+    def test_register_biomarker_with_ref_range_hint(self):
+        dp = database.DataPoint(
+            report_id=self.crp.report_id, canonical_name="Pepsinogen I",
+            original_name="Pepsinogen I", value=70.0, unit="ng/ml",
+        )
+        self.session.add(dp)
+        self.session.commit()
+
+        fid = self._add_finding("registry", "Pepsinogen I", action="register_biomarker",
+                                params={"ref_range": "70–165 ng/ml"}, category="unknown")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="Pepsinogen I").one())
+        self.assertEqual((row.ref_low, row.ref_high, row.ref_unit), (70.0, 165.0, "ng/ml"))
+
+    def test_register_biomarker_unparseable_hint_still_creates_row(self):
+        dp = database.DataPoint(
+            report_id=self.crp.report_id, canonical_name="Some Marker",
+            original_name="Some Marker", value=1.0, unit="x",
+        )
+        self.session.add(dp)
+        self.session.commit()
+        fid = self._add_finding("registry", "Some Marker", action="register_biomarker",
+                                params={"ref_range": "kein Bereich"}, category="unknown")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="Some Marker").one())
+        self.assertIsNone(row.ref_low)
+
+    def test_register_biomarker_no_measurements_skipped(self):
+        """A name with no data points at all is a hallucination — never registered."""
+        fid = self._add_finding("registry", "GhostMarker", action="register_biomarker",
+                                params={}, category="unknown")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "skipped")
+        self.session.expire_all()
+        self.assertIsNone((self.session.query(database.BiomarkerRegistry)
+                           .filter_by(canonical_name="GhostMarker").first()))
+
+    def test_register_biomarker_existing_row_skipped(self):
+        fid = self._add_finding("registry", "CRP", action="register_biomarker",
+                                params={}, category="unknown")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "skipped")
+
     # ── lifecycle ───────────────────────────────────────────────────────
 
     def test_unknown_finding_id_skipped(self):
@@ -5178,6 +5333,77 @@ class TestHealthInsightPipeline(unittest.TestCase):
         """Findings carrying only category/description render exactly as before."""
         from llm_client import _format_finding_context
         self.assertEqual(_format_finding_context({"category": "a", "description": "d"}, "en"), "")
+
+    def test_llm_ranking_is_per_patient_not_global(self):
+        """Regression: ranking used to be ONE assess_risks call over every
+        patient's flags merged, so the LLM's 10-risk budget could be spent on
+        a single patient and every other patient got zero explained flags —
+        and the Risks tab hides explanation-less flags once any flag is
+        LLM-ranked, so those patients showed no risk cards at all.
+        Ranking must run per patient: each patient's own findings get their
+        own explanation."""
+        from analyzer import refresh_risk_flags
+        pa = database.get_or_create_patient(self.session, "Ranking Patient A")
+        pb = database.get_or_create_patient(self.session, "Ranking Patient B")
+        # One critical_value flag each (Vitamin D 12 ng/ml, ref 30-100).
+        self._add_report(pa, "rank_a", datetime(2025, 1, 1),
+                         [("Vitamin D (25-OH)", 12.0, "ng/ml", 30.0, 100.0, True)])
+        self._add_report(pb, "rank_b", datetime(2025, 1, 1),
+                         [("Vitamin D (25-OH)", 11.0, "ng/ml", 30.0, 100.0, True)])
+
+        # The LLM answer depends on the PROMPT content (each patient's latest
+        # Vitamin D value), not on call order — patient iteration order in the
+        # shared test DB is not insertion order. A single global call would
+        # see both values in one prompt and could only explain one patient.
+        class OrderAgnosticRankingLLM:
+            def __init__(self):
+                self.prompts = []
+                outer = self
+
+                class _Completions:
+                    def create(self, *a, **kw):
+                        msgs = kw.get("messages") or (a[0] if a else [])
+                        user = [m for m in msgs if m.get("role") == "user"][0]["content"]
+                        outer.prompts.append(user)
+                        if "12.0 ng/ml" in user:
+                            expl = "Erklaerung A"
+                        elif "11.0 ng/ml" in user:
+                            expl = "Erklaerung B"
+                        else:  # other patients in the shared DB: generic explanation
+                            expl = "Erklaerung generic"
+                        return _MockLLMResponse(
+                            '{"risks": [{"index": 1, "urgency": "critical", '
+                            '"explanation": "' + expl + '"}]}'
+                        )
+
+                self.chat = type("_C", (), {"completions": _Completions()})()
+
+        llm = OrderAgnosticRankingLLM()
+        n = refresh_risk_flags(self.session, llm=llm, lang="en")
+        self.assertGreaterEqual(n, 2)
+        # Per-patient ranking => one prompt per patient with flags, and the
+        # two Vitamin D patients must appear in SEPARATE prompts.
+        self.assertGreaterEqual(len(llm.prompts), 2)
+        for prompt in llm.prompts:
+            self.assertFalse("12.0 ng/ml" in prompt and "11.0 ng/ml" in prompt,
+                             "both patients were ranked in one global call")
+
+        by_patient = {}
+        for rf in (
+            self.session.query(database.RiskFlag)
+            .join(database.Report, database.RiskFlag.report_id == database.Report.id)
+            .all()
+        ):
+            by_patient.setdefault(rf.report.patient_id, []).append(rf)
+        for pid, expected in ((pa.id, "Erklaerung A"), (pb.id, "Erklaerung B")):
+            flags = by_patient.get(pid) or []
+            self.assertTrue(flags, f"patient {pid} has no risk flags at all")
+            explained = [f for f in flags if f.explanation]
+            self.assertTrue(explained, f"patient {pid} got no LLM-explained flag")
+            self.assertIn(expected, explained[0].explanation)
+        # Rank numbering restarts per patient (1 = most urgent of THAT patient).
+        for pid, flags in by_patient.items():
+            self.assertEqual(sorted(f.rank for f in flags), list(range(1, len(flags) + 1)))
 
     # ── Precomputed per-biomarker trend summaries ───────────────────────────
 
@@ -5931,6 +6157,20 @@ class TestUiBehaviourAppTest(unittest.TestCase):
         self.assertEqual(len(at.tabs), 12)
         # Data actually reached the view (Overview metric cards).
         self.assertTrue(at.metric, "no metric cards rendered for a patient with data")
+
+    def test_unregistered_marker_surfaces_in_mapping_tab(self):
+        """A marker the extractor kept verbatim (no registry entry) gets no
+        default ref range and is invisible to risk detection — the Mapping tab
+        must surface it (warning naming the marker) so the user can recover it
+        via rename/registry edit instead of it sitting silently in the data."""
+        self._seed_patient(markers=(("Schmetterlingsindex", "fL", 26.0, 34.0),))
+        at = self._run_app()
+        self._assert_clean(at)
+        warnings = " || ".join(w.value for w in at.warning)
+        self.assertIn("Schmetterlingsindex", warnings)
+        # A fully registered marker set must NOT trigger the warning.
+        at2 = self._run_app()
+        self._assert_clean(at2)
 
     # ── widget identity (selection survives unrelated reruns) ────────────────
 

@@ -350,6 +350,16 @@ def normalize_names(llm: OpenAI, extracted_names: list[dict] | list[str], canoni
     disambiguate unit-qualified canonical variants (e.g. "HbA1c (%)" vs
     "HbA1c (mmol/mol)"). Each returned mapping echoes the unit of the entry it
     maps, so callers can match mappings back to entries per unit.
+
+    Returned mappings are validated against the canonical names the model was
+    actually shown: a hallucinated target is dropped so it can never be written
+    into ``DataPoint.canonical_name`` as a phantom biomarker (which would
+    bypass the registry, ref-range defaults and merge grouping). The prompt
+    explicitly instructs the model to echo the original name when no good match
+    exists, so a mapping whose canonical equals its original is kept — that is
+    the faithful unknown-marker case, not a hallucination. A dropped mapping
+    simply makes the entry fall through to the deterministic alias/registry
+    tiers in ``extractor._normalize_name``.
     """
     # Normalize plain strings to dicts (backward compatibility)
     entries = [
@@ -363,7 +373,8 @@ def normalize_names(llm: OpenAI, extracted_names: list[dict] | list[str], canoni
     # ``registry`` (active DB registry) takes precedence over the static
     # config baseline so accepted proposals are honored.
     active_registry = registry if registry is not None else _CANONICAL_BIOMARKERS
-    for name in canonical_list or list(active_registry.keys()):
+    shown_names = canonical_list or list(active_registry.keys())
+    for name in shown_names:
         info = active_registry.get(name, {})
         aliases = info.get("aliases", [])
         units = info.get("units", [])
@@ -394,11 +405,41 @@ def normalize_names(llm: OpenAI, extracted_names: list[dict] | list[str], canoni
         )
         raw = _strip_markdown_json(resp.choices[0].message.content or "")
     try:
-        return NormalizationMapping(**json.loads(raw))
+        mapping = NormalizationMapping(**json.loads(raw))
     except json.JSONDecodeError as e:
         raise LLMResponseError(f"LLM returned invalid JSON for name normalization: {e}\nResponse snippet: {raw[:200]}")
     except Exception as e:
         raise LLMResponseError(f"LLM response parsing failed for name normalization: {e}\nResponse snippet: {raw[:200]}")
+
+    mapping.mappings = _filter_hallucinated_mappings(mapping.mappings, shown_names)
+    return mapping
+
+
+def _filter_hallucinated_mappings(mappings: list[dict], shown_names: list[str]) -> list[dict]:
+    """Drop mappings whose canonical name was never offered to the LLM.
+
+    Same guard ``suggest_merge_targets`` applies to merge targets: an unknown
+    target is unusable and must not reach the DB. Kept exceptions:
+      - the entry is missing/blank (handled by the caller's fallback tiers);
+      - canonical equals the original name — the prompt's explicit "no good
+        match exists → use the original name as-is" instruction, i.e. a
+        faithful unknown marker rather than an invented one.
+    """
+    known = {str(n).strip().lower() for n in shown_names}
+    kept = []
+    for m in mappings:
+        if not isinstance(m, dict):
+            continue
+        canonical = str(m.get("canonical", "") or "").strip()
+        if not canonical:
+            continue
+        if canonical.lower() in known:
+            kept.append(m)
+            continue
+        original = str(m.get("original", "") or "").strip()
+        if original and canonical.lower() == original.lower():
+            kept.append(m)
+    return kept
 
 
 # ── Data quality check (split into per-biomarker + duplicate phases) ─────────
@@ -463,43 +504,50 @@ Only report problems you can name and fix with high confidence. If everything is
 Return ONLY valid JSON, no explanations:
 {"findings": []}"""
 
-DUPLICATE_CHECK_SYSTEM_PROMPT_DE = """Du bist ein medizinischer Terminologie-Assistent. Dir wird die Liste der Biomarker gegeben, für die ein Patient tatsächlich Messwerte hat — jeder Eintrag mit Name und den gefundenen Einheiten. Prüfe NUR auf Duplikate: Tippfehler-Varianten oder alternative Schreibweisen desselben Biomarkers (z.B. "CRP" vs "C-reaktives Protein", "HbA1c" vs "HBA1c").
+DUPLICATE_CHECK_SYSTEM_PROMPT_DE = """Du bist ein medizinischer Terminologie-Assistent. Dir wird die Liste der Biomarker gegeben, für die ein Patient tatsächlich Messwerte hat — jeder Eintrag mit Name und den gefundenen Einheiten — sowie die Liste der kanonischen Registry-Namen. Prüfe auf:
+1. Duplikate: Tippfehler-Varianten oder alternative Schreibweisen desselben Biomarkers (z.B. "CRP" vs "C-reaktives Protein", "HbA1c" vs "HBA1c").
+2. Nicht registrierte Biomarker: Einträge, die weder exakt noch als Alias in der kanonischen Liste vorkommen und offensichtlich ein echter Biomarker sind (kein Messfehler- oder Textartefakt).
 
-Gib eine Liste von Befunden ("findings") zurück — EINER pro redundanter Eintrag. Jedes Befund hat die Form:
-{"category": "merge"|"name", "target_type": "registry", "biomarker": "<redundanter Name>", "description": "...", "action": "...", "params": {...}}
-- "category": "merge" wenn der Eintrag in einen bestehenden Zielnamen zusammengeführt werden soll, "name" wenn nur der Name korrigiert werden soll
+Gib eine Liste von Befunden ("findings") zurück — EINER pro betroffener Eintrag. Jedes Befund hat die Form:
+{"category": "merge"|"name"|"unknown", "target_type": "registry", "biomarker": "<Name>", "description": "...", "action": "...", "params": {...}}
+- "category": "merge" wenn der Eintrag in einen bestehenden Zielnamen zusammengeführt werden soll, "name" wenn nur der Name korrigiert werden soll, "unknown" wenn der Eintrag gar nicht in der Registry vorhanden ist
 - "target_type": immer "registry" — die Befunde betreffen die Biomarker-Namen/Registry
-- "biomarker": der redundante bzw. falsch benannte Eintrag (exakt wie in der Liste)
-- "description": kurze Erklärung auf Deutsch (max 2 Sätze), WARUM es ein Duplikat ist
+- "biomarker": der betroffene Eintrag (exakt wie in der Liste)
+- "description": kurze Erklärung auf Deutsch (max 2 Sätze), WARUM
 - "action" + "params":
-  - "merge": params {"target": "Zielname"} — redundanten Eintrag in Ziel zusammenführen (Ziel muss existieren)
+  - "merge": params {"target": "Zielname"} — redundanten Eintrag in Ziel zusammenführen (Ziel muss in der kanonischen Liste existieren)
   - "registry_name": params {"proposed": "korrigierter Name"}
+  - "register_biomarker": params {} (optional {"ref_range": "low-high unit"}) — den Namen als neuen kanonischen Registry-Eintrag anlegen. Nur vorschlagen, wenn der Eintrag eindeutig ein eigenständiger echter Biomarker ist und NICHT nur eine Variante/Rechtschreibfehler eines bereits registrierten (dafür ist "merge" bzw. "registry_name" richtig). Ein Registry-Eintrag gibt dem Biomarker einen Standard-Referenzbereich, damit die Risiko-Erkennung ihn bewerten kann.
 
-Gib NUR Befunde für Duplikate, die du mit hoher Sicherheit benennen kannst. Wenn es keine Duplikate gibt, gib {"findings": []} zurück.
+Gib NUR Befunde, die du mit hoher Sicherheit benennen kannst. Wenn nichts zu beanstanden ist, gib {"findings": []} zurück.
 Gib NUR ein gültiges JSON zurück, keine Erklärungen:
 {"findings": []}"""
 
-DUPLICATE_CHECK_SYSTEM_PROMPT_EN = """You are a medical terminology assistant. You are given the list of biomarkers for which a patient actually has measurements — each entry with its name and the units found. Check ONLY for duplicates: typo variants or alternative spellings of the same biomarker (e.g. "CRP" vs "C-reactive protein", "HbA1c" vs "HBA1c").
+DUPLICATE_CHECK_SYSTEM_PROMPT_EN = """You are a medical terminology assistant. You are given the list of biomarkers for which a patient actually has measurements — each entry with its name and the units found — plus the list of canonical registry names. Check for:
+1. Duplicates: typo variants or alternative spellings of the same biomarker (e.g. "CRP" vs "C-reactive protein", "HbA1c" vs "HBA1c").
+2. Unregistered biomarkers: entries that appear neither exactly nor as an alias in the canonical list and are clearly a real biomarker (not a measurement or text artifact).
 
-Return a list of findings ("findings") — ONE per redundant entry. Each finding has the form:
-{"category": "merge"|"name", "target_type": "registry", "biomarker": "<redundant name>", "description": "...", "action": "...", "params": {...}}
-- "category": "merge" if the entry should be folded into an existing target name, "name" if only the name needs correcting
+Return a list of findings ("findings") — ONE per affected entry. Each finding has the form:
+{"category": "merge"|"name"|"unknown", "target_type": "registry", "biomarker": "<name>", "description": "...", "action": "...", "params": {...}}
+- "category": "merge" if the entry should be folded into an existing target name, "name" if only the name needs correcting, "unknown" if the entry is not in the registry at all
 - "target_type": always "registry" — the findings concern biomarker names/the registry
-- "biomarker": the redundant or misspelled entry (exactly as in the list)
-- "description": short explanation in English (max 2 sentences) of WHY it is a duplicate
+- "biomarker": the affected entry (exactly as in the list)
+- "description": short explanation in English (max 2 sentences) of WHY
 - "action" + "params":
-  - "merge": params {"target": "target name"} — fold the redundant entry into the target (target must exist)
+  - "merge": params {"target": "target name"} — fold the redundant entry into the target (target must exist in the canonical list)
   - "registry_name": params {"proposed": "corrected name"}
+  - "register_biomarker": params {} (optionally {"ref_range": "low-high unit"}) — create the name as a new canonical registry entry. Only propose this when the entry is clearly a distinct real biomarker and NOT merely a variant/misspelling of an already-registered one (use "merge" or "registry_name" for those). A registry entry gives the biomarker a default reference range so risk detection can evaluate it.
 
-Only report duplicates you can name with high confidence. If there are no duplicates, return {"findings": []}.
+Only report findings you can name with high confidence. If there is nothing to flag, return {"findings": []}.
 Return ONLY valid JSON, no explanations:
 {"findings": []}"""
 
 
 # Categories a finding may carry (kept in sync with the UI grouping).
-DATA_QUALITY_CATEGORIES = ("ref_range", "unit", "name", "merge", "value", "missing")
+DATA_QUALITY_CATEGORIES = ("ref_range", "unit", "name", "merge", "value", "missing", "unknown")
 _DATA_POINT_ACTIONS = ("set_ref_range", "set_unit", "disable_value")
-_REGISTRY_ACTIONS = ("registry_ref_range", "registry_unit", "registry_name", "merge")
+_REGISTRY_ACTIONS = ("registry_ref_range", "registry_unit", "registry_name", "merge",
+                     "register_biomarker")
 
 
 def _parse_findings(raw, allowed_categories=None, allowed_target_types=None) -> list[dict]:
@@ -579,6 +627,10 @@ def _parse_findings(raw, allowed_categories=None, allowed_target_types=None) -> 
             if action == "merge":
                 if not str(params.get("target", "")).strip():
                     continue
+            elif action == "register_biomarker":
+                # No params required — the finding's 'biomarker' IS the name to
+                # register. A ref_range hint is optional and validated on accept.
+                pass
             elif not str(params.get("proposed", "")).strip():
                 continue
 
@@ -726,12 +778,15 @@ def run_biomarker_quality_check(llm: OpenAI, registry: dict, biomarker_name: str
 
 def run_duplicate_check(llm: OpenAI, biomarker_entries: list[tuple[str, str]],
                         registry: dict | None = None, lang: str | None = None) -> dict:
-    """Phase 2: check the patient's biomarker names for duplicates.
+    """Phase 2: check the patient's biomarker names for duplicates and
+    unregistered entries.
 
     The LLM sees a compact list of every distinct biomarker the patient has
     measurements for (name + units found), plus the canonical registry names so
     merge targets can be chosen from real entries. It may only return registry
-    findings about duplicates (merge / name).
+    findings: duplicates (merge / name) or names missing from the registry
+    entirely (unknown → register_biomarker, which creates a registry row so the
+    marker gets a default ref range and enters risk detection).
 
     Args:
         llm: OpenAI client instance
@@ -742,7 +797,7 @@ def run_duplicate_check(llm: OpenAI, biomarker_entries: list[tuple[str, str]],
         lang: 'de' or 'en'; defaults to the app language via _get_lang().
 
     Returns:
-        {'findings': [...]}. Only registry findings (categories merge / name).
+        {'findings': [...]}. Only registry findings (categories merge / name / unknown).
 
     Raises:
         LLMResponseError: if the LLM call fails or returns unparseable content.
@@ -786,7 +841,7 @@ def run_duplicate_check(llm: OpenAI, biomarker_entries: list[tuple[str, str]],
 
     return _dq_call(
         llm, system_prompt, prompt, "duplicate check",
-        allowed_categories=("merge", "name"),
+        allowed_categories=("merge", "name", "unknown"),
         allowed_target_types=("registry",),
     )
 
@@ -974,6 +1029,7 @@ Nur belegbare Trends; bei dünner Datenlage explizit sagen.
 ## Empfehlungen
 1-3 konkrete nächste Schritte (arztorientiert)."""
 
+
 PATIENT_SUMMARY_SYSTEM_PROMPT_EN = """You are an experienced physician creating a health summary for a patient.
 
 Your task: Create a structured, coherent assessment of the OVERALL health status based on the lab results. Cross-examine the markers against each other: a single value is rarely meaningful — the combination of markers decides.
@@ -1012,7 +1068,7 @@ Du erhältst eine nummerierte Liste von Risikofindern (Kategorie + Beschreibung,
 3. Klassifiziere jedes Risiko als "critical" oder "long_term":
    - "critical" = Sofortmaßnahme empfohlen: Das Risiko sollte innerhalb der nächsten Tage bis Wochen adressiert werden (z.B. akut kritische Werte, akute Organschädigung, sofort behandlungsbedürftige Muster).
    - "long_term" = Langzeitbeobachtung empfohlen: Eher ein langfristiges Problem, das aktuell noch nicht gefährlich ist (z.B. chronisch leicht erhöhte Werte, Trends, überfällige Kontrollen).
-   - WICHTIG: Beurteile die Dringlichkeit nach dem AKTUELLEN Wert (Stand des letzten Berichts), nicht nach historischen Extremwerten. Ein Marker, der früher kritisch war, aber im neuesten Bericht normal oder deutlich verbessert ist, ist NICHT mehr "critical" — klassifiziere ihn als "long_term" und erwähne die Besserung in der Erklärung.
+   - WICHTIG: Beurteile die Dringlichkeit nach dem AKTUELLEN Wert (Stand des letzten Berichts), nicht nach historischen Extremen. Ein Marker, der früher kritisch war, aber im neuesten Bericht normal oder deutlich verbessert ist, ist NICHT mehr "critical" — klassifiziere ihn als "long_term" und erwähne die Besserung in der Erklärung.
 4. Erstelle für jedes Risiko eine kurze Erklärung (2-3 Sätze): Was bedeutet der Befund klinisch, welche Konsequenzen können daraus resultieren und was sollte konkret getan werden?
 
 Gib NUR gültiges JSON in genau diesem Format zurück, ohne Markdown oder zusätzliche Kommentare:
@@ -1544,7 +1600,7 @@ Berücksichtige:
 - Ob Werte außerhalb des Referenzbereichs liegen und wie stark abweichend
 - Klinische Relevanz der gefundenen Muster
 - Falls klinisch verwandte Marker mit angegeben sind: nutze sie zur Einordnung (z.B. MCV + Ferritin bei Anämie, ALT + GGT + Bilirubin bei Leberwerten), aber interpretiere weiterhin nur den genannten Biomarker — die verwandten Werte sind Kontext, nicht Gegenstand der Interpretation
-- Stütze jede Aussage strikt auf die vorliegenden Messwerte: Erfinde oder unterstelle keine Werte, Trends, Diagnosen oder Zustände, die nicht durch die gegebenen Daten belegt sind. Liegen zu wenige Messungen für eine belastbare Trendaussage vor (oder wurde kein Langzeitverlauf bereitgestellt), sage dies ausdrücklich statt eines Trends zu inferieren.
+- Stütze jede Aussage strikt auf die vorliegenden Messwerte: Erfinde oder unterstelle keine Werte, Trends, Diagnosen oder Zustände, die nicht durch die gegebenen Daten belegt sind. Liegen zu wenige Messungen für eine belastbare Trendaussage vor (oder wurde kein Langzeitverlauf bereitgestellt), sage das ausdrücklich statt eines Trends zu inferieren.
 
 Zeilen mit [ABNORMAL] liegen außerhalb des Referenzbereichs.
 
@@ -1582,15 +1638,51 @@ def _get_biomarker_interpretation_prompt(lang: str | None = None) -> str:
     return BIOMARKER_INTERPRETATION_SYSTEM_PROMPT_DE if lang == "de" else BIOMARKER_INTERPRETATION_SYSTEM_PROMPT_EN
 
 
-def generate_biomarker_description(llm, biomarker_name: str, unit: str | None, canonical_list: list[str], lang: str | None = None) -> str | None:
+def _description_context_line(biomarker_name: str, unit: str | None, registry: dict | None,
+                              lang: str) -> str:
+    """Registry facts for one biomarker (typical units + default reference range).
+
+    Replaces the former "canonical list for context", which dumped all ~94
+    registry names into every description prompt. A general "what does this
+    biomarker measure" explanation gains nothing from the other 93 names — on a
+    small local model it was pure token bloat, paid once per biomarker in the
+    bulk job — while the unit and default range genuinely anchor the answer.
+    Returns "" when the marker has no registry entry (unknown markers).
+
+    ``lang`` is passed in rather than resolved via ``_get_lang()``: worker
+    threads have no Streamlit session state to read.
+    """
+    active_registry = registry if registry is not None else _CANONICAL_BIOMARKERS
+    info = active_registry.get(biomarker_name) or {}
+    de = lang == "de"
+    bits = []
+    units = [u for u in info.get("units", []) if u]
+    if unit and unit not in units:
+        units.insert(0, unit)
+    if units:
+        bits.append(("Übliche Einheiten" if de else "Typical units") + f": {', '.join(units)}")
+    elif unit:
+        bits.append(("Einheit" if de else "Unit") + f": {unit}")
+    ref = info.get("default_ref") or {}
+    if ref.get("low") is not None or ref.get("high") is not None:
+        bits.append(
+            ("Standard-Referenzbereich" if de else "Default reference range")
+            + f": {ref.get('low')}–{ref.get('high')} {ref.get('unit', '')}".rstrip()
+        )
+    return "\n".join(bits)
+
+
+def generate_biomarker_description(llm, biomarker_name: str, unit: str | None, lang: str | None = None,
+                                   registry: dict | None = None) -> str | None:
     """Generate a general explanation for a biomarker (what it measures, implications of abnormal values).
 
     Args:
         llm: OpenAI client instance
         biomarker_name: The canonical name of the biomarker
         unit: Unit of measurement (e.g. 'g/dl')
-        canonical_list: Full list of canonical biomarkers for context
         lang: 'de' or 'en'
+        registry: active registry dict (get_registry shape) used for the
+            unit/ref-range context line; falls back to the config baseline.
 
     Returns:
         Generated description text, or None on failure.
@@ -1600,16 +1692,15 @@ def generate_biomarker_description(llm, biomarker_name: str, unit: str | None, c
 
     unit_str = f" ({unit})" if unit else ""
     display_name = f"{biomarker_name}{unit_str}"
+    context_line = _description_context_line(biomarker_name, unit, registry, lang)
 
-    prompt = (
-        f"Biomarker: {display_name}\n\n"
-        f"Erstelle eine allgemeine Erklärung dieses Biomarkers. "
-        f"Canonical-Liste zur Einordnung: {json.dumps(canonical_list)}"
-    ) if lang == "de" else (
-        f"Biomarker: {display_name}\n\n"
-        f"Create a general explanation of this biomarker. "
-        f"Canonical list for context: {json.dumps(canonical_list)}"
+    task = (
+        "Erstelle eine allgemeine Erklärung dieses Biomarkers." if lang == "de"
+        else "Create a general explanation of this biomarker."
     )
+    prompt = f"Biomarker: {display_name}\n\n{task}"
+    if context_line:
+        prompt += "\n\n" + context_line
 
     try:
         with _llm_semaphore:

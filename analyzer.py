@@ -1,4 +1,3 @@
-import random
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session as SASession
@@ -995,22 +994,33 @@ def _analyze_patient(session: SASession, patient: Patient) -> list[RiskFlag]:
     return flags
 
 
-def analyze_trends(session: SASession) -> list[RiskFlag]:
-    all_flags = []
-    patients = session.query(Patient).all()
+def analyze_trends_by_patient(session: SASession) -> list[tuple[int, list[RiskFlag]]]:
+    """Detect risk flags for all patients, grouped per patient (LLM-free).
 
-    # Dedup PER PATIENT, not globally. _dedup_by_biomarker groups by
-    # (patient_id, base canonical name), so a global pass across all patients
-    # would let one patient's flag suppress another patient's same-named
-    # biomarker and let a single patient consume the whole max_flags budget.
-    # Scoping per patient matches refresh_patient_risk_flags().
-    for patient in patients:
-        all_flags.extend(
-            _dedup_by_biomarker(
-                _analyze_patient(session, patient), session, RISK_CONFIG["max_flags"]
-            )
+    Dedup is scoped PER PATIENT, not globally. _dedup_by_biomarker groups by
+    (patient_id, base canonical name), so a global pass across all patients
+    would let one patient's flag suppress another patient's same-named
+    biomarker and let a single patient consume the whole max_flags budget.
+    Scoping per patient matches refresh_patient_risk_flags(). Keeping the
+    groups apart (instead of flattening) also lets refresh_risk_flags() rank
+    each patient with its own LLM call, so the LLM's 10-risk budget can never
+    be spent entirely on one patient while others get zero risk cards.
+    """
+    groups: list[tuple[int, list[RiskFlag]]] = []
+    for patient in session.query(Patient).all():
+        flags = _dedup_by_biomarker(
+            _analyze_patient(session, patient), session, RISK_CONFIG["max_flags"]
         )
+        if flags:
+            groups.append((patient.id, flags))
+    return groups
 
+
+def analyze_trends(session: SASession) -> list[RiskFlag]:
+    """Flat list of detected flags for all patients (see analyze_trends_by_patient)."""
+    all_flags: list[RiskFlag] = []
+    for _patient_id, flags in analyze_trends_by_patient(session):
+        all_flags.extend(flags)
     return all_flags
 
 
@@ -1145,52 +1155,69 @@ def _build_findings_with_context(session: SASession, flags: list[RiskFlag]) -> l
 
 
 def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) -> int:
-    """Rebuild all risk flags and let the LLM rank + explain them.
+    """Rebuild all risk flags and let the LLM rank + explain them PER PATIENT.
 
-    Detection (analyze_trends) is deterministic and LLM-free. The LLM then
-    selects up to 10 findings, ranks them by urgency and classifies each as
+    Detection (analyze_trends_by_patient) is deterministic and LLM-free. The
+    LLM then ranks each patient's own findings separately: one assess_risks
+    call per patient, selecting up to 10 findings and classifying each as
     "critical" (immediate action recommended) or "long_term" (observation
-    recommended). If the LLM is unavailable or fails, flags keep their
-    detection order/severity and are shuffled randomly instead.
+    recommended). Ranking globally (one call over every patient's flags) let a
+    single patient consume the whole 10-risk budget — every other patient was
+    left with zero explained flags, and the Risks tab hides explanation-less
+    flags once any flag is LLM-ranked, so those patients showed no risk cards
+    at all. Per patient, the budget applies per patient instead.
 
-    IMPORTANT: the DELETE + INSERT (write lock) happens AFTER the LLM call,
+    If the LLM is unavailable or fails for a patient, that patient's flags
+    keep their detection severities in a deterministic order (severity desc).
+
+    IMPORTANT: the DELETE + INSERT (write lock) happens AFTER all LLM calls,
     not before. Holding SQLite's single write lock across a multi-second/
     minute HTTP request would block every other writer (UI reruns, progress
     updates) until busy_timeout expires → "database is locked" crash.
     """
     # Detection + LLM ranking are read-only — no write lock held during the
-    # (slow) LLM HTTP call. analyze_trends creates in-memory RiskFlag objects
-    # and does not persist them, so nothing reads the old rows in between.
-    flags = analyze_trends(session)
+    # (slow) LLM HTTP calls. The helpers create in-memory RiskFlag objects and
+    # do not persist them, so nothing reads the old rows in between.
+    groups = analyze_trends_by_patient(session)
 
-    ranked: list[RiskFlag] | None = None
-    if llm and flags:
-        findings_data = _build_findings_with_context(session, flags)
-        from llm_client import assess_risks
-        try:
-            risks = assess_risks(llm, findings_data, lang=lang)
-        except Exception:
-            risks = []
-        if risks:
-            ranked = _apply_llm_ranking(flags, risks)
+    from llm_client import assess_risks, is_job_aborted
 
-    if ranked is None:
-        # No LLM assessment: keep detection severities, random order.
-        ranked = list(flags)
-        random.shuffle(ranked)
+    ranked_all: list[RiskFlag] = []
+    aborted = False
+    for _patient_id, flags in groups:
+        if is_job_aborted():
+            # User aborted: stop issuing LLM calls and skip the write phase
+            # entirely so old flags stay untouched.
+            aborted = True
+            break
+        ranked: list[RiskFlag] | None = None
+        if llm:
+            findings_data = _build_findings_with_context(session, flags)
+            try:
+                risks = assess_risks(llm, findings_data, lang=lang)
+            except Exception:
+                risks = []
+            if risks:
+                ranked = _apply_llm_ranking(flags, risks)
+        if ranked is None:
+            # No LLM assessment for this patient: keep detection severities,
+            # deterministic order — mirrors the no-LLM path of
+            # refresh_patient_risk_flags() (no random shuffle: a shuffled
+            # order re-shuffles on every run and re-writes every rank).
+            ranked = sorted(flags, key=lambda f: (f.severity or 0), reverse=True)
+        for rank, flag in enumerate(ranked, start=1):
+            flag.rank = rank
+            ranked_all.append(flag)
 
-    from llm_client import is_job_aborted
-    if is_job_aborted():
-        # User aborted: skip the write phase so old flags stay untouched.
+    if aborted:
         return 0
 
     # Only now take the write lock — for as short a time as possible.
     session.query(RiskFlag).delete(synchronize_session=False)
-    for rank, flag in enumerate(ranked, start=1):
-        flag.rank = rank
+    for flag in ranked_all:
         session.add(flag)
     session.commit()
-    return len(ranked)
+    return len(ranked_all)
 
 
 def _apply_llm_ranking(flags: list[RiskFlag], risks: list[dict]) -> list[RiskFlag]:

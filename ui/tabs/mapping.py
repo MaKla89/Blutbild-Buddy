@@ -11,8 +11,9 @@ import json
 import pandas as pd
 import streamlit as st
 
+from config import resolve_canonical
 from database import (
-    get_registry_names, get_custom_biomarkers,
+    get_registry, get_registry_names, get_custom_biomarkers, _canonical_base,
     rename_canonical_name, add_custom_biomarker, update_biomarker_registry,
     get_data_quality_findings, apply_data_quality_finding,
     dismiss_data_quality_finding, clear_resolved_data_quality_findings,
@@ -20,6 +21,28 @@ from database import (
 from translations import t
 from ui import queries
 from ui.helpers import _flash, _job_button, _show_flash
+
+
+def _unregistered_markers(names, registry: dict) -> list[str]:
+    """Canonical names the extractor kept verbatim (no registry entry).
+
+    Mirrors the extractor's own resolution tiers so a marker is flagged
+    'unregistered' exactly when the pipeline could not map it: a name counts
+    as registered if resolve_canonical matches it (exact canonical or alias)
+    OR its base name (unit suffix in parens stripped) matches a canonical's
+    base. Unknown markers have no default reference range and are invisible
+    to critical-value / cross-biomarker / missing-marker risk detection, so
+    surfacing them here is the recovery path (rename or add a registry row).
+    """
+    bases = {_canonical_base(c).lower() for c in registry}
+    unregistered = []
+    for name in names:
+        if resolve_canonical(name, registry=registry):
+            continue
+        if _canonical_base(name).lower() in bases:
+            continue
+        unregistered.append(name)
+    return unregistered
 
 
 def _fmt_num(v):
@@ -69,6 +92,12 @@ def _finding_proposal(f) -> str:
         return t("proposal_registry_unit", proposed=str(params.get("proposed", "") or "?"))
     if action == "registry_ref_range":
         return t("proposal_registry_ref_range", range=str(params.get("proposed", "") or "?"))
+    if action == "register_biomarker":
+        hint = str(params.get("ref_range", "") or "").strip()
+        if hint:
+            return t("proposal_register_biomarker_ref",
+                     name=str(f.biomarker or "?"), ref_range=hint)
+        return t("proposal_register_biomarker", name=str(f.biomarker or "?"))
     return t("proposal_unknown")
 
 
@@ -92,12 +121,34 @@ def render_mapping_tab(session, patient, patient_reports):
         # Build unique canonical names list first (needed for rename dropdown)
         unique_canonicals = sorted({row.canonical_name for row in dp_results})
 
+        # Names the extraction pipeline could not map to the registry (it keeps
+        # unknown names verbatim). Such markers get no default reference range
+        # and are skipped by critical-value, trend, cross-biomarker and
+        # missing-marker detection — so a patient can look entirely healthy
+        # while an abnormal odd-named marker sits in the data. Surface them
+        # with the recovery path (rename below, or add a registry row).
+        registry = get_registry(session)
+        custom_names = get_custom_biomarkers(session)
+        unregistered = _unregistered_markers(unique_canonicals, registry)
+        # Names the user added deliberately as custom biomarkers are not
+        # pipeline misses — the rename/edit sections below already cover them,
+        # so listing them here would be permanent noise.
+        unregistered = [n for n in unregistered if n.lower() not in {c.lower() for c in custom_names}]
+        if unregistered:
+            st.warning(
+                t("warning_unregistered_markers", names=", ".join(unregistered))
+                + "\n\n" + t("warning_unregistered_markers_hint")
+            )
+
         # Column labels are resolved once, not per row: a mapping table can run
         # into the thousands of rows and each t() hits session state for the
         # language, which measurably dominates the rerun.
         c_date, c_report = t("col_date"), t("col_report")
         c_original, c_canonical = t("col_original"), t("col_canonical")
         c_value, c_unit, c_reference = t("col_value"), t("col_unit"), t("col_reference")
+        c_registered = t("col_registered")
+        badge_unregistered = t("badge_unregistered")
+        unregistered_lower = {n.lower() for n in unregistered}
         mapping_rows = []
         for dp in dp_results:
             ref_str = f"{dp.ref_low}–{dp.ref_high}" if dp.ref_low is not None and dp.ref_high is not None else "—"
@@ -109,6 +160,7 @@ def render_mapping_tab(session, patient, patient_reports):
                 c_value: f"{dp.value} {dp.unit or ''}" if dp.value is not None else "—",
                 c_unit: dp.unit or "—",
                 c_reference: ref_str,
+                c_registered: badge_unregistered if dp.canonical_name.lower() in unregistered_lower else "",
             })
         df_mapping = pd.DataFrame(mapping_rows)
         st.dataframe(df_mapping, width='stretch', hide_index=True)
