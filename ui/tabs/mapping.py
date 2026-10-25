@@ -12,13 +12,13 @@ import pandas as pd
 import streamlit as st
 
 from database import (
-    Report, DataPoint,
     get_registry_names, get_custom_biomarkers,
     rename_canonical_name, add_custom_biomarker, update_biomarker_registry,
     get_data_quality_findings, apply_data_quality_finding,
     dismiss_data_quality_finding, clear_resolved_data_quality_findings,
 )
 from translations import t
+from ui import queries
 from ui.helpers import _flash, _job_button, _show_flash
 
 
@@ -82,34 +82,33 @@ def render_mapping_tab(session, patient, patient_reports):
     for r in patient_reports:
         date_str = r.report_date.strftime("%d.%m.%Y") if r.report_date else "?"
         report_options[date_str + " — " + r.filename] = r.id
-    selected_report_label = st.selectbox(t("select_filter_report"), list(report_options.keys()))
+    selected_report_label = st.selectbox(t("select_filter_report"), list(report_options.keys()),
+                                         key="mapping_report_filter")
     selected_report_id = report_options[selected_report_label]
 
-    dp_query = (
-        session.query(DataPoint, Report.report_date, Report.filename)
-        .join(Report)
-        .filter(Report.patient_id == patient.id)
-    )
-    if selected_report_id is not None:
-        dp_query = dp_query.filter(DataPoint.report_id == selected_report_id)
-    dp_query = dp_query.order_by(DataPoint.canonical_name, Report.report_date)
-    dp_results = dp_query.all()
+    dp_results = queries.mapping_rows(patient.id, selected_report_id)
 
     if dp_results:
         # Build unique canonical names list first (needed for rename dropdown)
-        unique_canonicals = sorted({dp.canonical_name for dp, _, _ in dp_results})
+        unique_canonicals = sorted({row.canonical_name for row in dp_results})
 
+        # Column labels are resolved once, not per row: a mapping table can run
+        # into the thousands of rows and each t() hits session state for the
+        # language, which measurably dominates the rerun.
+        c_date, c_report = t("col_date"), t("col_report")
+        c_original, c_canonical = t("col_original"), t("col_canonical")
+        c_value, c_unit, c_reference = t("col_value"), t("col_unit"), t("col_reference")
         mapping_rows = []
-        for dp, rdate, filename in dp_results:
+        for dp in dp_results:
             ref_str = f"{dp.ref_low}–{dp.ref_high}" if dp.ref_low is not None and dp.ref_high is not None else "—"
             mapping_rows.append({
-                t("col_date"): rdate.strftime("%d.%m.%Y") if rdate else "?",
-                t("col_report"): filename,
-                t("col_original"): dp.original_name or "—",
-                t("col_canonical"): dp.canonical_name,
-                t("col_value"): f"{dp.value} {dp.unit or ''}" if dp.value is not None else "—",
-                t("col_unit"): dp.unit or "—",
-                t("col_reference"): ref_str,
+                c_date: dp.report_date.strftime("%d.%m.%Y") if dp.report_date else "?",
+                c_report: dp.filename,
+                c_original: dp.original_name or "—",
+                c_canonical: dp.canonical_name,
+                c_value: f"{dp.value} {dp.unit or ''}" if dp.value is not None else "—",
+                c_unit: dp.unit or "—",
+                c_reference: ref_str,
             })
         df_mapping = pd.DataFrame(mapping_rows)
         st.dataframe(df_mapping, width='stretch', hide_index=True)
@@ -118,6 +117,11 @@ def render_mapping_tab(session, patient, patient_reports):
         st.divider()
         st.subheader(t("subheader_rename"))
         st.caption(t("caption_rename"))
+
+        # A successful rename sets _rerun_requested, which aborts the run and
+        # discards everything rendered in it — so every outcome of the rename is
+        # queued via _flash and shown on the following run.
+        _show_flash("mapping_rename")
 
         registry_names = get_registry_names(session)
         custom_names = get_custom_biomarkers(session)
@@ -131,43 +135,54 @@ def render_mapping_tab(session, patient, patient_reports):
         with col_r3:
             free_text = st.text_input(t("input_new_name"), key="mapping_new_name_free", placeholder=t("input_new_name_placeholder"))
 
-        if st.button(t("btn_rename_biomarker"), type="secondary", width='stretch'):
+        if st.button(t("btn_rename_biomarker"), type="secondary", width='stretch',
+                     key="btn_rename_biomarker_action"):
             final_new_name = free_text.strip() if free_text.strip() else new_name
+            data_changed = False
             if not final_new_name:
-                st.error(t("error_no_name"))
+                _flash("mapping_rename", "error", t("error_no_name"))
             elif final_new_name == old_name:
-                st.warning(t("warning_same_name"))
+                _flash("mapping_rename", "warning", t("warning_same_name"))
             elif old_name.lower() in {n.lower() for n in registry_names}:
                 # Global registry rename: renames the registry row, all data
                 # points and biomarker infos across ALL patients, and keeps
                 # the old name as an alias for incoming PDF names.
                 outcome = update_biomarker_registry(session, old_name, "name", final_new_name)
                 if outcome["status"] == "applied":
-                    st.success(t("msg_biomarker_renamed_global", old=old_name, new=final_new_name))
+                    _flash("mapping_rename", "success",
+                           t("msg_biomarker_renamed_global", old=old_name, new=final_new_name))
+                    data_changed = True
                 else:
                     # The only remaining skip reason here is a name collision.
-                    st.warning(t("warning_rename_collision", new=final_new_name))
+                    _flash("mapping_rename", "warning",
+                           t("warning_rename_collision", new=final_new_name))
             else:
                 # Custom biomarker without a registry row: keep the old
                 # per-patient rename behavior.
                 if free_text.strip() and free_text.strip().lower() not in {n.lower() for n in registry_names}:
                     if add_custom_biomarker(session, free_text.strip()):
-                        st.success(t("msg_added_to_master", name=free_text.strip()))
+                        _flash("mapping_rename", "success", t("msg_added_to_master", name=free_text.strip()))
                     else:
-                        st.info(t("msg_already_in_master", name=free_text.strip()))
+                        _flash("mapping_rename", "info", t("msg_already_in_master", name=free_text.strip()))
 
                 count = rename_canonical_name(session, patient.id, old_name, final_new_name)
                 if count > 0:
                     plural = "e" if count > 1 else ""
-                    st.success(t("msg_biomarker_renamed", count=count, plural=plural, old=old_name, new=final_new_name))
+                    _flash("mapping_rename", "success",
+                           t("msg_biomarker_renamed", count=count, plural=plural, old=old_name, new=final_new_name))
+                    data_changed = True
                 else:
-                    st.warning(t("warning_no_data_points", old=old_name))
-            st.session_state._rerun_requested = True
+                    _flash("mapping_rename", "warning", t("warning_no_data_points", old=old_name))
+            # Only reload the data when something actually changed: rerunning on
+            # a validation error would discard the message the user needs to see.
+            if data_changed:
+                st.session_state._rerun_requested = True
 
         # --- Manual registry edit section ---
         st.divider()
         st.subheader(t("subheader_registry_edit"))
         st.caption(t("caption_registry_edit"))
+        _show_flash("registry_edit")
 
         col_e1, col_e2, col_e3, col_e4 = st.columns([2, 1, 2, 1])
         with col_e1:
@@ -195,17 +210,21 @@ def render_mapping_tab(session, patient, patient_reports):
                 }[field_key],
             )
         with col_e4:
-            apply_edit = st.button(t("btn_apply_registry_edit"), type="secondary", width='stretch')
+            apply_edit = st.button(t("btn_apply_registry_edit"), type="secondary",
+                                   width='stretch', key="btn_apply_registry_edit")
 
         if apply_edit:
             if not edit_value.strip():
                 st.error(t("error_empty_value"))
             else:
                 outcome = update_biomarker_registry(session, edit_name, field_key, edit_value)
+                # Queued via _flash: the _rerun_requested below discards this run.
                 if outcome["status"] == "applied":
-                    st.success(t("msg_registry_edit_applied", field=field_key, proposed=outcome["detail"]))
+                    _flash("registry_edit", "success",
+                           t("msg_registry_edit_applied", field=field_key, proposed=outcome["detail"]))
                 else:
-                    st.warning(t("msg_suggestion_skipped", detail=outcome.get("detail", "")))
+                    _flash("registry_edit", "warning",
+                           t("msg_suggestion_skipped", detail=outcome.get("detail", "")))
                 st.session_state._rerun_requested = True
 
         # --- Backfill registry defaults onto missing data points -----------
@@ -318,9 +337,10 @@ def render_mapping_tab(session, patient, patient_reports):
                 st.session_state._rerun_requested = True
 
             # Housekeeping: drop applied/dismissed findings for this patient.
-            if st.button(t("btn_clear_resolved_findings")):
+            if st.button(t("btn_clear_resolved_findings"), key="btn_clear_resolved_findings"):
                 n = clear_resolved_data_quality_findings(session, patient.id)
-                st.info(t("msg_findings_cleared", n=n))
+                # Queued via _flash: the rerun below discards this run's output.
+                _flash("findings_accept_all", "info", t("msg_findings_cleared", n=n))
                 st.session_state._rerun_requested = True
         else:
             st.caption(t("caption_no_findings"))

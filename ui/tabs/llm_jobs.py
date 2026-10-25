@@ -24,10 +24,18 @@ applies to the job worker threads only.
 
 import streamlit as st
 
-from database import clear_finished_llm_jobs, get_session, list_llm_jobs
+from database import (
+    clear_finished_llm_jobs, get_active_llm_jobs, get_session, list_llm_jobs,
+)
 from llm_jobs import DATA_AFFECTING_KINDS, abort_job
 from translations import t
 from ui.helpers import _flash
+
+# Kinds whose result should be flashed into the originating tab when the job
+# finishes, on top of DATA_AFFECTING_KINDS. test_connection changes no data, so
+# it is deliberately not in DATA_AFFECTING_KINDS — but the user still needs the
+# verdict in the LLM Settings tab, and the flash only renders after the rerun.
+_EXTRA_FLASH_KINDS = {"test_connection"}
 
 # Which _flash() keys receive the result message when a job kind finishes.
 # A kind can be started from several tabs, and every tab renders on every
@@ -44,6 +52,7 @@ _FINISH_FLASH_KEYS = {
     "bulk_interpretations": ("bulk_interp",),
     "backfill": ("backfill_mapping",),
     "data_quality_check": ("data_quality_check",),
+    "test_connection": ("llm_settings",),
 }
 
 
@@ -56,60 +65,85 @@ def render_llm_jobs_tab(session):
             n = clear_finished_llm_jobs(s)
         st.toast(t("msg_jobs_cleared", n=n))
 
-    @st.fragment(run_every=2)
-    def _jobs_poll():
-        with get_session() as s:
-            jobs = list_llm_jobs(s, limit=20)
+    # Auto-poll only while a job is actually pending/running. An unconditional
+    # run_every=2 kept re-executing this fragment every 2 seconds forever — even
+    # hours after the last job finished — and every full app rerun registered
+    # another interval in the browser, so an idle screen got progressively more
+    # busy. The fragment is therefore only *defined* while something runs: once
+    # the last job finishes, the poll triggers an app rerun, that rerun sees no
+    # active job, and the polling fragment is never registered again (a leftover
+    # browser interval then resolves to an unknown fragment id and is dropped).
+    # run_every must be decided at definition time, hence the two branches.
+    with get_session() as s:
+        jobs_active = bool(get_active_llm_jobs(s))
 
-        if not jobs:
-            st.info(t("msg_no_jobs_yet"))
-            return
+    if jobs_active:
+        @st.fragment(run_every=2)
+        def _jobs_poll():
+            _render_jobs()
 
-        # Transition detection: remember the last-seen status per job id and
-        # refresh the app when a data-affecting job finishes.
-        prev = dict(st.session_state.get("_llm_job_statuses", {}))
-        now = {j.id: j.status for j in jobs}
-        just_finished = []
-        for jid, old_status in list(prev.items()):
-            new_status = now.get(jid)
-            if new_status is None:  # job scrolled out of the list — drop it
-                del prev[jid]
-                continue
-            if (new_status != old_status
-                    and old_status in ("pending", "running")
-                    and new_status in ("done", "error", "interrupted")):
-                job = next(j for j in jobs if j.id == jid)
-                if job.kind in DATA_AFFECTING_KINDS:
-                    just_finished.append(job)
-        # Persist the new statuses BEFORE rerunning: otherwise the rerun's
-        # first poll would see the same transition again and rerun forever.
-        st.session_state._llm_job_statuses = now
+        _jobs_poll()
+    else:
+        _render_jobs()
 
-        if just_finished:
-            # Tell the user the job is over (toasts live in the notification
-            # layer, so they survive the rerun below), and queue a result
-            # message for the tab that started the job — the rerun discards
-            # anything rendered in this run, hence _flash().
-            for job in just_finished:
-                st.toast(f"{job.label} — {t(f'job_status_{job.status}')}")
-                if job.status == "done":
-                    # info, not success: the worker's result text already
-                    # carries its own nuance (partial failures included) and the
-                    # toast above shows the ✅/❌ status.
-                    for flash_key in _FINISH_FLASH_KEYS.get(job.kind, ()):
-                        _flash(flash_key, "info", job.result_text or job.label)
-            st.rerun()
 
-        for i, job in enumerate(jobs):
-            _render_job_row(job)
-            if i < len(jobs) - 1:
-                st.divider()
+def _render_jobs():
+    """The job list itself, with transition detection (see render_llm_jobs_tab)."""
+    with get_session() as s:
+        jobs = list_llm_jobs(s, limit=20)
 
-        # Only explain the "interrupted" status when one is actually visible.
-        if any(j.status == "interrupted" for j in jobs):
-            st.caption(t("job_interrupted_note"))
+    if not jobs:
+        st.info(t("msg_no_jobs_yet"))
+        return
 
-    _jobs_poll()
+    # Transition detection: remember the last-seen status per job id and
+    # refresh the app when a data-affecting job finishes.
+    prev = dict(st.session_state.get("_llm_job_statuses", {}))
+    now = {j.id: j.status for j in jobs}
+    just_finished = []
+    for jid, old_status in list(prev.items()):
+        new_status = now.get(jid)
+        if new_status is None:  # job scrolled out of the list — drop it
+            del prev[jid]
+            continue
+        if (new_status != old_status
+                and old_status in ("pending", "running")
+                and new_status in ("done", "error", "interrupted")):
+            job = next(j for j in jobs if j.id == jid)
+            if job.kind in DATA_AFFECTING_KINDS or job.kind in _EXTRA_FLASH_KINDS:
+                just_finished.append(job)
+    # Persist the new statuses BEFORE rerunning: otherwise the rerun's
+    # first poll would see the same transition again and rerun forever.
+    st.session_state._llm_job_statuses = now
+
+    if just_finished:
+        # Tell the user the job is over (toasts live in the notification
+        # layer, so they survive the rerun below), and queue a result
+        # message for the tab that started the job — the rerun discards
+        # anything rendered in this run, hence _flash().
+        for job in just_finished:
+            st.toast(f"{job.label} — {t(f'job_status_{job.status}')}")
+            if job.status == "done":
+                # info, not success: the worker's result text already
+                # carries its own nuance (partial failures included) and the
+                # toast above shows the ✅/❌ status.
+                for flash_key in _FINISH_FLASH_KEYS.get(job.kind, ()):
+                    _flash(flash_key, "info", job.result_text or job.label)
+            elif job.kind in _EXTRA_FLASH_KINDS:
+                # A failed connection test must be visible where the user
+                # clicked, not only in the LLM-Jobs tab.
+                for flash_key in _FINISH_FLASH_KEYS.get(job.kind, ()):
+                    _flash(flash_key, "error", job.error or job.label)
+        st.rerun()
+
+    for i, job in enumerate(jobs):
+        _render_job_row(job)
+        if i < len(jobs) - 1:
+            st.divider()
+
+    # Only explain the "interrupted" status when one is actually visible.
+    if any(j.status == "interrupted" for j in jobs):
+        st.caption(t("job_interrupted_note"))
 
 
 def _render_job_row(job):

@@ -370,10 +370,22 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
 
     # Live "answer is generating" state + adoption of finished answers. The
     # fragment polls every 2s even while the user sits on another tab (all tab
-    # content renders on every rerun, and run_every keeps it alive afterwards),
-    # so the answer is adopted into the DB and shown as soon as it lands.
+    # content renders on every rerun), so the answer is adopted into the DB and
+    # shown as soon as it lands. It is only registered while an answer is
+    # actually in flight: an unconditional run_every kept a 2s timer alive in
+    # the browser for every conversation that had ever been opened, and each
+    # full rerun added another one. When the answer lands, the poll adopts it
+    # and reruns the app; that rerun sees no in-flight job and never defines the
+    # polling fragment again.
     if conv is not None:
-        _chat_answer_poll(conv.id)
+        if pending:
+            @st.fragment(run_every=2)
+            def _chat_answer_poll(conversation_id: int):
+                _poll_chat_answer(conversation_id)
+
+            _chat_answer_poll(conv.id)
+        else:
+            _poll_chat_answer(conv.id)
 
     user_msg = st.chat_input(
         t("chat_input_placeholder"), key=f"chat_input_{patient.id}", disabled=pending,
@@ -422,8 +434,7 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
     st.caption(t("chat_disclaimer"))
 
 
-@st.fragment(run_every=2)
-def _chat_answer_poll(conversation_id: int):
+def _poll_chat_answer(conversation_id: int):
     """Poll this conversation's newest chat_answer job (see render_chat_tab).
 
     - pending/running → live progress bar (the worker reports chat_thinking);

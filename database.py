@@ -4,10 +4,12 @@ import logging
 import re
 
 from sqlalchemy import (
-    create_engine, Column, Integer, Float, String, Text, DateTime, ForeignKey,
-    Boolean, inspect, text, func, select, UniqueConstraint,
+    create_engine, event, Column, Integer, Float, String, Text, DateTime,
+    ForeignKey, Boolean, inspect, text, func, select, UniqueConstraint,
 )
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session as SASession
+from sqlalchemy.orm import (
+    declarative_base, relationship, sessionmaker, Session as SASession,
+)
 
 import config as _config
 
@@ -16,6 +18,23 @@ _logger = logging.getLogger(__name__)
 _base = declarative_base()
 _engine = None
 _SessionLocal = None
+# Monotonic counter bumped on EVERY commit made through any ORM Session in this
+# process (UI code and LLM job workers alike). The UI caches read-only query
+# results keyed on it, so a cached result is dropped as soon as anything writes.
+# Single-process app → reliable; a second app instance writing to the same file
+# is additionally covered by SQLite's PRAGMA data_version (see ui.helpers).
+_commit_version = 0
+
+
+@event.listens_for(SASession, "after_commit")
+def _bump_commit_version(_session):
+    global _commit_version
+    _commit_version += 1
+
+
+def commit_version() -> int:
+    """Current in-process commit counter (see _commit_version)."""
+    return _commit_version
 # DB path the current engine was created for. Streamlit re-executes app.py
 # (and thus init_db()) on every rerun; when the path is unchanged we can skip
 # engine recreation and all migration checks entirely.

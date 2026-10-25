@@ -10,7 +10,6 @@ from database import (
     get_latest_patient_summary, patient_age_years, collect_report_artifacts,
     mark_stale_llm_jobs_interrupted,
 )
-from sqlalchemy import func
 from llm_client import generate_patient_summary
 from llm_jobs import active_job_ids
 from translations import t, set_lang, _get_lang
@@ -20,6 +19,7 @@ from translations import t, set_lang, _get_lang
 from ui.helpers import (  # noqa: F401
     _handle_file_upload,
     load_data,
+    data_point_count,
     _collect_historical_data,
     _HISTORICAL_MAX_POINTS_PER_BIOMARKER,
     _run_bulk_generation,
@@ -33,6 +33,7 @@ from ui.helpers import (  # noqa: F401
 from ui.tabs.reports import render_reports_tab as _render_reports_tab  # noqa: F401
 from ui.tabs.patients import render_patients_tab as _render_patients_tab  # noqa: F401
 from ui.tabs.llm_settings import render_llm_settings_tab as _render_llm_settings_tab  # noqa: F401
+from ui import queries
 from ui.tabs.overview import render_overview_tab  # noqa: F401
 from ui.tabs.detail import render_detail_tab  # noqa: F401
 from ui.tabs.trends import render_trends_tab  # noqa: F401
@@ -175,16 +176,8 @@ def _render_health_summary(session, patient, t):
 
 
 def _patient_report_stats(session):
-    """One aggregate query for report count + latest date per patient."""
-    return {
-        pid: (count, latest)
-        for pid, count, latest in session.query(
-            Report.patient_id, func.count(Report.id), func.max(Report.report_date)
-        )
-        .filter(Report.patient_id.isnot(None))
-        .group_by(Report.patient_id)
-        .all()
-    }
+    """Report count + latest date per patient (cached — see ui.queries)."""
+    return queries.report_stats()
 
 
 def _patient_label(stats, patient):
@@ -228,7 +221,7 @@ def main():
         )
 
     session = get_session()
-    patients, reports, dps, flags = load_data(session)
+    patients, reports = load_data(session)
 
     # Patient selector at top (not in sidebar) — labels carry report count
     # and latest report date so the choice is informative at a glance.
@@ -281,7 +274,7 @@ def main():
 
     # --- TAB: Reports ---
     with mgmt_subtabs[0]:
-        _render_reports_tab(session, patients, reports, dps, _generate_summary_for_patient)
+        _render_reports_tab(session, patients, reports, _generate_summary_for_patient)
 
     # --- TAB: Patients ---
     with mgmt_subtabs[1]:
@@ -310,22 +303,11 @@ def main():
         return
 
     patient = selected_patient
-    patient_reports = (
-        session.query(Report)
-        .filter(Report.patient_id == patient.id)
-        .order_by(Report.report_date)
-        .all()
-    )
-
-    # Compute time range for chart filters
-    date_range_results = (
-        session.query(func.min(Report.report_date), func.max(Report.report_date))
-        .filter(Report.patient_id == patient.id)
-        .filter(Report.report_date.isnot(None))
-        .first()
-    )
-    min_date = date_range_results[0] if date_range_results else None
-    max_date = date_range_results[1] if date_range_results else None
+    # Cached read-only queries (ui.queries): these ran on every rerun before,
+    # including the 2 s fragment polls. They return plain namedtuples, so the
+    # tabs must not treat them as ORM objects.
+    patient_reports = queries.patient_reports(patient.id)
+    min_date, max_date = queries.patient_date_range(patient.id)
 
     time_range_key = f"time_range_{patient.id}"
     if time_range_key not in st.session_state:

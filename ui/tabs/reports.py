@@ -25,10 +25,11 @@ from translations import t, _get_lang
 from ui.helpers import (
     _handle_file_upload,
     _active_job_for, _flash, _job_button, _render_job_state, _show_flash,
+    data_point_count,
 )
 
 
-def render_reports_tab(session, patients, reports, dps, gen_summary):
+def render_reports_tab(session, patients, reports, gen_summary):
     """Render the Reports management tab."""
     st.subheader(t("subheader_reports_manage"))
     st.caption(t("caption_reports_manage"))
@@ -214,7 +215,7 @@ def render_reports_tab(session, patients, reports, dps, gen_summary):
     total_rows = len(reports) + len(unprocessed)
     _plural = "" if total_rows == 1 else ("e" if _get_lang() == "de" else "s")
     st.markdown(f"**{t('heading_reports_list', n=total_rows, plural=_plural)}**")
-    caption = t("caption_stats", n=len(reports), m=len(dps))
+    caption = t("caption_stats", n=len(reports), m=data_point_count(session))
     if unprocessed:
         caption += t("caption_stats_unprocessed", n=len(unprocessed))
     st.caption(caption)

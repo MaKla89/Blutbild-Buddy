@@ -163,6 +163,7 @@ DE = {
     "subheader_pdf_settings_tab": "PDF-Einstellungen",
     "caption_pdf_settings_tab": "Einstellungen für PDF-Verarbeitung und Bildextraktion.",
     "btn_test_connection": "🔌 Verbindung testen",
+    "help_test_connection": "Startet einen Hintergrund-Job — die Oberfläche bleibt bedienbar, und das Ergebnis erscheint hier sowie im LLM-Jobs-Tab.",
     "msg_llm_connected": "✅ LLM-Verbindung erfolgreich!",
     "msg_llm_disconnected": "❌ Keine Verbindung:",
     "msg_llm_error": "❌ Fehler:",
@@ -172,7 +173,7 @@ DE = {
     "subheader_all_values": "Alle Biomarker-Werte im Zeitverlauf",
     "caption_all_values": "Matrix: Biomarker (Zeilen) × Berichtstermine (Spalten). Leere Zellen bedeuten, dass der Marker in diesem Bericht nicht gemessen wurde. Gelb hinterlegte Werte sind deaktiviert und fließen nicht in Diagramme oder Analysen ein.",
     "btn_export_csv": "📥 Als XLSX exportieren",
-    "msg_csv_exported": "XLSX-Datei heruntergeladen: {filename}",
+    "help_export_xlsx": "Direkter Download der Matrix — die Schaltfläche öffnet die Speicherabfrage des Browsers.",
     "col_reference_min": "Min",
     "col_reference_max": "Max",
     "col_all_values_date": "Datum",
@@ -448,6 +449,8 @@ DE = {
     "job_kind_backfill": "Referenzbereiche nachtragen",
     "job_kind_data_quality_check": "Datenqualität prüfen",
     "job_kind_chat_answer": "Chat-Antwort generieren",
+    "job_kind_test_connection": "LLM-Verbindungstest",
+    "note_test_timeout_capped": "Der Test verwendet maximal {timeout}s statt des konfigurierten Timeouts — so friert die Oberfläche bei unerreichbarem Server nicht ein.",
     "error_chat_no_question": "Keine Frage übermittelt — die Chat-Antwort konnte nicht gestartet werden.",
     "error_chat_empty_answer": "Das Modell hat keine Antwort geliefert — bitte fragen Sie erneut.",
     "msg_job_submitted": "Job gestartet — Fortschritt im Tab 'LLM-Jobs'.",
@@ -615,6 +618,7 @@ EN = {
     "subheader_pdf_settings_tab": "PDF Settings",
     "caption_pdf_settings_tab": "Settings for PDF processing and image extraction.",
     "btn_test_connection": "🔌 Test Connection",
+    "help_test_connection": "Starts a background job — the UI stays responsive, and the result appears here and in the LLM Jobs tab.",
     "msg_llm_connected": "✅ LLM connection successful!",
     "msg_llm_disconnected": "❌ No connection:",
     "msg_llm_error": "❌ Error:",
@@ -624,7 +628,7 @@ EN = {
     "subheader_all_values": "All Biomarker Values Over Time",
     "caption_all_values": "Matrix: biomarkers (rows) × report dates (columns). Empty cells mean the marker was not measured in that report. Yellow-highlighted values are disabled and excluded from charts and analyses.",
     "btn_export_csv": "📥 Export as XLSX",
-    "msg_csv_exported": "XLSX file downloaded: {filename}",
+    "help_export_xlsx": "Direct download of the matrix — the button opens your browser's save dialog.",
     "col_reference_min": "Min",
     "col_reference_max": "Max",
     "col_all_values_date": "Date",
@@ -899,6 +903,8 @@ EN = {
     "job_kind_backfill": "Backfill reference ranges",
     "job_kind_data_quality_check": "Check data quality",
     "job_kind_chat_answer": "Generate chat answer",
+    "job_kind_test_connection": "Test LLM connection",
+    "note_test_timeout_capped": "The test used at most {timeout}s instead of the configured timeout — that keeps the UI responsive when the server is unreachable.",
     "error_chat_no_question": "No question was submitted — the chat answer could not be started.",
     "error_chat_empty_answer": "The model returned no answer — please ask again.",
     "msg_job_submitted": "Job started — progress in the 'LLM Jobs' tab.",
@@ -916,10 +922,13 @@ _LANG_KEY = "_bb_lang"
 
 
 def _get_lang() -> str:
-    """Return the current language code ('de' or 'en')."""
-    if _LANG_KEY not in st.session_state:
-        st.session_state[_LANG_KEY] = "de"
-    return st.session_state[_LANG_KEY]
+    """Return the current language code ('de' or 'en').
+
+    ``t()`` calls this on every lookup, and a single app rerun can render a few
+    thousand translated table cells, so this must stay to one session-state
+    access: ``get()`` (rather than ``in`` + ``[]``) halves the proxy round-trips.
+    """
+    return st.session_state.get(_LANG_KEY, "de")
 
 
 def set_lang(lang: str):

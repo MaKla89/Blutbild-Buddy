@@ -4,7 +4,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -3286,12 +3286,17 @@ class TestDisabledMeasurements(unittest.TestCase):
             .filter(database.DataPoint.value == 2.8)
             .one()
         )
+        before = app.data_point_count(self.session)
         database.set_data_point_disabled(self.session, dp.id, True)
-        _, _, dps, _ = app.load_data(self.session)
-        values = [d.value for d in dps if d.canonical_name == "Kreatinin"]
-        self.assertNotIn(2.8, values)
+        # load_data() no longer materialises DataPoint rows at all — the count
+        # helper is the only consumer, and it must skip disabled values.
+        self.assertEqual(app.data_point_count(self.session), before - 1)
+        patients, reports = app.load_data(self.session)
+        self.assertTrue(patients)
+        self.assertTrue(reports)
         # Restore for other tests
         database.set_data_point_disabled(self.session, dp.id, False)
+        self.assertEqual(app.data_point_count(self.session), before)
 
 
 class TestToggleRefreshesPatientFlags(unittest.TestCase):
@@ -5819,6 +5824,310 @@ class TestChatPersistence(unittest.TestCase):
         self.assertIn("st.session_state[widget_key] = selected", src)
 
 
+class TestUiBehaviourAppTest(unittest.TestCase):
+    """Behavioural UI tests: run the real app.py with Streamlit's AppTest against
+    a temp DB and assert the rendered element tree. These cover the responsiveness
+    / crash defects found in the UI audit — a plain unit test cannot see that a
+    widget raises and kills the whole app view.
+
+    Every test drives the actual script run, so a StreamlitAPIException from a
+    widget (stale default, missing key) shows up in `at.exception` instead of
+    silently breaking the browser view.
+    """
+
+    def setUp(self):
+        # app.py runs in-process, so it reads the module-level config paths.
+        # Save and restore them: the rest of the suite relies on its own DB_PATH.
+        self._orig_db = config.DB_PATH
+        self._orig_reports = config.REPORTS_DIR
+        self.tmp = TEST_DIR / f"uitest_{self.id().split('.')[-1]}"
+        self.tmp.mkdir(parents=True, exist_ok=True)
+        config.DB_PATH = self.tmp / "app.db"
+        config.REPORTS_DIR = self.tmp / "reports"
+        config.REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        self.session = _fresh_db(f"uitest_{self.id().split('.')[-1]}.db")
+
+    def tearDown(self):
+        config.DB_PATH = self._orig_db
+        config.REPORTS_DIR = self._orig_reports
+        self.session.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _seed_patient(self, name="Doe, Jane", favorites=None, reports=3,
+                      markers=(("H\u00e4moglobin", "g/dl", 14.0, 18.0),
+                               ("Leukozyten", "Tsd./\u00b5l", 4.0, 10.0))):
+        p = database.Patient(name=name, name_normalized=name, favorites=favorites)
+        self.session.add(p)
+        self.session.flush()
+        for i in range(reports):
+            rep = database.Report(
+                patient_id=p.id, filename=f"r{i}.pdf", file_hash=f"h_{name}_{i}",
+                report_date=datetime(2023, 1, 1) + timedelta(days=i * 90),
+                panel_type="Kleines Blutbild",
+            )
+            self.session.add(rep)
+            self.session.flush()
+            for cname, unit, lo, hi in markers:
+                v = round((lo + hi) / 2 + i, 2)
+                self.session.add(database.DataPoint(
+                    report_id=rep.id, canonical_name=cname, original_name=cname,
+                    value=v, unit=unit, ref_low=lo, ref_high=hi,
+                    is_abnormal=(v < lo or v > hi),
+                ))
+        self.session.commit()
+        return p
+
+    def _run_app(self):
+        from streamlit.testing.v1 import AppTest
+        at = AppTest.from_file("app.py", default_timeout=120)
+        at.run()
+        return at
+
+    def _assert_clean(self, at):
+        if at.exception:
+            detail = "; ".join(f"{type(e.value).__name__}: {e.value}" for e in at.exception)
+            self.fail(f"app view raised during render: {detail}")
+
+    # ── crash regressions ────────────────────────────────────────────────────
+
+    def test_stale_favorite_does_not_kill_app_view(self):
+        """Regression: a favorite whose marker disappeared (report deleted, marker
+        renamed, unit changed) used to be handed to st.multiselect as a `default`
+        outside `options` — a StreamlitAPIException that replaced the ENTIRE app
+        view with an error. The stale entry must be filtered out instead."""
+        self._seed_patient(favorites='["H\u00e4moglobin (g/dl)", "Ghost Marker (xx)"]')
+        at = self._run_app()
+        self._assert_clean(at)
+        fav = next((m for m in at.multiselect if m.key.startswith("fav_select_")), None)
+        self.assertIsNotNone(fav, "favorites multiselect is missing")
+        # The live marker is selected; the stale one is silently dropped.
+        self.assertEqual(fav.value, ["H\u00e4moglobin (g/dl)"])
+
+    def test_all_stale_favorites_still_renders(self):
+        """Every favorite stale (e.g. all reports deleted) must render an empty
+        selection, not an exception."""
+        self._seed_patient(favorites='["Removed (mg/dl)"]')
+        at = self._run_app()
+        self._assert_clean(at)
+        fav = next((m for m in at.multiselect if m.key.startswith("fav_select_")), None)
+        self.assertIsNotNone(fav)
+        self.assertEqual(fav.value, [])
+
+    def test_app_renders_without_patient(self):
+        """Empty database: the app must render the no-patient state, not crash."""
+        at = self._run_app()
+        self._assert_clean(at)
+        self.assertIsNotNone(at.title)
+
+    def test_all_tabs_render_with_patient_selected(self):
+        """Smoke test for every tab body: all tab content renders on every rerun,
+        so one broken tab breaks the whole page. Guards the cached-query wiring
+        (ui/queries.py) against shape mistakes in any single tab."""
+        self._seed_patient()
+        at = self._run_app()
+        self._assert_clean(at)
+        self.assertTrue(at.tabs, "no tabs rendered")
+        # The tab set is the full expected list (data tabs + management tabs).
+        self.assertEqual(len(at.tabs), 12)
+        # Data actually reached the view (Overview metric cards).
+        self.assertTrue(at.metric, "no metric cards rendered for a patient with data")
+
+    # ── widget identity (selection survives unrelated reruns) ────────────────
+
+    def test_report_and_biomarker_selectboxes_have_keys(self):
+        """Unkeyed widgets get an auto-key derived from label + options, so adding
+        a report or a biomarker silently resets what the user had picked. The two
+        navigation selectboxes must carry an explicit, patient-scoped key."""
+        self._seed_patient()
+        at = self._run_app()
+        self._assert_clean(at)
+        keys = {sb.key for sb in at.selectbox}
+        self.assertIn("detail_report_1", keys)
+        self.assertIn("trends_marker_1", keys)
+
+    def test_biomarker_selection_survives_a_rerun(self):
+        """Picking a biomarker in Trends must still be selected after a later
+        interaction re-runs the app (the old `[t[1] for t in ...][0]` lookup also
+        raised IndexError when the option list changed under the selection)."""
+        self._seed_patient()
+        at = self._run_app()
+        self._assert_clean(at)
+        marker_sb = next(sb for sb in at.selectbox if sb.key == "trends_marker_1")
+        marker_sb.select("Leukozyten (Tsd./\u00b5l)")
+        at.run()
+        self._assert_clean(at)
+        marker_sb = next(sb for sb in at.selectbox if sb.key == "trends_marker_1")
+        self.assertEqual(marker_sb.value, "Leukozyten (Tsd./\u00b5l)")
+
+    # ── export flow ──────────────────────────────────────────────────────────
+
+    def test_xlsx_export_is_a_single_download_button(self):
+        """Regression: the export used to need two clicks (a button that only
+        rendered the download button during the run it triggered) and claimed
+        success before anything was downloaded. The All-Values tab must render a
+        ready-to-use download_button in the same run as the table."""
+        self._seed_patient()
+        at = self._run_app()
+        self._assert_clean(at)
+        # AppTest models download_button as an untyped element (no key), so match
+        # it by its label. Exactly one, rendered in the same run as the table.
+        from translations import t as _t
+        labels = [d.label for d in at.get("download_button")]
+        self.assertEqual(labels, [_t("btn_export_csv")],
+                         f"expected exactly one ready-to-use export button, got {labels}")
+        # No separate "export" click-button left behind next to it (the old flow
+        # needed a click before the download button existed at all).
+        self.assertNotIn("btn_export_action", [b.key for b in at.button])
+        # And it is keyed in the source, so its state is stable across reruns.
+        from pathlib import Path
+        self.assertIn('key=f"download_xlsx_{patient.id}"',
+                      Path("ui/tabs/all_values.py").read_text(encoding="utf-8"))
+
+    # ── polling / idle behaviour ─────────────────────────────────────────────
+
+    def test_job_polling_only_runs_while_a_job_is_active(self):
+        """An unconditional @st.fragment(run_every=2) re-executed every 2s forever
+        and re-registered a new browser interval on every rerun, so an idle screen
+        got steadily busier. Both poll fragments must be registered ONLY while a
+        job is actually in flight (run_every is fixed at decoration time, so this
+        requires the conditional definition asserted here)."""
+        from pathlib import Path
+        for src_name in ("ui/tabs/llm_jobs.py", "ui/tabs/chat.py"):
+            src = Path(src_name).read_text(encoding="utf-8")
+            self.assertIn("@st.fragment(run_every=2)", src)
+            self.assertNotIn("@st.fragment(run_every=2)\ndef", src,
+                             f"{src_name}: unconditional polling fragment")
+        # The jobs tab decides the interval from the DB, not unconditionally.
+        self.assertIn("get_active_llm_jobs", Path("ui/tabs/llm_jobs.py").read_text(encoding="utf-8"))
+        # The chat tab gates on its own in-flight answer.
+        self.assertIn("if pending:", Path("ui/tabs/chat.py").read_text(encoding="utf-8"))
+
+    def test_no_connection_test_button_blocks_the_render_path(self):
+        """The LLM connection test must be a background job: an inline call froze
+        the whole app for the configured timeout (up to 2000s) when the endpoint
+        was down, which is the single worst "unresponsive" symptom."""
+        from pathlib import Path
+        src = Path("ui/tabs/llm_settings.py").read_text(encoding="utf-8")
+        self.assertIn("_job_button(", src)
+        self.assertIn('kind="test_connection"', src)
+        self.assertNotIn("check_llm_connection(", src,
+                         "connection test still runs inline in the render path")
+
+    def test_flash_messages_survive_the_rerun(self):
+        """Actions that end in st.rerun() discard everything they rendered, so
+        their outcome must be queued via _flash and replayed on the next run."""
+        from pathlib import Path
+        for src_name, key in (("ui/tabs/patients.py", "patient_rename"),
+                              ("ui/tabs/mapping.py", "mapping_rename")):
+            src = Path(src_name).read_text(encoding="utf-8")
+            self.assertIn(f'_flash("{key}"', src, f"{src_name}: result not queued")
+            self.assertIn(f'_show_flash("{key}")', src, f"{src_name}: result never replayed")
+
+    def test_risk_cards_and_table_render(self):
+        """The Risks tab was rewritten onto the cached flat row shape. With an LLM
+        ranking present only the explained flags become cards (the rest would be
+        unexplained noise) while the table below keeps every flag."""
+        p = self._seed_patient()
+        report = self.session.query(database.Report).filter(
+            database.Report.patient_id == p.id).order_by(
+            database.Report.id.desc()).first()
+        dp = self.session.query(database.DataPoint).filter(
+            database.DataPoint.report_id == report.id).first()
+        for rank, sev, cat, expl in [
+            (1, 3, "critical_value", "Deutlich erh\u00f6ht"),
+            (2, 2, "concerning_trend", None),
+        ]:
+            self.session.add(database.RiskFlag(
+                report_id=report.id, data_point_id=dp.id, rank=rank, severity=sev,
+                category=cat, description=f"{cat} description", explanation=expl))
+        self.session.commit()
+
+        at = self._run_app()
+        self._assert_clean(at)
+        # Cards only (the shared CSS block is injected as markdown too, so match
+        # the card div specifically).
+        cards = [m.value for m in at.markdown
+                 if str(m.value).startswith("<div class='bb-card bb-card--")]
+        self.assertEqual(len(cards), 1,
+                         "only the LLM-explained flag should be shown as a card")
+        self.assertIn("Deutlich erh\u00f6ht", cards[0])
+        # HTML-derived text must be escaped: the analyzer writes "CRP < 5" style
+        # descriptions and an unescaped < would corrupt the markup.
+        self.assertNotIn("< 5", cards[0])
+
+        from translations import t as _t
+        tables = [d.value for d in at.dataframe
+                  if _t("col_description") in list(d.value.columns)]
+        self.assertEqual(len(tables), 1, "expected exactly one all-flags table")
+        self.assertEqual(len(tables[0]), 2, "table must list every flag, LLM leftovers included")
+        # The severity column is display-only on the cards and dropped from the table.
+        self.assertNotIn(_t("col_severity"), list(tables[0].columns))
+
+    # ── cached query layer ───────────────────────────────────────────────────
+
+    def test_cached_queries_invalidate_on_write(self):
+        """st.cache_data keyed on a change token must return fresh rows after a
+        write through ANY path — a stale cache would hide new reports."""
+        from ui import queries
+        p = self._seed_patient()
+        before = len(queries.patient_reports(p.id))
+        self.assertEqual(before, 3)
+        self.session.add(database.Report(
+            patient_id=p.id, filename="new.pdf", file_hash="h_new",
+            report_date=datetime(2024, 5, 1), panel_type="Kleines Blutbild"))
+        self.session.commit()
+        self.assertEqual(len(queries.patient_reports(p.id)), before + 1,
+                         "cached report list did not see a committed insert")
+
+    def test_cached_queries_return_plain_data(self):
+        """st.cache_data deep-copies its return value; a detached ORM object would
+        blow up on the second access. Every cached helper must hand back ORM-free
+        rows (namedtuples / scalars)."""
+        from sqlalchemy.orm import DeclarativeBase
+        from ui import queries
+        p = self._seed_patient()
+        for rows in (queries.patient_reports(p.id), queries.patient_values(p.id),
+                     queries.risk_flags(p.id), queries.mapping_rows(p.id),
+                     queries.biomarker_series(p.id, "H\u00e4moglobin", "g/dl")):
+            for row in rows:
+                self.assertNotIsInstance(row, DeclarativeBase)
+        # A second call must still work (the deep-copy path).
+        self.assertEqual(len(queries.patient_values(p.id)),
+                         len(queries.patient_values(p.id)))
+
+    def test_translation_lookups_are_not_per_row(self):
+        """Column labels used to be translated inside the row loops: 31k t() calls
+        per rerun at 7.2k data points, and every call touches session state. The
+        labels must be hoisted, so a rerun's t() count stays in the hundreds."""
+        import translations
+        self._seed_patient(reports=6, markers=tuple(
+            (f"Marker {i:02d}", "ng/ml", 10.0, 60.0) for i in range(1, 41)))
+        orig = translations.t
+        counter = {"n": 0}
+
+        def counting_t(*args, **kwargs):
+            counter["n"] += 1
+            return orig(*args, **kwargs)
+
+        # app.py and every tab module imported `t` by value, so patch each holder.
+        import sys
+        holders = [m for m in sys.modules.values()
+                   if m is not None and getattr(m, "t", None) is orig]
+        for m in holders:
+            m.t = counting_t
+        translations.t = counting_t
+        try:
+            at = self._run_app()
+            self._assert_clean(at)
+        finally:
+            translations.t = orig
+            for m in holders:
+                m.t = orig
+        # 240 data points across 6 reports; per-row translation would be ~1500+.
+        self.assertLess(counter["n"], 700,
+                        f"{counter['n']} translation lookups in one rerun")
+
+
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""
     if TEST_DIR.exists():
@@ -5875,6 +6184,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestUnitWhitespaceDefenseConfig))
     suite.addTests(loader.loadTestsFromTestCase(TestChatWithData))
     suite.addTests(loader.loadTestsFromTestCase(TestChatPersistence))
+    suite.addTests(loader.loadTestsFromTestCase(TestUiBehaviourAppTest))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

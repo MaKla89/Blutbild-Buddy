@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import func
 
 import config
 from database import (
@@ -235,12 +236,27 @@ def _time_range_slider(min_date, max_date, value_key, slider_key, label):
     st.session_state[value_key] = time_range
     return time_range[0], time_range[1]
 
+
 def load_data(session):
+    """Load the app-wide lists every rerun needs: all patients and all reports.
+
+    Deliberately does NOT load DataPoint/RiskFlag rows: those are by far the
+    largest tables, they were fetched unfiltered (every patient) on every rerun,
+    and the only consumer needed their count. Use data_point_count() for the
+    total instead.
+    """
     patients = session.query(Patient).all()
     reports = session.query(Report).order_by(Report.report_date).all()
-    dps = session.query(DataPoint).filter(DataPoint.is_disabled == False).all()  # noqa: E712
-    flags = session.query(RiskFlag).all()
-    return patients, reports, dps, flags
+    return patients, reports
+
+
+def data_point_count(session) -> int:
+    """Total enabled data points across all patients (cheap COUNT, not rows)."""
+    return (
+        session.query(func.count(DataPoint.id))
+        .filter(DataPoint.is_disabled == False)  # noqa: E712
+        .scalar()
+    ) or 0
 
 
 # R3-11: cap on historical data points per biomarker in the summary prompt.

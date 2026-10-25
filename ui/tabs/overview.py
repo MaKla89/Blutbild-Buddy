@@ -14,8 +14,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from database import Report, DataPoint, RiskFlag
 from translations import t
+from ui import queries
 from ui.helpers import _time_range_slider
 
 
@@ -28,15 +28,7 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
         latest_date = latest.report_date.strftime("%d.%m.%Y") if latest and latest.report_date else "—"
         st.metric(t("metric_last_report"), latest_date)
 
-    all_dps = (
-        session.query(DataPoint)
-        .join(Report)
-        .filter(
-            Report.patient_id == patient.id,
-            DataPoint.is_disabled == False,  # noqa: E712
-        )
-        .all()
-    )
+    all_dps = queries.patient_values(patient.id)
     abnormal_dps = [dp for dp in all_dps if dp.is_abnormal]
     with col3:
         n_abnormal = len(abnormal_dps)
@@ -57,12 +49,7 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
         # selected (with an explanation) are shown as cards; leftovers without
         # an explanation are hidden. Without an LLM assessment all flags are
         # shown, so count them all.
-        patient_flags = (
-            session.query(RiskFlag)
-            .join(Report)
-            .filter(Report.patient_id == patient.id)
-            .all()
-        )
+        patient_flags = queries.risk_flags(patient.id)
         if any(rf.explanation is not None for rf in patient_flags):
             counted_flags = [rf for rf in patient_flags if rf.explanation is not None]
         else:
@@ -84,16 +71,16 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
     if patient_reports:
         st.subheader(t("subheader_last_abnormal"))
         if latest:
-            latest_dps = (
-                session.query(DataPoint)
-                .filter(
-                    DataPoint.report_id == latest.id,
-                    DataPoint.is_disabled == False,  # noqa: E712
-                )
-                .all()
-            )
-            abnormal = [dp for dp in latest_dps if dp.is_abnormal]
+            # Reuse the cached per-patient measurement list (already excludes
+            # disabled values) instead of a second query for the latest report.
+            abnormal = [
+                dp for dp in all_dps
+                if dp.report_id == latest.id and dp.is_abnormal
+            ]
             if abnormal:
+                # Column labels resolved once, not per row (each t() reads the
+                # language out of session state).
+                c_marker, c_value, c_reference = t("col_marker"), t("col_value"), t("col_reference")
                 rows = []
                 for dp in abnormal:
                     if dp.ref_high is not None and dp.value > dp.ref_high:
@@ -103,9 +90,9 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                     else:
                         direction = "❓"
                     rows.append({
-                        t("col_marker"): f"{direction} {dp.canonical_name}",
-                        t("col_value"): f"{dp.value} {dp.unit or ''}",
-                        t("col_reference"): f"{dp.ref_low}–{dp.ref_high}" if dp.ref_low is not None and dp.ref_high is not None else "—",
+                        c_marker: f"{direction} {dp.canonical_name}",
+                        c_value: f"{dp.value} {dp.unit or ''}",
+                        c_reference: f"{dp.ref_low}–{dp.ref_high}" if dp.ref_low is not None and dp.ref_high is not None else "—",
                     })
                 st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
             else:
@@ -123,21 +110,7 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
         two_years_ago = None
         if latest and latest.report_date:
             two_years_ago = latest.report_date - timedelta(days=2 * 365)
-            oor_rows = (
-                session.query(DataPoint.canonical_name, DataPoint.unit)
-                .join(Report)
-                .filter(
-                    Report.patient_id == patient.id,
-                    DataPoint.value.isnot(None),
-                    DataPoint.is_disabled == False,  # noqa: E712
-                    Report.report_date >= two_years_ago,
-                    ((DataPoint.ref_high.isnot(None)) & (DataPoint.value > DataPoint.ref_high))
-                    | ((DataPoint.ref_low.isnot(None)) & (DataPoint.value < DataPoint.ref_low)),
-                )
-                .distinct()
-                .all()
-            )
-            out_of_range_entries = {(cname, unit) for cname, unit in oor_rows}
+            out_of_range_entries = queries.out_of_range_biomarkers(patient.id, two_years_ago)
 
         stored_favs = []
         if patient.favorites:
@@ -145,29 +118,26 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                 stored_favs = json.loads(patient.favorites)
             except (json.JSONDecodeError, ValueError):
                 stored_favs = []
-        all_cnames_units = (
-            session.query(DataPoint.canonical_name, DataPoint.unit)
-            .join(Report)
-            .filter(
-                Report.patient_id == patient.id,
-                DataPoint.value.isnot(None),
-                DataPoint.is_disabled == False,  # noqa: E712
-            )
-            .distinct()
-            .order_by(DataPoint.canonical_name)
-            .all()
-        )
+        all_cnames_units = queries.biomarkers(patient.id)
         all_options = []
         for cname, unit in all_cnames_units:
             label = f"{cname} ({unit})" if unit else cname
             all_options.append((label, cname, unit))
+        fav_options = [o[0] for o in all_options]
+        # Favorites are stored as display labels in the DB, but the option list
+        # is rebuilt from live data on every run. A favorite whose marker was
+        # renamed, re-united, or whose report was deleted is therefore no longer
+        # in `options` — and st.multiselect raises StreamlitAPIException for a
+        # default outside the options, which kills the WHOLE app view. Drop the
+        # stale entries before handing the list over as `default`.
+        valid_favs = [f for f in stored_favs if f in fav_options]
         selected_fav_labels = st.multiselect(
             t("multiselect_favorites"),
-            options=[o[0] for o in all_options],
-            default=stored_favs,
+            options=fav_options,
+            default=valid_favs,
             key=f"fav_select_{patient.id}",
         )
-        if selected_fav_labels != stored_favs:
+        if selected_fav_labels != valid_favs:
             patient.favorites = json.dumps(selected_fav_labels)
             session.commit()
 
@@ -177,48 +147,46 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
         )
 
           # --- Favorite biomarker charts (absolute values, one per biomarker) ---
+        c_date = t("col_date")
         for label in selected_fav_labels:
             st.subheader(f"{label} — {t('chart_trend')}")
-            cname, unit = [(t[1], t[2]) for t in all_options if t[0] == label][0]
-            dp_query = (
-                session.query(DataPoint, Report.report_date)
-                .join(Report)
-                .filter(
-                    DataPoint.canonical_name == cname,
-                    DataPoint.unit == unit,
-                    DataPoint.value.isnot(None),
-                    DataPoint.is_disabled == False,  # noqa: E712
-                    Report.patient_id == patient.id,
-                )
-                .order_by(Report.report_date)
-            )
-            if start_date is not None:
-                dp_query = dp_query.filter(Report.report_date >= start_date)
-            if end_date is not None:
-                dp_query = dp_query.filter(Report.report_date <= end_date)
-            dps_entry = dp_query.all()
+            # Lookup by label; the multiselect only ever yields labels that came
+            # from all_options, but keep the fallback so a stale widget value
+            # can't raise IndexError and take down the page.
+            match = next((o for o in all_options if o[0] == label), None)
+            if match is None:
+                continue
+            cname, unit = match[1], match[2]
+            # Cached full series; the slider window is applied in Python so the
+            # cache key stays independent of the slider (moving it no longer
+            # re-queries, it only re-slices).
+            dps_entry = [
+                row for row in queries.biomarker_series(patient.id, cname, unit)
+                if (start_date is None or row.report_date >= start_date)
+                and (end_date is None or row.report_date <= end_date)
+            ]
             if not dps_entry:
                 continue
 
             dates = [d.report_date for d in dps_entry]
-            values = [d.DataPoint.value for d in dps_entry]
-            units = dps_entry[0].DataPoint.unit or ""
+            values = [d.value for d in dps_entry]
+            units = dps_entry[0].unit or ""
             ref_low = None
             ref_high = None
             for dp_data in reversed(dps_entry):
-                if dp_data.DataPoint.ref_low is not None and dp_data.DataPoint.ref_high is not None:
-                    ref_low = dp_data.DataPoint.ref_low
-                    ref_high = dp_data.DataPoint.ref_high
+                if dp_data.ref_low is not None and dp_data.ref_high is not None:
+                    ref_low = dp_data.ref_low
+                    ref_high = dp_data.ref_high
                     break
 
             chart_label = label
             df_chart = pd.DataFrame({
-                t("col_date"): dates,
+                c_date: dates,
                 chart_label: values,
             })
 
             fig = px.line(
-                df_chart, x=t("col_date"), y=chart_label,
+                df_chart, x=c_date, y=chart_label,
                 markers=True,
             )
 
@@ -241,32 +209,22 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
         if risk_entries:
             series = {}
             for cname, unit in risk_entries:
-                risk_query = (
-                    session.query(DataPoint, Report.report_date)
-                    .join(Report)
-                    .filter(
-                        DataPoint.canonical_name == cname,
-                        DataPoint.unit == unit,
-                        DataPoint.value.isnot(None),
-                        DataPoint.is_disabled == False,  # noqa: E712
-                        Report.patient_id == patient.id,
-                    )
-                    .order_by(Report.report_date)
-                )
                 # The charts only consider the last 2 years (same window as
                 # the candidate pool), so clamp the slider's start date to it.
                 effective_start = start_date
                 if two_years_ago is not None:
                     effective_start = max(start_date, two_years_ago) if start_date is not None else two_years_ago
-                if effective_start is not None:
-                    risk_query = risk_query.filter(Report.report_date >= effective_start)
-                if end_date is not None:
-                    risk_query = risk_query.filter(Report.report_date <= end_date)
-                dps_entry = risk_query.all()
+                # Cached full series, windowed in Python (see the favorite
+                # charts above for why the window is not part of the cache key).
+                dps_entry = [
+                    row for row in queries.biomarker_series(patient.id, cname, unit)
+                    if (effective_start is None or row.report_date >= effective_start)
+                    and (end_date is None or row.report_date <= end_date)
+                ]
                 if not dps_entry:
                     continue
                 series[(cname, unit)] = [
-                    (d.report_date, d.DataPoint.value, d.DataPoint.ref_low, d.DataPoint.ref_high)
+                    (d.report_date, d.value, d.ref_low, d.ref_high)
                     for d in dps_entry
                 ]
 
@@ -308,6 +266,10 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                     st.caption(t("chart_log_scale_caption"))
 
                 def build_deviation_chart(series_dict, above=True):
+                    # Resolved once: the loop below appends one dict per
+                    # measurement, and each t() reads the language from session
+                    # state.
+                    c_date, c_marker = t("col_date"), t("col_marker")
                     rows = []
                     for (cname, unit), pts in series_dict.items():
                         # Use the most recent point that actually carries the
@@ -333,15 +295,15 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                                 if not (pct > 0 if above else pct < 0):
                                     continue
                                 rows.append({
-                                    t("col_date"): report_date,
-                                    t("col_marker"): marker_label,
+                                    c_date: report_date,
+                                    c_marker: marker_label,
                                     "pct": abs(pct),
                                 })
                             else:
                                 pct = ((value - boundary) / boundary) * 100 if boundary not in (None, 0) else 0.0
                                 rows.append({
-                                    t("col_date"): report_date,
-                                    t("col_marker"): marker_label,
+                                    c_date: report_date,
+                                    c_marker: marker_label,
                                     # Neutral internal column name — the visible
                                     # axis title comes from t("chart_relative_ylabel").
                                     "pct": pct,
@@ -350,8 +312,8 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                     if df.empty:
                         return None
                     fig = px.line(
-                        df, x=t("col_date"), y="pct",
-                        color=t("col_marker"), markers=True,
+                        df, x=c_date, y="pct",
+                        color=c_marker, markers=True,
                     )
                     if show_log_scale:
                         # tickformat renders plain numbers (200, 50, 0.5)
@@ -394,8 +356,9 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                         st.plotly_chart(fig, width='stretch')
 
         st.subheader(t("subheader_panel_types"))
+        c_date, c_panel, panel_unknown = t("col_date"), t("col_panel"), t("panel_unknown")
         panel_data = [
-            {t("col_date"): r.report_date.strftime("%d.%m.%Y") if r.report_date else "?", t("col_panel"): r.panel_type or t("panel_unknown")}
+            {c_date: r.report_date.strftime("%d.%m.%Y") if r.report_date else "?", c_panel: r.panel_type or panel_unknown}
             for r in patient_reports
         ]
         st.dataframe(pd.DataFrame(panel_data), width='stretch', hide_index=True)

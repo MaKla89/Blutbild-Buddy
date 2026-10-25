@@ -9,69 +9,52 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from database import Report, DataPoint, get_biomarker_info
+from database import get_biomarker_info
 from translations import t
+from ui import queries
 from ui.helpers import _job_button, _show_flash, _time_range_slider
 
 
 def render_trends_tab(session, patient, patient_reports, min_date, max_date, time_range_key, lang):
     if patient_reports:
-        all_entries = (
-            session.query(DataPoint.canonical_name, DataPoint.unit)
-            .join(Report)
-            .filter(
-                Report.patient_id == patient.id,
-                DataPoint.value.isnot(None),
-                DataPoint.is_disabled == False,  # noqa: E712
-            )
-            .distinct()
-            .order_by(DataPoint.canonical_name)
-            .all()
-        )
-        trend_options = []
+        all_entries = queries.biomarkers(patient.id)
+        # display label -> (canonical name, unit). Resolving the selection with a
+        # dict lookup also removes the old `[x for x in …][0]` pair, which shadowed
+        # the translation function `t` and raised IndexError on a stale selection.
+        options = {}
         for cname, unit in all_entries:
-            if unit:
-                trend_options.append((f"{cname} ({unit})", cname, unit))
-            else:
-                trend_options.append((cname, cname, None))
-        display_labels = [t[0] for t in trend_options]
-
-        selected_label = st.selectbox(t("select_biomarker"), display_labels)
-        selected_cname, selected_unit = [t[1] for t in trend_options if t[0] == selected_label][0], [t[2] for t in trend_options if t[0] == selected_label][0]
+            options[f"{cname} ({unit})" if unit else cname] = (cname, unit)
+        # Explicit key: without one, Streamlit derives an auto-key from the label +
+        # option list, so adding a report or renaming a marker silently resets the
+        # user's current selection.
+        selected_label = st.selectbox(t("select_biomarker"), list(options),
+                                      key=f"trends_marker_{patient.id}")
+        selected_cname, selected_unit = options[selected_label]
 
         # --- Time range slider (robust against a single report) ---
         start_date, end_date = _time_range_slider(
             min_date, max_date, time_range_key, f"slider_trends_{patient.id}", t("time_range_label"),
         )
 
-        dp_data = (
-            session.query(DataPoint, Report.report_date)
-            .join(Report)
-            .filter(
-                DataPoint.canonical_name == selected_cname,
-                DataPoint.value.isnot(None),
-                DataPoint.unit == selected_unit,
-                DataPoint.is_disabled == False,  # noqa: E712
-                Report.patient_id == patient.id,
-            )
-            .order_by(Report.report_date)
-        )
+        # Cached per (patient, marker, unit); the time window is applied in Python
+        # so moving the slider re-slices instead of re-querying.
+        dp_data = [d for d in queries.biomarker_series(patient.id, selected_cname, selected_unit)
+                   if d.unit == selected_unit]
         if start_date is not None:
-            dp_data = dp_data.filter(Report.report_date >= start_date)
+            dp_data = [d for d in dp_data if d.report_date >= start_date]
         if end_date is not None:
-            dp_data = dp_data.filter(Report.report_date <= end_date)
-        dp_data = dp_data.all()
+            dp_data = [d for d in dp_data if d.report_date <= end_date]
 
         if dp_data:
             dates = [d.report_date for d in dp_data]
-            values = [d.DataPoint.value for d in dp_data]
-            units = dp_data[0].DataPoint.unit or ""
+            values = [d.value for d in dp_data]
+            units = dp_data[0].unit or ""
             ref_low = None
             ref_high = None
             for dp_data_row in reversed(dp_data):
-                if dp_data_row.DataPoint.ref_low is not None and dp_data_row.DataPoint.ref_high is not None:
-                    ref_low = dp_data_row.DataPoint.ref_low
-                    ref_high = dp_data_row.DataPoint.ref_high
+                if dp_data_row.ref_low is not None and dp_data_row.ref_high is not None:
+                    ref_low = dp_data_row.ref_low
+                    ref_high = dp_data_row.ref_high
                     break
 
             # ── Biomarker Description (above graph) ──────────────────────────
@@ -141,15 +124,17 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
             st.plotly_chart(fig, width='stretch')
 
             # ── Data Table ───────────────────────────────────────────────────
+            c_status, c_date, c_value, c_reference = (
+                t("col_status"), t("col_date"), t("col_value"), t("col_reference"))
             table_rows = []
-            for d, dp in zip(dates, dp_data):
-                ref_s = f"{dp.DataPoint.ref_low}–{dp.DataPoint.ref_high}" if dp.DataPoint.ref_low is not None and dp.DataPoint.ref_high is not None else "—"
-                flag = "🔴" if dp.DataPoint.is_abnormal else "🟢"
+            for dp in dp_data:
+                ref_s = (f"{dp.ref_low}–{dp.ref_high}"
+                         if dp.ref_low is not None and dp.ref_high is not None else "—")
                 table_rows.append({
-                    t("col_status"): flag,
-                    t("col_date"): d.strftime("%d.%m.%Y") if d else "?",
-                    t("col_value"): f"{dp.DataPoint.value} {dp.DataPoint.unit or ''}",
-                    t("col_reference"): ref_s,
+                    c_status: "🔴" if dp.is_abnormal else "🟢",
+                    c_date: dp.report_date.strftime("%d.%m.%Y") if dp.report_date else "?",
+                    c_value: f"{dp.value} {dp.unit or ''}",
+                    c_reference: ref_s,
                 })
             st.dataframe(pd.DataFrame(table_rows), width='stretch', hide_index=True)
 

@@ -5,11 +5,9 @@ timeout), PDF rendering settings (DPI, batch size), and a connection test.
 """
 
 import streamlit as st
-from openai import APIConnectionError, APITimeoutError
 
-import config
-from llm_client import _build_client
 from translations import t
+from ui.helpers import _job_button, _show_flash
 
 
 def render_llm_settings_tab(session):
@@ -51,25 +49,19 @@ def render_llm_settings_tab(session):
     # Settings are applied live (session state is read on every run) — no save needed.
     st.caption(t("caption_settings_live"))
 
-    # Test connection button (LLM call → primary, per app-wide color convention)
-    st.divider()
-    if st.button(t("btn_test_connection"), type="primary", width='stretch'):
-        try:
-            test_llm = _build_client()
-            model = st.session_state.get("llm_model", config.get_unsloth_model())
-            timeout = int(st.session_state.get("llm_timeout", config.get_llm_timeout()))
-            # Lightweight ping — just list models or do a tiny completion
-            test_llm.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": "OK"}],
-                max_tokens=1,
-                timeout=timeout,
-            )
-            st.success(t("msg_llm_connected"))
-        except (APIConnectionError, APITimeoutError) as e:
-            st.error(f"{t('msg_llm_disconnected')} {e}")
-            st.warning(
-                t("tooltip_docker_llm")
-            )
-        except Exception as e:
-            st.error(f"{t('msg_llm_error')} {type(e).__name__}: {e}")
+    # Test connection button (LLM call → primary, per app-wide color convention).
+    # Runs as a background job: an inline call blocks the whole Streamlit script,
+    # so an unreachable endpoint froze the app for the full configured timeout
+    # (up to 2000s) with no feedback. The job's verdict is flashed back into this
+    # tab by the LLM-Jobs poll fragment (see _FINISH_FLASH_KEYS["test_connection"]).
+    _show_flash("llm_settings")
+    _job_button(
+        session,
+        label_key="btn_test_connection",
+        kind="test_connection",
+        job_label_key="job_kind_test_connection",
+        key="btn_test_connection_action",
+        flash_key="llm_settings",
+        button_type="primary",
+        help_key="help_test_connection",
+    )

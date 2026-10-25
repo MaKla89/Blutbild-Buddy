@@ -8,8 +8,9 @@ import pandas as pd
 import streamlit as st
 
 from analyzer import refresh_patient_risk_flags
-from database import DataPoint, ReportArtifact, set_data_point_disabled, set_report_artifact_disabled
+from database import ReportArtifact, set_data_point_disabled, set_report_artifact_disabled
 from translations import t, _get_lang
+from ui import queries
 from ui.helpers import _flash, _show_flash
 
 
@@ -39,21 +40,23 @@ def render_detail_tab(session, patient, patient_reports):
             f"{r.report_date.strftime('%d.%m.%Y') if r.report_date else '?'} — {r.filename}": r
             for r in reversed(patient_reports)
         }
-        selected_label = st.selectbox(t("select_report"), list(report_options.keys()))
+        # Explicit key so the current selection survives unrelated reruns (an
+        # auto-key changes as soon as a report is added or removed).
+        selected_label = st.selectbox(t("select_report"), list(report_options),
+                                      key=f"detail_report_{patient.id}")
         selected_report = report_options[selected_label]
 
-        dps_detail = (
-            session.query(DataPoint)
-            .filter(DataPoint.report_id == selected_report.id)
-            .order_by(DataPoint.canonical_name)
-            .all()
-        )
+        dps_detail = queries.report_values(selected_report.id)
 
         if dps_detail:
             st.caption(t("caption_disabled_values"))
             # One compact table instead of ~40 stacked rows. The "active"
             # checkbox column is the only editable one; every other column
             # is read-only and row add/remove is disabled.
+            # Column labels are resolved once, not per row (see mapping.py).
+            c_status, c_marker, c_value = t("col_status"), t("col_marker"), t("col_value")
+            c_reference, c_original, c_active = (
+                t("col_reference"), t("col_original"), t("col_active"))
             rows = []
             for dp in dps_detail:
                 ref_str = (
@@ -73,16 +76,14 @@ def render_detail_tab(session, patient, patient_reports):
                     if dp.original_name and dp.original_name != dp.canonical_name
                     else ""
                 )
-                rows.append(
-                    {
-                        t("col_status"): status,
-                        t("col_marker"): marker_name,
-                        t("col_value"): value_str,
-                        t("col_reference"): ref_str,
-                        t("col_original"): original,
-                        t("col_active"): not dp.is_disabled,
-                    }
-                )
+                rows.append({
+                    c_status: status,
+                    c_marker: marker_name,
+                    c_value: value_str,
+                    c_reference: ref_str,
+                    c_original: original,
+                    c_active: not dp.is_disabled,
+                })
             df = pd.DataFrame(rows)
 
             # Snapshot of the enabled state from the previous run, keyed by
@@ -99,11 +100,11 @@ def render_detail_tab(session, patient, patient_reports):
                 hide_index=True,
                 num_rows="fixed",
                 column_config={
-                    t("col_status"): st.column_config.TextColumn(disabled=True),
-                    t("col_marker"): st.column_config.TextColumn(disabled=True),
-                    t("col_value"): st.column_config.TextColumn(disabled=True),
-                    t("col_reference"): st.column_config.TextColumn(disabled=True),
-                    t("col_original"): st.column_config.TextColumn(disabled=True),
+                    c_status: st.column_config.TextColumn(disabled=True),
+                    c_marker: st.column_config.TextColumn(disabled=True),
+                    c_value: st.column_config.TextColumn(disabled=True),
+                    c_reference: st.column_config.TextColumn(disabled=True),
+                    c_original: st.column_config.TextColumn(disabled=True),
                 },
             )
 
@@ -117,7 +118,7 @@ def render_detail_tab(session, patient, patient_reports):
                     was_enabled = prev_enabled.get(dp.id)
                     if was_enabled is None:
                         continue
-                    now_enabled = bool(row[t("col_active")])
+                    now_enabled = bool(row[c_active])
                     if was_enabled == now_enabled:
                         continue
                     updated = set_data_point_disabled(session, dp.id, not now_enabled)
@@ -138,7 +139,7 @@ def render_detail_tab(session, patient, patient_reports):
                 # Update the snapshot to the new state BEFORE the rerun so
                 # the next run diffs against what was just applied.
                 st.session_state[snap_key] = {
-                    dps_detail[idx].id: bool(row[t("col_active")])
+                    dps_detail[idx].id: bool(row[c_active])
                     for idx, (_, row) in enumerate(editor_df.iterrows())
                 }
                 if changed:

@@ -15,6 +15,7 @@ from database import (
     update_patient_profile,
 )
 from translations import t, _get_lang
+from ui.helpers import _flash, _show_flash
 
 
 def render_patients_tab(session, patients):
@@ -73,6 +74,11 @@ def render_patients_tab(session, patients):
     st.divider()
     st.markdown(f"✏️ **{t('rename_patient')}**")
 
+    # The rename below sets _rerun_requested, which aborts this run and discards
+    # anything rendered in it — so its result is queued via _flash and shown here
+    # on the following run.
+    _show_flash("patient_rename")
+
     col_rename1, col_rename2 = st.columns(2)
     with col_rename1:
         selected_for_rename = st.selectbox(
@@ -86,12 +92,12 @@ def render_patients_tab(session, patients):
     if st.button(t("rename_patient"), type="secondary", width='stretch', key="btn_rename_patient_action"):
         if new_name and new_name != selected_for_rename:
             if rename_patient(session, selected_for_rename, new_name):
-                st.success(t("msg_renamed", old=selected_for_rename, new=new_name))
+                _flash("patient_rename", "success", t("msg_renamed", old=selected_for_rename, new=new_name))
                 st.session_state._rerun_requested = True
             else:
-                st.error(t("msg_rename_error"))
+                _flash("patient_rename", "error", t("msg_rename_error"))
         elif new_name == selected_for_rename:
-            st.info(t("warning_same_name"))
+            _flash("patient_rename", "info", t("warning_same_name"))
 
     # Patient profile section (demographics + clinical context).
     # Feeds the LLM prompts: reference ranges are age/sex dependent and

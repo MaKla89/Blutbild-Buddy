@@ -33,6 +33,7 @@ _log = logging.getLogger(__name__)
 import streamlit as st
 
 import config
+from openai import APIConnectionError, APITimeoutError
 from sqlalchemy import func
 from database import (
     Patient, Report, DataPoint, RiskFlag, PatientSummary, BiomarkerInfo,
@@ -992,6 +993,50 @@ def _parse_param_date(value):
         return None
 
 
+# Upper bound for the connection-test ping. The configured LLM timeout can be
+# minutes (a big report extraction legitimately needs that), but a 1-token ping
+# should answer in seconds — a cold local model load is the only slow case.
+# Without a cap, an unreachable base URL leaves the test "running" for the full
+# configured timeout, which is exactly the unresponsiveness it is meant to
+# diagnose.
+_TEST_CONNECTION_MAX_TIMEOUT = 120
+
+
+def _job_test_connection(session, cfg, lang, params):
+    """Ping the configured LLM endpoint (LLM Settings → "Test Connection").
+
+    Runs as a job rather than inline in the render path: an inline call blocks
+    the whole Streamlit script — the app is frozen and unresponsive for the full
+    configured timeout (up to 2000s) when the endpoint is unreachable.
+    """
+    base_url = cfg.get("base_url") or config.get_unsloth_base_url()
+    model = cfg.get("model") or config.get_unsloth_model()
+    timeout = int(cfg.get("timeout") or config.get_llm_timeout())
+    timeout = max(1, min(timeout, _TEST_CONNECTION_MAX_TIMEOUT))
+
+    llm = _build_client(cfg)
+    try:
+        llm.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "OK"}],
+            max_tokens=1,
+            timeout=timeout,
+        )
+    except (APIConnectionError, APITimeoutError) as e:
+        # Raise so the job row lands in status "error" and the LLM-Jobs tab
+        # renders the diagnostic in red, instead of a green "done" row.
+        raise RuntimeError(
+            f"{t('msg_llm_disconnected', lang=lang)} {e} — "
+            f"{t('error_llm_connection_hint', lang=lang, base_url=base_url)}"
+        ) from e
+    except Exception as e:
+        raise RuntimeError(f"{t('msg_llm_error', lang=lang)} {type(e).__name__}: {e}") from e
+    note = ""
+    if timeout < int(cfg.get("timeout") or config.get_llm_timeout()):
+        note = f"\n{t('note_test_timeout_capped', lang=lang, timeout=timeout)}"
+    return "success", f"{t('msg_llm_connected', lang=lang)}{note}"
+
+
 def _job_backfill(session, cfg, lang, params):
     result = backfill_reference_ranges(session)
     if result["updated"] > 0:
@@ -1130,4 +1175,5 @@ _WORK_FNS = {
     "backfill": _job_backfill,
     "data_quality_check": _job_data_quality_check,
     "chat_answer": _job_chat_answer,
+    "test_connection": _job_test_connection,
 }
