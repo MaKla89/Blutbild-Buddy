@@ -222,6 +222,14 @@ class TestExtractorMocked(unittest.TestCase):
     def setUpClass(cls):
         cls.session = _fresh_db("test_extractor.db")
 
+    def setUp(self):
+        import streamlit as st
+        # This test asserts the DEFAULT render setting (batch size 0 → one
+        # extraction call per report). Other classes set pdf_batch_size = 1 on
+        # the shared session state and never restore it, so without pinning it
+        # here the call-count assertion depends on test order.
+        st.session_state.pdf_batch_size = 0
+
     @classmethod
     def tearDownClass(cls):
         cls.session.close()
@@ -4182,9 +4190,16 @@ class TestReprocessPdfs(unittest.TestCase):
         st.session_state.pdf_batch_size = 1
         st.session_state._bb_lang = "de"
         # Fresh fixture: one report with one data point (tests are self-contained).
+        # "gone.pdf" / "other.pdf" are created by the scope/missing-file tests and
+        # must not leak into the next one (file_hash has a unique constraint).
         for r in self.session.query(database.Report).filter(
-                database.Report.filename == "reproc.pdf").all():
+                database.Report.filename.in_(
+                    ["reproc.pdf", "gone.pdf", "other.pdf"])).all():
             self.session.delete(r)  # cascade removes data points + risk flags
+        for stray in ("other.pdf",):
+            p = self.pdf_dir / stray
+            if p.exists():
+                p.unlink()
         self.session.commit()
         report = database.Report(
             patient_id=self.patient.id, filename="reproc.pdf",
@@ -4199,18 +4214,24 @@ class TestReprocessPdfs(unittest.TestCase):
         self.session.commit()
 
     def _run_reprocess(self, patient_name="ReprocPatient", mappings=None,
-                       patient_id=None):
-        """Run the reprocess job synchronously with a mocked extraction."""
+                       patient_id=None, extract_error=None):
+        """Run the reprocess job synchronously with a mocked extraction.
+
+        ``extract_error`` makes the extraction call raise, simulating an LLM
+        that is unreachable (or returns junk) for every PDF.
+        """
         import llm_jobs
         from schemas import ExtractedPage
         page = {"patient_name": patient_name, "report_date": "15.03.2022",
                 "panel_type": None,
                 "entries": [{"name": "A", "value": 1.0, "unit": "mg/l",
                              "reference_range": None}]}
+        extract = (lambda *a, **kw: (_ for _ in ()).throw(extract_error)) \
+            if extract_error else (lambda *a, **kw: ExtractedPage(**page))
         with patch("extractor.REPORTS_DIR", str(self.pdf_dir)), \
              patch.object(config, "REPORTS_DIR", str(self.pdf_dir)), \
              patch("extractor.pdf_to_base64_jpeg", return_value=["fake_b64"]), \
-             patch("extractor.extract_page", return_value=ExtractedPage(**page)), \
+             patch("extractor.extract_page", side_effect=extract), \
              patch("extractor.normalize_names",
                    return_value=type("NM", (), {"mappings": mappings or []})()), \
              patch.object(llm_jobs, "_build_client", return_value=_MockLLM("{}")):
@@ -4254,7 +4275,9 @@ class TestReprocessPdfs(unittest.TestCase):
             database.Report.filename == "reproc.pdf").first()
         self.assertEqual(r.patient_id, self.patient.id)
         # …and the stray patient created by the LLM's name answer is cleaned up.
-        self.assertEqual(self.session.query(database.Patient).count(), 1)
+        self.assertEqual(
+            self.session.query(database.Patient)
+            .filter(database.Patient.name == "OtherPatient").count(), 0)
 
     def test_reprocess_restores_disabled(self):
         dp = self.session.query(database.DataPoint).first()
@@ -4291,6 +4314,151 @@ class TestReprocessPdfs(unittest.TestCase):
         stored = database.get_llm_job(self.session, job.id)
         self.assertEqual(stored.status, "done")
         self.assertIn("Keine Berichte", stored.result_text or "")
+
+    def test_reprocess_total_extraction_failure_keeps_data(self):
+        """REGRESSION: a reprocess whose extraction fails for every PDF must not
+        delete the reports it snapshotted.
+
+        The job deletes the old rows before re-extracting (the file_hash unique
+        constraint forbids inserting a second row for the same PDF), so without
+        the snapshot restore a dead LLM silently wipes the whole history — and
+        every later reprocess then reports "no reports to re-extract", which
+        looks exactly like a broken LLM connection.
+        """
+        old_dp = self.session.query(database.DataPoint).first()
+        old_dp.ref_low = 99.0  # marker proving the row survived
+        self.session.commit()
+
+        job = self._run_reprocess(patient_id=self.patient.id,
+                                  extract_error=ConnectionError("LLM unreachable"))
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        # The failure must be visible as an error, not a green "finished" row.
+        self.assertEqual(stored.status, "error")
+
+        # The report and its data point are back, byte for byte.
+        reports = self.session.query(database.Report).filter(
+            database.Report.filename == "reproc.pdf").all()
+        self.assertEqual(len(reports), 1)
+        dps = self.session.query(database.DataPoint).filter(
+            database.DataPoint.report_id == reports[0].id).all()
+        self.assertEqual(len(dps), 1)
+        self.assertEqual(dps[0].ref_low, 99.0)
+        self.assertEqual(dps[0].canonical_name, "A")
+        self.assertEqual(dps[0].value, 1.0)
+        self.assertEqual(dps[0].unit, "mg/l")
+        # The error text says nothing was re-extracted and data was preserved.
+        self.assertIn("nicht verändert", stored.error or "")
+        self.assertIn("wiederhergestellt", stored.error or "")
+        self.assertIn("LLM unreachable", stored.error or "")
+
+    def test_reprocess_failure_restores_children_verbatim(self):
+        """The restore payload must cover risk flags, artifacts and summaries —
+        recomputing them would need a working LLM, which is exactly what failed."""
+        report = self.session.query(database.Report).filter(
+            database.Report.filename == "reproc.pdf").first()
+        dp = self.session.query(database.DataPoint).first()
+        self.session.add(database.RiskFlag(
+            report_id=report.id, data_point_id=dp.id, category="critical_value",
+            severity=3, rank=1, description="alt", explanation="erklaerung"))
+        self.session.add(database.ReportArtifact(
+            report_id=report.id, category="clinical_observation",
+            text="Befund", source_excerpt="excerpt", source_page=2))
+        self.session.add(database.PatientSummary(
+            patient_id=self.patient.id, report_id=report.id,
+            summary_text="alte Zusammenfassung"))
+        self.session.commit()
+
+        self._run_reprocess(patient_id=self.patient.id,
+                            extract_error=ConnectionError("LLM down"))
+        self.session.expire_all()
+
+        r = self.session.query(database.Report).filter(
+            database.Report.filename == "reproc.pdf").first()
+        rfs = self.session.query(database.RiskFlag).filter(
+            database.RiskFlag.report_id == r.id).all()
+        self.assertEqual(len(rfs), 1)
+        self.assertEqual(rfs[0].description, "alt")
+        self.assertEqual(rfs[0].severity, 3)
+        # The flag is re-linked to the restored data point by (name, unit).
+        restored_dp = self.session.query(database.DataPoint).filter(
+            database.DataPoint.report_id == r.id).first()
+        self.assertEqual(rfs[0].data_point_id, restored_dp.id)
+
+        arts = self.session.query(database.ReportArtifact).filter(
+            database.ReportArtifact.report_id == r.id).all()
+        self.assertEqual(len(arts), 1)
+        self.assertEqual(arts[0].text, "Befund")
+        self.assertEqual(arts[0].source_page, 2)
+
+        sums = self.session.query(database.PatientSummary).filter(
+            database.PatientSummary.report_id == r.id).all()
+        self.assertEqual(len(sums), 1)
+        self.assertEqual(sums[0].summary_text, "alte Zusammenfassung")
+
+    def test_reprocess_missing_pdf_file_is_not_deleted(self):
+        """A report whose PDF is gone can never be replaced, so it must stay."""
+        other = database.Report(
+            patient_id=self.patient.id, filename="gone.pdf",
+            file_hash="gone_hash_1", report_date=datetime(2024, 5, 1),
+        )
+        self.session.add(other)
+        self.session.flush()
+        self.session.add(database.DataPoint(
+            report_id=other.id, canonical_name="Z", original_name="Z",
+            value=7.0, unit="mg/l", ref_low=99.0, ref_high=100.0,
+        ))
+        self.session.commit()
+
+        job = self._run_reprocess(patient_id=self.patient.id)
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+
+        r = self.session.query(database.Report).filter(
+            database.Report.filename == "gone.pdf").first()
+        self.assertIsNotNone(r)
+        dps = self.session.query(database.DataPoint).filter(
+            database.DataPoint.report_id == r.id).all()
+        self.assertEqual(len(dps), 1)
+        self.assertEqual(dps[0].ref_low, 99.0)  # untouched
+        self.assertIn("gone.pdf", stored.result_text or "")
+
+    def test_reprocess_does_not_touch_other_patients_reports(self):
+        """force=True must stay scoped to the snapshotted files.
+
+        Without the allowlist, force=True re-extracts every PDF in the folder —
+        including other patients' reports whose rows are still in the DB, so
+        each insert collides with the file_hash unique constraint and surfaces
+        as a bogus extraction error.
+        """
+        import shutil
+        other_patient = database.get_or_create_patient(self.session, "OtherOwner")
+        shutil.copy(self.pdf_dir / "reproc.pdf", self.pdf_dir / "other.pdf")
+        other = database.Report(
+            patient_id=other_patient.id, filename="other.pdf",
+            file_hash="other_hash_1", report_date=datetime(2024, 5, 1),
+        )
+        self.session.add(other)
+        self.session.flush()
+        self.session.add(database.DataPoint(
+            report_id=other.id, canonical_name="Z", original_name="Z",
+            value=7.0, unit="mg/l", ref_low=99.0, ref_high=100.0,
+        ))
+        self.session.commit()
+
+        job = self._run_reprocess(patient_id=self.patient.id)
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done")
+
+        r = self.session.query(database.Report).filter(
+            database.Report.filename == "other.pdf").first()
+        self.assertEqual(r.patient_id, other_patient.id)
+        dps = self.session.query(database.DataPoint).filter(
+            database.DataPoint.report_id == r.id).all()
+        self.assertEqual(len(dps), 1)
+        self.assertEqual(dps[0].ref_low, 99.0)  # never re-extracted
+        self.assertNotIn("other.pdf", stored.result_text or "")
 
 
 class TestDataQualityParsing(unittest.TestCase):
@@ -6417,6 +6585,10 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestUpdateBiomarkerRegistry))
     suite.addTests(loader.loadTestsFromTestCase(TestLlmJobs))
     suite.addTests(loader.loadTestsFromTestCase(TestLlmJobAbort))
+    # Defined since the reprocess feature landed but never registered here, so
+    # the documented "python test_blutbild_buddy.py" run silently skipped them.
+    suite.addTests(loader.loadTestsFromTestCase(TestReprocessPdfs))
+    suite.addTests(loader.loadTestsFromTestCase(TestFixImplausibleRefRanges))
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityParsing))
     suite.addTests(loader.loadTestsFromTestCase(TestApplyDataQualityFinding))
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityJob))

@@ -180,7 +180,7 @@ def _apply_global_normalization(
     return changed
 
 
-def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False) -> tuple[list[str], list[str]]:
+def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False, only_files: set[str] | None = None) -> tuple[list[str], list[str]]:
     """Process all unprocessed PDFs in REPORTS_DIR.
 
     Two phases, so no single LLM request grows with the number of PDFs:
@@ -204,6 +204,12 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             The caller must have deleted the old Report rows first (the
             ``file_hash`` unique constraint would otherwise reject the insert);
             used by the "reprocess" job after a registry/LLM improvement.
+        only_files: restrict processing to this set of PDF filenames. The
+            reprocess job passes exactly the reports it snapshotted — without
+            it, ``force=True`` would also re-extract PDFs whose rows are still
+            in the DB (other patients' reports, or unprocessed uploads), and
+            every one of those inserts fails on the ``file_hash`` unique
+            constraint and shows up as a spurious error.
 
     Returns:
         (processed, errors) — processed is a list of filenames, errors a list
@@ -226,6 +232,8 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
 
     pdf_dir = Path(REPORTS_DIR)
     pdf_files = sorted(p for p in pdf_dir.glob("*.pdf") if not p.name.startswith("_"))
+    if only_files is not None:
+        pdf_files = [p for p in pdf_files if p.name in only_files]
 
     total = len(pdf_files)
     # Phase 1 collects the deduplicated (name, unit) entries and the new report
@@ -238,15 +246,15 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             # User aborted the job: stop before starting the next PDF. Partial
             # results so far are kept; the worker marks the job interrupted.
             break
-        fhash = file_hash(pdf_path)
-        if not force:
-            existing = session.query(Report).filter(Report.file_hash == fhash).first()
-            if existing:
-                if progress_callback:
-                    progress_callback(f"Skipping {pdf_path.name} (duplicate)", (idx + 1) / total * 0.85)
-                continue
-
         try:
+            fhash = file_hash(pdf_path)
+            if not force:
+                existing = session.query(Report).filter(Report.file_hash == fhash).first()
+                if existing:
+                    if progress_callback:
+                        progress_callback(f"Skipping {pdf_path.name} (duplicate)", (idx + 1) / total * 0.85)
+                    continue
+
             if progress_callback:
                 progress_callback(f"Processing {pdf_path.name} ({idx + 1}/{total})", (idx + 1) / total * 0.85)
 

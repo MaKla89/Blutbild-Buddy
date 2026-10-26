@@ -402,9 +402,13 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
     """Snapshot the data a reprocess is about to replace.
 
     Returns {"reports": {filename: {...}}, "disabled": {(filename, original_name, unit): bool}}.
-    The report snapshot feeds the before/after diff; the disabled set preserves
-    the user's manual value disabling across the cascade delete (matched by
-    filename + original name + unit — the stable identity of a measurement).
+    The report snapshot feeds the before/after diff AND is the restore payload
+    used by ``_restore_reports`` when a re-extraction fails — a failed
+    reprocess must never cost the user data they already had, so every field a
+    report row carries is captured here (not just the diff-relevant ones).
+    The disabled set preserves the user's manual value disabling across the
+    cascade delete (matched by filename + original name + unit — the stable
+    identity of a measurement).
     """
     q = session.query(Report).filter(Report.file_hash.isnot(None))
     if patient_id is not None:
@@ -416,14 +420,52 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
             .filter(DataPoint.report_id == r.id)
             .all()
         )
+        dp_key_by_id = {
+            dp.id: (dp.original_name or "", dp.unit or "") for dp in dps
+        }
         reports[r.filename] = {
             "patient_id": r.patient_id,
             "report_date": r.report_date,
             "panel_type": r.panel_type,
+            "file_hash": r.file_hash,
+            "raw_text": r.raw_text,
             "dps": [
                 (dp.original_name or "", dp.unit or "", dp.canonical_name,
                  dp.value, dp.ref_low, dp.ref_high)
                 for dp in dps
+            ],
+            # Restore payload: full row fidelity, including the abnormality flag
+            # and the user's manual disabling.
+            "dp_rows": [
+                {"original_name": dp.original_name, "canonical_name": dp.canonical_name,
+                 "value": dp.value, "unit": dp.unit, "ref_low": dp.ref_low,
+                 "ref_high": dp.ref_high, "is_abnormal": dp.is_abnormal,
+                 "is_disabled": dp.is_disabled}
+                for dp in dps
+            ],
+            "artifacts": [
+                {"category": art.category, "text": art.text,
+                 "source_excerpt": art.source_excerpt, "source_page": art.source_page,
+                 "is_disabled": art.is_disabled}
+                for art in session.query(ReportArtifact)
+                .filter(ReportArtifact.report_id == r.id).all()
+            ],
+            # Risk flags are derived data, but recomputing them needs a working
+            # LLM — so a failed reprocess restores them verbatim instead.
+            # ``dp_key`` re-links a flag to its data point by identity after the
+            # restore (the restored rows have fresh rowids).
+            "risk_flags": [
+                {"category": rf.category, "severity": rf.severity,
+                 "rank": rf.rank, "description": rf.description,
+                 "explanation": rf.explanation,
+                 "dp_key": dp_key_by_id.get(rf.data_point_id)}
+                for rf in session.query(RiskFlag)
+                .filter(RiskFlag.report_id == r.id).all()
+            ],
+            "summaries": [
+                {"summary_text": ps.summary_text, "created_at": ps.created_at}
+                for ps in session.query(PatientSummary)
+                .filter(PatientSummary.report_id == r.id).all()
             ],
         }
     dq = session.query(DataPoint, Report.filename).join(
@@ -447,6 +489,66 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
         for art, filename in aq.all()
     }
     return {"reports": reports, "disabled": disabled, "disabled_artifacts": disabled_artifacts}
+
+
+def _restore_reports(session, before: dict, filenames: list[str]) -> int:
+    """Re-insert the reports a failed re-extraction had deleted.
+
+    ``_job_reprocess_pdfs`` must delete the old rows before extracting (the
+    ``file_hash`` unique constraint rejects a second row for the same PDF), so
+    a PDF whose extraction throws leaves a report that simply no longer exists.
+    Restoring the snapshot makes that failure non-destructive: the user gets
+    their previous data back and the job reports what could not be re-read.
+
+    Returns the number of reports restored.
+    """
+    if not filenames:
+        return 0
+    restored = 0
+    for fn in filenames:
+        info = before["reports"].get(fn)
+        if not info:
+            continue
+        r = Report(
+            patient_id=info["patient_id"], filename=fn,
+            file_hash=info["file_hash"], report_date=info["report_date"],
+            panel_type=info["panel_type"], raw_text=info["raw_text"],
+        )
+        session.add(r)
+        session.flush()
+        dp_id_by_key: dict[tuple[str, str | None], int] = {}
+        for dp in info["dp_rows"]:
+            new_dp = DataPoint(
+                report_id=r.id, canonical_name=dp["canonical_name"],
+                original_name=dp["original_name"], value=dp["value"],
+                unit=dp["unit"], ref_low=dp["ref_low"], ref_high=dp["ref_high"],
+                is_abnormal=dp["is_abnormal"], is_disabled=dp["is_disabled"],
+            )
+            session.add(new_dp)
+            session.flush()
+            dp_id_by_key[(dp["original_name"] or "", dp["unit"] or "")] = new_dp.id
+        for art in info["artifacts"]:
+            session.add(ReportArtifact(
+                report_id=r.id, category=art["category"], text=art["text"],
+                source_excerpt=art["source_excerpt"], source_page=art["source_page"],
+                is_disabled=art["is_disabled"],
+            ))
+        for rf in info["risk_flags"]:
+            key = rf["dp_key"]
+            session.add(RiskFlag(
+                report_id=r.id,
+                data_point_id=dp_id_by_key.get(key) if key else None,
+                category=rf["category"], severity=rf["severity"], rank=rf["rank"],
+                description=rf["description"], explanation=rf["explanation"],
+            ))
+        for ps in info["summaries"]:
+            session.add(PatientSummary(
+                patient_id=info["patient_id"], report_id=r.id,
+                summary_text=ps["summary_text"], created_at=ps["created_at"],
+            ))
+        restored += 1
+    session.commit()
+    return restored
 
 
 def _diff_reprocess(before: dict, session, filenames: list[str]) -> dict:
@@ -567,10 +669,20 @@ def _restore_disabled_artifacts(session, disabled: dict) -> int:
 def _job_reprocess_pdfs(session, cfg, lang, params):
     """Re-extract existing reports with the current LLM + registry.
 
-    Flow: snapshot old data → delete Report rows (cascades to data points and
-    risk flags; patient identity is pinned by re-attributing each PDF to its
-    previous patient) → run process_new_pdfs(force=True) → refresh risk flags
-    → restore manually disabled values → diff old vs. new for the result text.
+    Flow: snapshot old data → delete the Report rows whose PDF is on disk
+    (cascades to data points and risk flags; patient identity is pinned by
+    re-attributing each PDF to its previous patient) → run
+    process_new_pdfs(force=True, only_files=targets) → restore any report we
+    deleted but did not get back → refresh risk flags → restore manually
+    disabled values → diff old vs. new for the result text.
+
+    The delete-then-extract order is forced by the ``file_hash`` unique
+    constraint (a second row for the same PDF would be rejected), which makes
+    the job destructive by construction — so the snapshot doubles as a restore
+    payload and EVERY path that does not produce a replacement row (per-PDF
+    extraction error, a crash before the per-PDF loop, an abort, a PDF missing
+    from disk) must leave the previous data intact. A failed reprocess may
+    waste time, it may never lose data.
 
     The registry is only READ here — reprocessing consumes improved mappings,
     it never writes them back (that stays an explicit user action).
@@ -587,27 +699,33 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
     # name can't fork a duplicate patient.
     pinned = {fn: info["patient_id"] for fn, info in before["reports"].items()}
 
+    # A report whose PDF file is gone can never be re-extracted, so deleting it
+    # would be pure loss with no chance of replacement — keep those rows.
+    pdf_dir = _Path(config.REPORTS_DIR)
+    missing_files = [fn for fn in before["reports"] if not (pdf_dir / fn).exists()]
+    targets = [fn for fn in before["reports"] if (pdf_dir / fn).exists()]
+
     # Delete old rows and everything that referenced them. Bulk Query.delete()
     # does NOT apply ORM cascades (and SQLite doesn't enforce FKs), so the
     # children must be removed explicitly — otherwise orphaned data points
     # would survive the reprocess and pollute the diff.
-    report_ids = [r.id for r in session.query(Report).filter(
-        Report.filename.in_(list(before["reports"].keys()))
-    ).all()]
-    if report_ids:
-        from database import PatientSummary, RiskFlag
-        session.query(RiskFlag).filter(RiskFlag.report_id.in_(report_ids)).delete()
-        session.query(DataPoint).filter(DataPoint.report_id.in_(report_ids)).delete()
-        session.query(ReportArtifact).filter(ReportArtifact.report_id.in_(report_ids)).delete()
-        session.query(PatientSummary).filter(PatientSummary.report_id.in_(report_ids)).delete()
-        session.query(Report).filter(Report.id.in_(report_ids)).delete()
-        session.commit()
+    if targets:
+        report_ids = [r.id for r in session.query(Report).filter(
+            Report.filename.in_(targets)
+        ).all()]
+        if report_ids:
+            from database import PatientSummary, RiskFlag
+            session.query(RiskFlag).filter(RiskFlag.report_id.in_(report_ids)).delete()
+            session.query(DataPoint).filter(DataPoint.report_id.in_(report_ids)).delete()
+            session.query(ReportArtifact).filter(ReportArtifact.report_id.in_(report_ids)).delete()
+            session.query(PatientSummary).filter(PatientSummary.report_id.in_(report_ids)).delete()
+            session.query(Report).filter(Report.id.in_(report_ids)).delete()
+            session.commit()
 
     # Estimate pages for the progress bar (best-effort — missing files are
     # simply skipped by process_new_pdfs).
-    pdf_dir = _Path(config.REPORTS_DIR)
     total_pages = 0
-    for fn in before["reports"]:
+    for fn in targets:
         p = pdf_dir / fn
         if p.exists():
             try:
@@ -618,10 +736,27 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
     def progress(msg, pct):
         _update_progress(session, getattr(_current_job_id_var, "job_id", None), msg, pct)
 
-    processed, errors = process_new_pdfs(
-        session, progress_callback=progress,
-        dpi=cfg.get("dpi"), batch_size=cfg.get("batch_size"), force=True,
-    )
+    processed: list[str] = []
+    errors: list[str] = []
+    try:
+        processed, errors = process_new_pdfs(
+            session, progress_callback=progress,
+            dpi=cfg.get("dpi"), batch_size=cfg.get("batch_size"),
+            force=True, only_files=set(targets),
+        )
+    except Exception as exc:
+        # process_new_pdfs builds the LLM client and the registry BEFORE its
+        # per-PDF try/except. A failure there (bad config, client build error)
+        # would otherwise propagate with every snapshotted report already
+        # deleted — total data loss reported as a mere job error.
+        session.rollback()
+        errors.append(str(exc))
+
+    # Anything we deleted but did not get back is restored from the snapshot:
+    # a per-PDF extraction failure, an abort mid-run, or a crash before the
+    # loop must never cost the user reports they already had.
+    failed = [fn for fn in targets if fn not in processed]
+    restored_reports = _restore_reports(session, before, failed) if failed else 0
 
     # Re-attribute any report whose LLM-extracted patient name resolved to a
     # different (or new) patient — the PDF's previous attribution wins.
@@ -656,7 +791,12 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
     artifact_restored = _restore_disabled_artifacts(session, before.get("disabled_artifacts", {}))
 
     if is_job_aborted():
-        return "info", t("job_aborted_note", lang=lang)
+        # Partial results are kept; the reports we had deleted but not yet
+        # re-extracted were put back above, so an abort is non-destructive too.
+        note = t("job_aborted_note", lang=lang)
+        if restored_reports:
+            note += f"\n{t('reprocess_restored', lang=lang, n=restored_reports)}"
+        return "info", note
 
     n_risks = 0
     if processed:
@@ -665,9 +805,33 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         except Exception as e:
             errors.append(f"{t('error_risk_flags', lang=lang)}: {e}")
 
-    diff = _diff_reprocess(before, session, processed)
+    # Diff over every snapshotted PDF that we touched (processed OR restored),
+    # so a restored report is compared against itself (no changes) instead of
+    # being listed as "missing". Reports skipped for a missing PDF file are
+    # reported separately below.
+    diff = _diff_reprocess(before, session, targets)
+
+    if not processed:
+        # Nothing could be re-extracted. The snapshot restore above means the
+        # DB is exactly as it was — say so explicitly, because this is the
+        # case that previously looked like "the LLM is unreachable" while the
+        # real damage (all reports deleted) had already happened.
+        # Raise rather than return ("error", …): the level is not part of the
+        # job status, so a returned error would still render as a green
+        # "finished" row. Raising lands in LlmJob.error, which the LLM-Jobs tab
+        # shows in red.
+        parts = [t("reprocess_failed_all", lang=lang, n=len(before["reports"]))]
+        if restored_reports:
+            parts.append(t("reprocess_restored", lang=lang, n=restored_reports))
+        for fn in missing_files[:5]:
+            parts.append(f"⚠️ {t('reprocess_missing_file', lang=lang, filename=fn)}")
+        for err in errors[:5]:
+            parts.append(f"⚠️ {err}")
+        raise RuntimeError("\n".join(parts))
 
     parts = [t("msg_reprocess_done", lang=lang, n=len(processed), risks=n_risks)]
+    if restored_reports:
+        parts.append(t("reprocess_restored", lang=lang, n=restored_reports))
     if diff["name_changes"]:
         parts.append(t("reprocess_diff_names", lang=lang, n=diff["name_changes"]))
     if diff["ref_changes"]:
@@ -682,12 +846,16 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         parts.append(t("reprocess_artifacts_restored", lang=lang, n=artifact_restored))
     if diff["patient_moves"]:
         parts.append(t("reprocess_patient_pinned", lang=lang, n=diff["patient_moves"]))
-    for fn in diff["missing"][:5]:
+    for fn in missing_files[:5]:
+        parts.append(f"⚠️ {t('reprocess_missing_file', lang=lang, filename=fn)}")
+    # The diff also flags the skipped reports as missing — they are already
+    # reported above with the explicit "PDF file missing" message.
+    for fn in [f for f in diff["missing"] if f not in missing_files][:5]:
         parts.append(f"⚠️ {fn}")
     for err in errors[:5]:
         parts.append(f"⚠️ {err}")
 
-    if processed and not errors and not diff["missing"]:
+    if processed and not errors and not diff["missing"] and not restored_reports and not missing_files:
         return "success", "\n".join(parts)
     if processed:
         return "warning", "\n".join(parts)
