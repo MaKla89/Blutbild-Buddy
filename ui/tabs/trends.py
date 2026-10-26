@@ -12,6 +12,7 @@ import streamlit as st
 from database import get_biomarker_info
 from translations import t
 from ui import queries
+from ui.cards import render_markdown_card
 from ui.helpers import _job_button, _show_flash, _time_range_slider
 
 
@@ -90,7 +91,7 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
 
             if desc_text:
                 st.markdown(
-                    f"<div class='bb-card bb-card--summary bb-card--warning'>{desc_text}</div>",
+                    render_markdown_card(desc_text, "warning", summary=True),
                     unsafe_allow_html=True,
                 )
             else:
@@ -170,7 +171,7 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
 
             if interp_text:
                 st.markdown(
-                    f"<div class='bb-card bb-card--summary bb-card--info'>{interp_text}</div>",
+                    render_markdown_card(interp_text, "info", summary=True),
                     unsafe_allow_html=True,
                 )
             else:

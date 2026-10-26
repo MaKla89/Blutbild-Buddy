@@ -42,7 +42,7 @@ from ui.tabs.all_values import render_all_values_tab  # noqa: F401
 from ui.tabs.chat import render_chat_tab  # noqa: F401
 from ui.tabs.mapping import render_mapping_tab  # noqa: F401
 from ui.tabs.llm_jobs import render_llm_jobs_tab  # noqa: F401
-from ui.cards import inject_card_css
+from ui.cards import inject_card_css, render_markdown_card
 
 st.set_page_config(page_title="Blutbild-Buddy", page_icon="🩸", layout="wide")
 
@@ -166,7 +166,8 @@ def _render_health_summary(session, patient, t):
     summary = get_latest_patient_summary(session, patient.id)
 
     if summary:
-        st.markdown(f"<div class='bb-card bb-card--summary bb-card--info'>{summary.summary_text}</div>", unsafe_allow_html=True)
+        st.markdown(render_markdown_card(summary.summary_text, "info", summary=True),
+                    unsafe_allow_html=True)
         date_str = summary.created_at.strftime("%d.%m.%Y %H:%M") if summary.created_at else "?"
         st.caption(f"{t('last_updated')}: {date_str}")
     else:

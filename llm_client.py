@@ -1019,15 +1019,30 @@ WICHTIGE REGELN:
 - Schreibe auf Deutsch in professioneller, aber für Laien verständlicher Sprache.
 - Empfehlungen sind patientenorientiert ("Bitte lassen Sie ... bei der nächsten Arztvisite prüfen", "Besprechen Sie mit Ihrem Arzt ..."), niemals Dosierungs- oder Verschreibungsempfehlungen.
 
-ANTWORTFORMAT (Markdown, gesamt 150-300 Wörter):
-## Gesamtbild
-1-2 Sätze: der wichtigste Gesamteindruck des Gesundheitszustands.
-## Systembefunde
-Ein Absatz pro Organsystem/Markergruppe mit Daten (z.B. Blutbild, Schilddrüse, Stoffwechsel, Lipide, Niere, Leber, Elektrolyte, Entzündung) — nur Systeme mit Daten. Je: Status (unauffällig / auffällig / gebessert / verschlechtert) + belegende Werte + ggf. Kreuzkorrelation.
-## Trends & Verlauf
-Nur belegbare Trends; bei dünner Datenlage explizit sagen.
-## Empfehlungen
-1-3 konkrete nächste Schritte (arztorientiert)."""
+ERZÄHLREGEL — SPRACHE ZUERST, ZAHLEN ZULETZT:
+- Ein Abschnitt beginnt IMMER mit einer Aussage in einfacher Alltagssprache ("Die Blutbildung ist unauffällig; es gibt keine Hinweise auf eine Blutarmut."). Erst danach folgen die belegenden Werte in einer eigenen Zeile mit ">".
+- Nenne im Fließtext KEINE Zahlen, Einheiten, Abkürzungen oder Referenzbereiche — die gehören ausschließlich in die "> Belegende Werte:"-Zeile. Ein Abschnitt, der nur aus einer Aufzählung von Messwerten besteht, ist ein Fehler.
+- Fasse zusammen, statt aufzuzählen: wähle pro System die 2-5 Werte aus, die die Aussage tatsächlich tragen. Unauffällige Marker, die nichts zur Beurteilung beitragen, gar nicht erwähnen.
+- Schreibe vollständige Sätze im Fließtext, keine Satzfragmente und keine Bullet-Listen im Fließtext (Bullets nur in den Empfehlungen).
+
+ANTWORTFORMAT (Markdown, gesamt 250-400 Wörter, exakt diese Überschriften und Ebenen):
+### Gesamtbild
+3-5 Sätze in einfacher Alltagssprache für einen Laien: Wie ist der Gesundheitszustand insgesamt, was ist gut, was ist auffällig, was ist als Nächstes zu tun? Hier gehören KEINE Messwerte hin (nur bei einem akut kritischen Befund: dieser eine Wert ausdrücklich benennen).
+### Organsystem: <Name>
+Ein Abschnitt pro Organsystem/Markergruppe mit Daten (z.B. Blutbild, Schilddrüse, Stoffwechsel und Lipide, Niere, Leber, Elektrolyte, Entzündung, Immunsystem) — nur Systeme mit Daten, in fallender Bedeutung. Pro Abschnitt: 1-2 Sätze in einfacher Sprache (Status + was das wahrscheinlich bedeutet + Kreuzkorrelation, wenn tragfähig), dann eine Zeile:
+> Belegende Werte: <Wert> <Einheit> (Ref. <niedrig>–<hoch>), ...
+### Trends & Verlauf
+1-3 Sätze in einfacher Sprache darüber, was sich über die Zeit bewegt hat oder stabil blieb; bei dünner Datenlage explizit sagen. Dann:
+> Belegende Werte: <Marker> <alt>→<neu> <Einheit>, ...
+### Empfehlungen
+1-3 konkrete nächste Schritte (arztorientiert), als Bullet-Listenpunkte.
+
+BEISPIEL (nur Stil, andere Daten):
+### Gesamtbild
+Ihre Laborwerte wirken insgesamt ausgeglichen. Die Organe arbeiten unauffällig, und auch das Blutbild zeigt keine Hinweise auf eine Blutarmut oder Abwehrschwäche. Auffällig sind die Blutfette, die seit Jahren leicht über dem Zielbereich liegen; das ist behandelbar, aber nicht dringend.
+### Organsystem: Blutfette
+Die Blutfette liegen seit mehreren Kontrollen leicht über dem Zielbereich, zuletzt aber etwas besser als früher. Das spricht für ein leicht erhöhtes Langzeitrisiko, das sich über Lebensstil beeinflussen lässt.
+> Belegende Werte: LDL 131 mg/dl (Ref. < 130), Triglyceride 165 mg/dl (Ref. < 150), HDL 42 mg/dl (Ref. > 40)"""
 
 
 PATIENT_SUMMARY_SYSTEM_PROMPT_EN = """You are an experienced physician creating a health summary for a patient.
@@ -1049,15 +1064,30 @@ IMPORTANT RULES:
 - Write in English, professional yet accessible to laypeople.
 - Recommendations should be patient-oriented ("Please ask your doctor to check... at your next visit", "Discuss with your physician..."), never dosage or prescribing advice.
 
-ANSWER FORMAT (Markdown, 150-300 words total):
-## Overall picture
-1-2 sentences: the most important overall impression of the health status.
-## Findings by system
-One paragraph per organ system / marker group with data (e.g. blood count, thyroid, metabolism, lipids, kidney, liver, electrolytes, inflammation) — only systems with data. Each: status (unremarkable / abnormal / improved / worsening) + supporting values + cross-correlations if any.
-## Trends & course
-Only supportable trends; explicitly note thin data.
-## Recommendations
-1-3 concrete next steps (doctor-oriented)."""
+NARRATION RULE — PLAIN LANGUAGE FIRST, NUMBERS LAST:
+- Every section starts with a statement in simple everyday language ("Blood formation looks normal, with no sign of anaemia."). Only afterwards do the supporting values follow, on their own line starting with ">".
+- Do NOT put numbers, units, abbreviations or reference ranges in the prose — they belong exclusively in the "> Supporting values:" line. A section that is just an enumeration of measurements is a failure.
+- Summarise instead of listing: pick the 2-5 values per system that actually carry the statement. Do not mention unremarkable markers that add nothing to the assessment.
+- Write complete sentences in the prose, no fragments and no bullet lists in the prose (bullets only in the recommendations).
+
+ANSWER FORMAT (Markdown, 250-400 words total, exactly these headings and levels):
+### Overall picture
+3-5 sentences in simple everyday language for a layperson: what is the health status overall, what is good, what is abnormal, what to do next? No measurements here (the single exception: an acutely critical value, which must be named explicitly).
+### Organ system: <name>
+One section per organ system / marker group with data (e.g. blood count, thyroid, metabolism and lipids, kidney, liver, electrolytes, inflammation, immune system) — only systems with data, most important first. Per section: 1-2 sentences in plain language (status + what it likely means + cross-correlation if supportable), then one line:
+> Supporting values: <value> <unit> (ref. <low>–<high>), ...
+### Trends & course
+1-3 sentences in plain language about what moved or stayed stable over time; explicitly note thin data. Then:
+> Supporting values: <marker> <old>→<new> <unit>, ...
+### Recommendations
+1-3 concrete next steps (doctor-oriented), as bullet list items.
+
+EXAMPLE (style only, different data):
+### Overall picture
+Your lab results look balanced overall. The organs work unremarkably, and the blood count shows no sign of anaemia or immune weakness. The lipids stand out: they have been slightly above target for years, which is treatable but not urgent.
+### Organ system: blood lipids
+The lipid values have been mildly above target across several check-ups, most recently a little better than before. That points to a slightly raised long-term risk that can be influenced by lifestyle.
+> Supporting values: LDL 131 mg/dl (ref. < 130), triglycerides 165 mg/dl (ref. < 150), HDL 42 mg/dl (ref. > 40)"""
 
 
 RISK_ASSESSMENT_SYSTEM_PROMPT_DE = """Du bist ein erfahrener Arzt, der Laborbefunde eines Patienten bewertet.

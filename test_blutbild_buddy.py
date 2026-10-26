@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -6218,6 +6219,72 @@ class TestChatPersistence(unittest.TestCase):
         self.assertIn("st.session_state[widget_key] = selected", src)
 
 
+class TestSummaryCardRendering(unittest.TestCase):
+    """The health summary (and the Trends description/interpretation boxes) hold
+    LLM *Markdown*. Rendering them as f"<div>{text}</div>" made remark treat the
+    whole blob as one raw HTML block, so the model's headings, paragraphs and
+    blockquotes appeared literally in the browser ("## Gesamtbild"). The card
+    must come from render_markdown_card(), which separates the wrapper div from
+    the body with blank lines — and the prompt must ask for plain language
+    first, supporting numbers second."""
+
+    def test_card_separates_html_wrapper_from_markdown_body(self):
+        from ui.cards import render_markdown_card
+        out = render_markdown_card("### Gesamtbild\nIhr Befund ist stabil.",
+                                   "info", summary=True)
+        self.assertTrue(out.startswith(
+            "<div class='bb-card bb-card--summary bb-card--info'>"))
+        # Blank line right after the opening div and before the closing one —
+        # without them remark swallows the body into the HTML block.
+        self.assertIn("'>\n\n### Gesamtbild", out)
+        self.assertIn("stabil.\n\n</div>", out)
+
+    def test_card_escapes_angle_brackets_but_keeps_markdown_syntax(self):
+        """unsafe_allow_html is required for the wrapper div, so a "<" in LLM
+        text ("Troponin < 0.01") must not be able to open a tag. Markdown's own
+        ">" blockquote marker must survive, or the evidence lines break."""
+        from ui.cards import render_markdown_card
+        out = render_markdown_card(
+            "Troponin < 0.01 ng/ml\n> Belegende Werte: CK 511 U/l", "warning")
+        self.assertIn("Troponin &lt; 0.01", out)
+        self.assertNotIn("< 0.01", out)
+        self.assertIn("\n> Belegende Werte:", out)
+        # Variant without --summary padding; default border variant.
+        plain = render_markdown_card("x")
+        self.assertEqual(plain.split("'")[1], "bb-card bb-card--info")
+        self.assertNotIn("bb-card--summary", plain)
+
+    def test_summary_prompt_asks_for_plain_language_then_values(self):
+        from llm_client import (PATIENT_SUMMARY_SYSTEM_PROMPT_DE,
+                                PATIENT_SUMMARY_SYSTEM_PROMPT_EN)
+        de, en = PATIENT_SUMMARY_SYSTEM_PROMPT_DE, PATIENT_SUMMARY_SYSTEM_PROMPT_EN
+        for heading in ("### Gesamtbild", "### Organsystem:", "### Trends & Verlauf",
+                        "### Empfehlungen", "> Belegende Werte:"):
+            self.assertIn(heading, de)
+        for heading in ("### Overall picture", "### Organ system:", "### Trends & course",
+                        "### Recommendations", "> Supporting values:"):
+            self.assertIn(heading, en)
+        # The core of the request: no measurement lists in the prose.
+        self.assertIn("KEINE Zahlen", de)
+        self.assertIn("Do NOT put numbers", en)
+        # Bilingual guard: the EN prompt must stay English (past regression).
+        for german in ("für", "Beobachtung", "nicht", "und die"):
+            self.assertNotIn(german, en)
+
+    def test_no_card_is_rendered_by_gluing_markdown_into_an_html_string(self):
+        """Source-level guard: every LLM-markdown box must go through
+        render_markdown_card(); an inline f"<div class='bb-card ...'>{text}"
+        reintroduces the literal-"##" bug for that box. (The Risks tab is
+        excluded on purpose: its card body is pre-escaped HTML fragments, not
+        Markdown, so an inline div there is correct.)"""
+        from pathlib import Path
+        for src_name in ("app.py", "ui/tabs/trends.py"):
+            src = Path(src_name).read_text(encoding="utf-8")
+            for match in re.finditer(r"<div class='bb-card[^']*'>\{", src):
+                self.fail(f"{src_name}: raw markdown interpolated into HTML at "
+                          f"{match.group(0)!r}")
+
+
 class TestUiBehaviourAppTest(unittest.TestCase):
     """Behavioural UI tests: run the real app.py with Streamlit's AppTest against
     a temp DB and assert the rendered element tree. These cover the responsiveness
@@ -6596,6 +6663,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestUnitWhitespaceDefenseConfig))
     suite.addTests(loader.loadTestsFromTestCase(TestChatWithData))
     suite.addTests(loader.loadTestsFromTestCase(TestChatPersistence))
+    suite.addTests(loader.loadTestsFromTestCase(TestSummaryCardRendering))
     suite.addTests(loader.loadTestsFromTestCase(TestUiBehaviourAppTest))
 
     runner = unittest.TextTestRunner(verbosity=2)
