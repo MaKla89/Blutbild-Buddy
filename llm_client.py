@@ -508,6 +508,8 @@ DUPLICATE_CHECK_SYSTEM_PROMPT_DE = """Du bist ein medizinischer Terminologie-Ass
 1. Duplikate: Tippfehler-Varianten oder alternative Schreibweisen desselben Biomarkers (z.B. "CRP" vs "C-reaktives Protein", "HbA1c" vs "HBA1c").
 2. Nicht registrierte Biomarker: Einträge, die weder exakt noch als Alias in der kanonischen Liste vorkommen und offensichtlich ein echter Biomarker sind (kein Messfehler- oder Textartefakt).
 
+Optional wird eine Liste VORGEFUNDENER Ähnlichkeits-Kandidaten mitgegeben (rein rechnerisch per Zeichenähnlichkeit ermittelt, ohne Fachwissen). Diese Kandidaten sind Verdachtsfälle, keine Entscheidungen: bestätige sie, wenn es tatsächlich derselbe Biomarker ist (dann "merge"), und verwerfe sie, wenn es zwei unterschiedliche Biomarker sind (z.B. HDL-Cholesterin und LDL-Cholesterin). Finde zusätzlich selbst weitere Duplikate, die nicht in der Kandidatenliste stehen.
+
 Gib eine Liste von Befunden ("findings") zurück — EINER pro betroffener Eintrag. Jedes Befund hat die Form:
 {"category": "merge"|"name"|"unknown", "target_type": "registry", "biomarker": "<Name>", "description": "...", "action": "...", "params": {...}}
 - "category": "merge" wenn der Eintrag in einen bestehenden Zielnamen zusammengeführt werden soll, "name" wenn nur der Name korrigiert werden soll, "unknown" wenn der Eintrag gar nicht in der Registry vorhanden ist
@@ -526,6 +528,8 @@ Gib NUR ein gültiges JSON zurück, keine Erklärungen:
 DUPLICATE_CHECK_SYSTEM_PROMPT_EN = """You are a medical terminology assistant. You are given the list of biomarkers for which a patient actually has measurements — each entry with its name and the units found — plus the list of canonical registry names. Check for:
 1. Duplicates: typo variants or alternative spellings of the same biomarker (e.g. "CRP" vs "C-reactive protein", "HbA1c" vs "HBA1c").
 2. Unregistered biomarkers: entries that appear neither exactly nor as an alias in the canonical list and are clearly a real biomarker (not a measurement or text artifact).
+
+A list of PRE-FOUND similarity candidates may be supplied (computed purely by string similarity, without domain knowledge). These are suspicions, not decisions: confirm them with "merge" when they really are the same biomarker, and drop them when they are two different markers (e.g. HDL-cholesterol and LDL-cholesterol). Also find any further duplicates that are not in the candidate list.
 
 Return a list of findings ("findings") — ONE per affected entry. Each finding has the form:
 {"category": "merge"|"name"|"unknown", "target_type": "registry", "biomarker": "<name>", "description": "...", "action": "...", "params": {...}}
@@ -777,7 +781,8 @@ def run_biomarker_quality_check(llm: OpenAI, registry: dict, biomarker_name: str
 
 
 def run_duplicate_check(llm: OpenAI, biomarker_entries: list[tuple[str, str]],
-                        registry: dict | None = None, lang: str | None = None) -> dict:
+                        registry: dict | None = None, lang: str | None = None,
+                        candidates: list[dict] | None = None) -> dict:
     """Phase 2: check the patient's biomarker names for duplicates and
     unregistered entries.
 
@@ -795,6 +800,12 @@ def run_duplicate_check(llm: OpenAI, biomarker_entries: list[tuple[str, str]],
         registry: active registry dict (get_registry shape); its names are
             listed so merge targets must be real entries. Optional.
         lang: 'de' or 'en'; defaults to the app language via _get_lang().
+        candidates: optional list of {'source', 'target', 'ratio'} dicts from
+            database.find_variant_candidates() — deterministic string-similarity
+            suspicions rendered as an explicit hint list. Without them the model
+            has to spot typo pairs itself among ~94 canonical names, which small
+            models routinely fail at; with them it only has to confirm or reject
+            a short list. Optional so callers can run the check without hints.
 
     Returns:
         {'findings': [...]}. Only registry findings (categories merge / name / unknown).
@@ -823,15 +834,36 @@ def run_duplicate_check(llm: OpenAI, biomarker_entries: list[tuple[str, str]],
         system_prompt = DUPLICATE_CHECK_SYSTEM_PROMPT_DE
         header = "BIOMARKER DES PATIENTEN:\n"
         reg_header = "KANONISCHE BIOMARKER-NAMEN (Registry):\n"
+        cand_header = (
+            "VORGEFUNDENE ÄHNLICHKEITS-KANDIDATEN (rein rechnerisch, bitte "
+            "bestätigen oder verwerfen):\n"
+        )
     else:
         system_prompt = DUPLICATE_CHECK_SYSTEM_PROMPT_EN
         header = "PATIENT'S BIOMARKERS:\n"
         reg_header = "CANONICAL BIOMARKER NAMES (registry):\n"
+        cand_header = (
+            "PRE-FOUND SIMILARITY CANDIDATES (string similarity only — confirm "
+            "or reject):\n"
+        )
 
     prompt = (
         f"{header}\n({len(lines)} entries)\n"
         + ("\n".join(lines) if lines else "(none)")
     )
+    if candidates:
+        cand_lines = []
+        for c in candidates:
+            if not (c.get("source") and c.get("target")):
+                continue
+            su = ", ".join(c.get("source_units") or []) or "?"
+            tu = ", ".join(c.get("target_units") or []) or "?"
+            cand_lines.append(
+                f"- {c['source']} [{su}] → {c['target']} [{tu}] "
+                f"(similarity {c.get('ratio', '')})"
+            )
+        if cand_lines:
+            prompt += f"\n\n{cand_header}\n({len(cand_lines)} candidates)\n" + "\n".join(cand_lines)
     if registry:
         prompt += (
             f"\n\n{reg_header}\n({len(registry)} entries)\n"

@@ -5330,6 +5330,322 @@ class TestDataQualityJob(unittest.TestCase):
         self.assertIn("patient_id", stored.error or "")
 
 
+class TestVariantCandidates(unittest.TestCase):
+    """Deterministic (no-LLM) typo/variant detection — find_variant_candidates().
+
+    The guards matter more than the ratio here: the curated registry itself
+    contains pairs of genuinely DIFFERENT markers scoring 0.87-0.97
+    (HDL vs LDL vs VLDL-Cholesterin, Freies T3/T4), so raw string similarity
+    alone would produce dangerous merge suggestions."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = _fresh_db("test_variant_candidates.db")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.session.close()
+
+    def _patient_with_names(self, name, per_report_names):
+        """One report per inner list — names sharing a report co-occur."""
+        patient = database.get_or_create_patient(self.session, name)
+        for i, names in enumerate(per_report_names):
+            report = database.Report(
+                patient_id=patient.id, filename=f"v{i}.pdf",
+                file_hash=f"vhash_{name}_{i}", report_date=datetime(2024, 1, 1 + i),
+            )
+            self.session.add(report)
+            self.session.flush()
+            for n in names:
+                self.session.add(database.DataPoint(
+                    report_id=report.id, canonical_name=n, original_name=n,
+                    value=1.0, unit="mg/dl",
+                ))
+        self.session.commit()
+        return patient
+
+    def test_typo_variants_pair_with_registry_spelling(self):
+        """The reported bug: 'Trigylceride' / 'Tryglyceride' beside 'Triglyceride'."""
+        patient = self._patient_with_names("VC_Trig", [
+            ["Triglyceride"], ["Trigylceride"], ["Tryglyceride"],
+        ])
+        found = database.find_variant_candidates(self.session, patient.id)
+        pairs = {(c["source"], c["target"]) for c in found}
+        self.assertEqual(
+            pairs,
+            {("Trigylceride", "Triglyceride"), ("Tryglyceride", "Triglyceride")},
+            "Both typos must fold into the correctly spelled registry name",
+        )
+        for c in found:
+            self.assertGreaterEqual(c["ratio"], database.VARIANT_MIN_RATIO)
+            self.assertEqual(
+                set(c), {"source", "target", "ratio", "source_units", "target_units"},
+                "Internal tie-break keys must not leak into the result",
+            )
+
+    def test_numbered_variants_are_never_paired(self):
+        """Interleukin 6 vs 8 scores 0.92 and only IL-6 is curated — the curated
+        guard alone would let IL-8 be folded into IL-6."""
+        patient = self._patient_with_names("VC_IL",
+                                           [["Interleukin 6"], ["Interleukin 8"]])
+        self.assertEqual(
+            database.find_variant_candidates(self.session, patient.id), [],
+            "Numbered analyte families must never be merge candidates",
+        )
+        # Vitamin D2/D3 is the same class of pair and stays unpaired as well.
+        patient = self._patient_with_names("VC_VitD",
+                                           [["Vitamin D2"], ["Vitamin D3"]])
+        self.assertEqual(database.find_variant_candidates(self.session, patient.id), [])
+
+    def test_candidate_reports_observed_units(self):
+        """Units are not part of the key, so they must be surfaced for review."""
+        patient = database.get_or_create_patient(self.session, "VC_Units")
+        for i, (name, unit) in enumerate([("Triglyceride", "mg/dl"),
+                                          ("Trigylceride", "mmol/l")]):
+            report = database.Report(
+                patient_id=patient.id, filename=f"u{i}.pdf",
+                file_hash=f"vhash_units_{i}", report_date=datetime(2024, 1, 1 + i),
+            )
+            self.session.add(report)
+            self.session.flush()
+            self.session.add(database.DataPoint(
+                report_id=report.id, canonical_name=name, original_name=name,
+                value=1.0, unit=unit,
+            ))
+        self.session.commit()
+        found = database.find_variant_candidates(self.session, patient.id)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["source"], "Trigylceride")
+        self.assertEqual(found[0]["source_units"], ["mmol/l"])
+        self.assertEqual(found[0]["target_units"], ["mg/dl"])
+
+    def test_curated_lookalikes_are_never_proposed(self):
+        """HDL-/LDL-/VLDL-Cholesterin differ by one char (0.93-0.97) but are distinct."""
+        patient = self._patient_with_names("VC_Lipids", [
+            ["HDL-Cholesterin"], ["LDL-Cholesterin"], ["VLDL-Cholesterin"],
+        ])
+        self.assertEqual(
+            database.find_variant_candidates(self.session, patient.id), [],
+            "Curated markers must never be a merge source, however similar",
+        )
+
+    def test_qualifier_containment_is_not_a_typo(self):
+        """'Testosteron' vs 'Testosteron frei' (0.85) are different analytes."""
+        patient = self._patient_with_names(
+            "VC_Testo", [["Testosteron"], ["Testosteron frei"]])
+        self.assertEqual(database.find_variant_candidates(self.session, patient.id), [])
+
+    def test_unregistered_qualifier_pair_is_not_a_typo(self):
+        """The containment guard also covers names absent from the registry."""
+        patient = self._patient_with_names(
+            "VC_Pepsin", [["Pepsinogen"], ["Pepsinogen I"]])
+        self.assertEqual(database.find_variant_candidates(self.session, patient.id), [])
+
+    def test_co_occurring_names_are_distinct_markers(self):
+        """Same report = same panel = different markers, even when non-curated."""
+        together = self._patient_with_names(
+            "VC_Cooccur", [["Pepsinogen", "Pepsinogeen"]])
+        self.assertEqual(
+            database.find_variant_candidates(self.session, together.id), [],
+            "Names measured side by side must not be paired",
+        )
+        # The same two names in separate reports DO pair up — this isolates the
+        # co-occurrence guard from the ratio/curated/containment guards.
+        apart = self._patient_with_names(
+            "VC_Apart", [["Pepsinogen"], ["Pepsinogeen"]])
+        found = database.find_variant_candidates(self.session, apart.id)
+        self.assertEqual(
+            len(found), 1,
+            "One unordered pair only — the reverse direction is deduplicated",
+        )
+        self.assertEqual(
+            {found[0]["source"], found[0]["target"]}, {"Pepsinogen", "Pepsinogeen"},
+            "Two non-curated variants of each other still pair up",
+        )
+
+    def test_short_names_are_skipped(self):
+        """Names below VARIANT_MIN_KEY_LEN are too ambiguous to compare."""
+        patient = self._patient_with_names("VC_Short", [["CRP"], ["CRPm"], ["E"]])
+        self.assertEqual(database.find_variant_candidates(self.session, patient.id), [])
+
+    def test_no_candidates_for_single_name(self):
+        patient = self._patient_with_names("VC_Single", [["Trigylceride"]])
+        self.assertEqual(database.find_variant_candidates(self.session, patient.id), [])
+
+    def test_other_patients_names_are_not_candidates(self):
+        """Scope is per patient — another patient's typo must not leak in."""
+        self._patient_with_names("VC_Other", [["Trigylceride"]])
+        lonely = self._patient_with_names("VC_Lonely", [["Triglyceride"]])
+        self.assertEqual(database.find_variant_candidates(self.session, lonely.id), [])
+
+
+class TestDataQualityDeterministicMerge(unittest.TestCase):
+    """The data-quality job must surface typo duplicates even when the LLM
+    duplicate check stays silent or fails outright."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = _fresh_db("test_dq_deterministic.db")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.session.close()
+
+    def setUp(self):
+        import streamlit as st
+        st.session_state.llm_base_url = "http://test:8888/v1"
+        st.session_state.llm_api_key = "test-key"
+        st.session_state.llm_model = "test-model"
+        st.session_state.llm_timeout = 30
+        st.session_state.pdf_dpi = 150
+        st.session_state.pdf_batch_size = 1
+        st.session_state._bb_lang = "de"
+        # A fresh patient per test: the accept-and-merge test rewrites the data
+        # points, which would otherwise poison the tests running after it.
+        # One report per name — co-occurring names are treated as distinct.
+        tag = self.id().split(".")[-1]
+        self.patient = database.get_or_create_patient(self.session, f"DQDet_{tag}")
+        for i, name in enumerate(("Triglyceride", "Trigylceride", "Tryglyceride")):
+            report = database.Report(
+                patient_id=self.patient.id, filename=f"t{i}.pdf",
+                file_hash=f"dqd_{tag}_{i}", report_date=datetime(2024, 1, 1),
+            )
+            self.session.add(report)
+            self.session.flush()
+            self.session.add(database.DataPoint(
+                report_id=report.id, canonical_name=name, original_name=name,
+                value=120.0, unit="mg/dl", ref_low=0.0, ref_high=150.0,
+            ))
+        self.session.commit()
+
+    def _run(self, duplicate=None, duplicate_exc=None):
+        import llm_jobs
+
+        def dup(*args, **kwargs):
+            if duplicate_exc is not None:
+                raise duplicate_exc
+            return {"findings": duplicate or []}
+
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "run_biomarker_quality_check",
+                          return_value={"findings": []}), \
+             patch.object(llm_jobs, "run_duplicate_check", side_effect=dup):
+            job = llm_jobs.submit_job(
+                "data_quality_check", "job_kind_data_quality_check",
+                params={"patient_id": self.patient.id}, runner=llm_jobs._run_job,
+            )
+        self.session.expire_all()
+        return database.get_llm_job(self.session, job.id)
+
+    def _merge_findings(self):
+        return [
+            f for f in database.get_data_quality_findings(self.session, self.patient.id)
+            if f.action == "merge"
+        ]
+
+    def test_silent_llm_still_produces_merge_findings(self):
+        """The regression this guards: LLM returns nothing, duplicates remain."""
+        stored = self._run(duplicate=[])
+        self.assertEqual(stored.status, "done")
+        by_source = {f.biomarker: json.loads(f.params_json)["target"]
+                     for f in self._merge_findings()}
+        self.assertEqual(
+            by_source,
+            {"Trigylceride": "Triglyceride", "Tryglyceride": "Triglyceride"},
+        )
+        for f in self._merge_findings():
+            self.assertEqual(f.category, "merge")
+            self.assertEqual(f.target_type, "registry")
+            self.assertEqual(f.status, "pending")
+            self.assertIn("Zeichenähnlichkeit", f.description)
+            self.assertNotIn("unterschiedliche Einheiten", f.description,
+                             "Identical units must not add a unit warning")
+
+    def test_unit_mismatch_is_flagged_in_the_finding(self):
+        """A merge renames only — it never converts, so the units must be shown."""
+        for dp in self.session.query(database.DataPoint).join(
+                database.Report).filter(
+                database.Report.patient_id == self.patient.id).all():
+            if dp.canonical_name == "Trigylceride":
+                dp.unit = "mmol/l"
+        self.session.commit()
+        self._run(duplicate=[])
+        descs = {f.biomarker: f.description for f in self._merge_findings()}
+        self.assertIn("unterschiedliche Einheiten", descs["Trigylceride"])
+        self.assertIn("mmol/l", descs["Trigylceride"])
+        self.assertIn("mg/dl", descs["Trigylceride"])
+        self.assertNotIn("unterschiedliche Einheiten", descs["Tryglyceride"])
+
+    def test_llm_confirmation_is_not_duplicated(self):
+        """A candidate the LLM already confirmed must appear exactly once."""
+        self._run(duplicate=[
+            {"category": "merge", "target_type": "registry",
+             "biomarker": "Trigylceride", "description": "llm said so",
+             "action": "merge", "params": {"target": "Triglyceride"},
+             "data_points": None},
+        ])
+        rows = self._merge_findings()
+        self.assertEqual(len(rows), 2, "One confirmed + one unconfirmed candidate")
+        self.assertEqual(
+            sum(1 for f in rows if f.biomarker == "Trigylceride"), 1,
+            "Confirmed candidate must not be emitted twice",
+        )
+
+    def test_failed_duplicate_check_still_finds_duplicates(self):
+        """A crashing LLM call must not hide a duplicate — only add an error line."""
+        stored = self._run(duplicate_exc=RuntimeError("boom"))
+        self.assertEqual(stored.status, "done")
+        self.assertIn("Duplikat-Check: boom", stored.result_text or "")
+        self.assertEqual(
+            {f.biomarker for f in self._merge_findings()},
+            {"Trigylceride", "Tryglyceride"},
+        )
+
+    def test_candidates_are_passed_to_the_llm_as_hints(self):
+        import llm_jobs
+        seen = {}
+
+        def dup(llm, entries, registry, lang, candidates=None):
+            seen["candidates"] = candidates
+            return {"findings": []}
+
+        with patch.object(llm_jobs, "_build_client", return_value=object()), \
+             patch.object(llm_jobs, "run_biomarker_quality_check",
+                          return_value={"findings": []}), \
+             patch.object(llm_jobs, "run_duplicate_check", side_effect=dup):
+            llm_jobs.submit_job(
+                "data_quality_check", "job_kind_data_quality_check",
+                params={"patient_id": self.patient.id}, runner=llm_jobs._run_job,
+            )
+        pairs = {(c["source"], c["target"]) for c in seen["candidates"]}
+        self.assertEqual(
+            pairs,
+            {("Trigylceride", "Triglyceride"), ("Tryglyceride", "Triglyceride")},
+            "Deterministic candidates must reach the duplicate check as hints",
+        )
+
+    def test_accepted_finding_merges_and_keeps_alias(self):
+        """End to end: accepting the finding migrates data and records the alias."""
+        self._run(duplicate=[])
+        rows = self._merge_findings()
+        applied = [database.apply_data_quality_finding(self.session, f.id) for f in rows]
+        self.assertTrue(all(a["status"] == "applied" for a in applied), str(applied))
+
+        names = {
+            dp.canonical_name
+            for dp in self.session.query(database.DataPoint)
+            .join(database.Report)
+            .filter(database.Report.patient_id == self.patient.id)
+            .all()
+        }
+        self.assertEqual(names, {"Triglyceride"}, "All data points must end up merged")
+
+        registry = database.get_registry(self.session)
+        aliases = {a.lower() for a in registry["Triglyceride"]["aliases"]}
+        self.assertIn("trigylceride", aliases)
+        self.assertIn("tryglyceride", aliases)
+
+
 class TestHealthInsightPipeline(unittest.TestCase):
     """Tests for the LLM-insight improvements: patient demographics, temporally
     aligned cross-biomarker patterns, enriched risk-assessment context,
@@ -6659,6 +6975,8 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityParsing))
     suite.addTests(loader.loadTestsFromTestCase(TestApplyDataQualityFinding))
     suite.addTests(loader.loadTestsFromTestCase(TestDataQualityJob))
+    suite.addTests(loader.loadTestsFromTestCase(TestVariantCandidates))
+    suite.addTests(loader.loadTestsFromTestCase(TestDataQualityDeterministicMerge))
     suite.addTests(loader.loadTestsFromTestCase(TestHealthInsightPipeline))
     suite.addTests(loader.loadTestsFromTestCase(TestUnitWhitespaceDefenseConfig))
     suite.addTests(loader.loadTestsFromTestCase(TestChatWithData))

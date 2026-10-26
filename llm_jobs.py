@@ -41,6 +41,7 @@ from database import (
     upsert_biomarker_info, backfill_reference_ranges, create_patient_summary,
     get_registry, patient_age_years, collect_report_artifacts,
     DataQualityFinding, clear_patient_data_quality_findings,
+    find_variant_candidates,
     get_chat_conversation, ReportArtifact,
 )
 from llm_client import (
@@ -1284,12 +1285,56 @@ def _job_data_quality_check(session, cfg, lang, params):
                          f"{name} ({idx + 1}/{total})", (idx + 1) / total)
 
     # Phase 2: duplicate check over all of the patient's biomarkers.
+    #
+    # Typo detection used to be LLM-only: the model had to spot that
+    # 'Trigylceride' and 'Tryglyceride' are the same marker as 'Triglyceride'
+    # while reading ~94 canonical names, and small quantised models routinely
+    # return {"findings": []} — the split then survives every check. So the
+    # pairs are found deterministically first (find_variant_candidates, pure
+    # string similarity) and the LLM is asked to CONFIRM that short list. Any
+    # candidate the LLM did not confirm is still emitted as a merge finding, so
+    # a silent/failed duplicate check can no longer hide a duplicate.
     if not is_job_aborted():
         try:
             entries = [(d["name"], d["unit"]) for d in dp_dicts]
-            findings.extend(run_duplicate_check(llm, entries, registry, lang)["findings"])
+            candidates = find_variant_candidates(session, patient_id, registry)
+            dup_findings = run_duplicate_check(
+                llm, entries, registry, lang, candidates=candidates)["findings"]
         except Exception as e:
+            dup_findings = []
             errors.append(f"{t('label_duplicate_check', lang=lang)}: {e}")
+        confirmed = {
+            (str(f.get("biomarker", "")).strip().lower(),
+             str((f.get("params") or {}).get("target", "")).strip().lower())
+            for f in dup_findings if f.get("action") == "merge"
+        }
+        findings.extend(dup_findings)
+        for cand in candidates:
+            source, target = cand["source"], cand["target"]
+            if (source.lower(), target.lower()) in confirmed:
+                continue
+            src_units = sorted({(u or "").strip() for u in cand.get("source_units") or [] if (u or "").strip()})
+            tgt_units = sorted({(u or "").strip() for u in cand.get("target_units") or [] if (u or "").strip()})
+            # Units are NOT part of the similarity key, so a name typo can pair
+            # with a unit difference. Renaming never converts a value, so the
+            # user must see the units before accepting — otherwise mg/dl and
+            # mmol/l measurements of one marker end up on a single trend line.
+            unit_note = ""
+            if src_units and tgt_units and {u.lower() for u in src_units} != {u.lower() for u in tgt_units}:
+                unit_note = t(
+                    "dq_candidate_merge_unit_warning", lang=lang,
+                    source_units=", ".join(src_units), target_units=", ".join(tgt_units))
+            findings.append({
+                "category": "merge",
+                "target_type": "registry",
+                "biomarker": source,
+                "description": t(
+                    "dq_candidate_merge_description", lang=lang,
+                    source=source, target=target, ratio=cand["ratio"]) + unit_note,
+                "action": "merge",
+                "params": {"target": target},
+                "data_points": None,
+            })
 
     # Map each data_point finding's 1-based "#n" indices (per biomarker group)
     # to real DataPoint DB ids — the apply step resolves them via session.get().

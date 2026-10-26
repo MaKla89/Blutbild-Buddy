@@ -1,4 +1,5 @@
 from datetime import datetime
+import difflib
 import json
 import logging
 import re
@@ -993,6 +994,236 @@ def get_unique_biomarker_groups(session: SASession, patient_id: int) -> list[dic
         groups[group_key]["total_count"] += cnt
 
     return [g for g in groups.values() if len(g["variants"]) > 1]
+
+
+# ── Deterministic typo/variant detection (no LLM) ────────────────────────────
+#
+# Name resolution at extraction time is exact-or-alias only, so an OCR typo
+# ('Trigylceride' for 'Triglyceride') becomes its own canonical name and splits
+# one biomarker across several entries. get_unique_biomarker_groups() cannot
+# help: its grouping key is the exact base name, so the variants never even land
+# in one group. The only detector was the LLM duplicate check, which has to
+# notice the pair itself among ~94 canonical names — small models routinely
+# return nothing. find_variant_candidates() replaces that guesswork with a
+# string-similarity pre-pass: it always produces the candidate pairs, and the
+# LLM (when available) only has to CONFIRM a short list instead of finding it.
+
+# Similarity below this is not treated as a plausible typo. 0.80 catches
+# 'Trigylceride' (0.83) and 'Tryglyceride' (0.92) while staying clear of
+# deliberately distinct names; the curated-name guard below is what actually
+# protects near-identical-but-different markers like HDL/LDL-Cholesterin.
+VARIANT_MIN_RATIO = 0.80
+# Below this length, single-character differences are far too common between
+# genuinely different markers (abbreviations, 'T3'/'T4') to be worth flagging.
+VARIANT_MIN_KEY_LEN = 5
+
+
+def _variant_key(name: str) -> str:
+    """Comparison key for similarity matching: base name, lowercased, alnum only.
+
+    Strips the unit suffix in parens and every non-alphanumeric character, so
+    casing, spacing and punctuation ('HDL-Cholesterin' vs 'hdl cholesterin')
+    never affect the ratio — only the letters do.
+    """
+    return re.sub(r"[^0-9a-z]", "", _canonical_base(name).lower())
+
+
+def _is_qualifier_pair(key_a: str, key_b: str) -> bool:
+    """True when one key simply contains the other — a qualifier, not a typo.
+
+    A typo changes characters in place ('trigylceride' vs 'triglyceride':
+    neither contains the other). Appending a qualifier produces a different
+    analyte, and string similarity scores those pairs very high precisely
+    because most of the string is shared:
+      'testosteron' ⊂ 'testosteronfrei'   (0.85) — total vs free testosterone
+      'vitamind2'   ⊂ 'vitamind25oh'      (0.94) — D2 vs 25-OH-D
+      'ldlcholesterin' ⊂ 'vldlcholesterin' (0.97) — LDL vs VLDL
+    Rejecting containment removes that whole class of false positives.
+    """
+    return key_a in key_b or key_b in key_a
+
+
+def _is_numbered_variant_pair(key_a: str, key_b: str) -> bool:
+    """True when the two keys differ in their digits — numbered analytes.
+
+    Subscript-style names are a family of distinct markers that share almost
+    their entire string, so similarity alone cannot separate them:
+      'interleukin6' vs 'interleukin8' (0.92) — and only IL-6 is curated, so the
+        curated guard would let IL-8 be folded into IL-6
+      'freiest3' vs 'freiest4', 'vitamind2' vs 'vitamind3', 'hemoglobina1c' vs
+        'hemoglobina2c'
+    Comparing the digit runs rejects every one of them. A typo that happens to
+    corrupt a digit ('HbA1c' → 'HbA2c') is rejected too — deliberately, since
+    HbA2 is a real, different marker.
+    """
+    return re.findall(r"\d+", key_a) != re.findall(r"\d+", key_b)
+
+
+def _curated_name_keys() -> set[str]:
+    """Comparison keys of the curated baseline registry (names + aliases).
+
+    These are the deliberately distinct, human-curated markers. A name matching
+    one is never used as a merge SOURCE: 'HDL-Cholesterin' and
+    'LDL-Cholesterin' differ by ONE character (ratio 0.93) and string
+    similarity must never propose folding one into the other. A name NOT in this
+    set is either unregistered (a pipeline miss / typo) or a user- or
+    LLM-created registry row — both fair game as merge candidates.
+    """
+    keys = set()
+    for canonical, info in _config._CANONICAL_BIOMARKERS.items():
+        keys.add(_variant_key(canonical))
+        for alias in info.get("aliases", []):
+            keys.add(_variant_key(alias))
+    keys.discard("")
+    return keys
+
+
+def find_variant_candidates(
+    session: SASession,
+    patient_id: int,
+    registry: dict | None = None,
+    min_ratio: float = VARIANT_MIN_RATIO,
+) -> list[dict]:
+    """Find likely typo/variant duplicates among a patient's stored names — deterministically.
+
+    For every distinct canonical name the patient actually has measurements for,
+    compute the closest other name by string similarity and keep the pair when
+    the ratio clears ``min_ratio``. Three guards keep genuinely different
+    markers out of the results, because raw similarity alone cannot:
+      1. at least one side must be a NON-curated name (see _curated_name_keys) —
+         HDL-/LDL-/VLDL-Cholesterin or Freies T3/T4 are curated, so they can
+         never be proposed as a merge source;
+      2. neither key may contain the other (_is_qualifier_pair) — 'Testosteron'
+         vs 'Testosteron frei' scores 0.85 but they are different analytes;
+      3. the digit runs must match (_is_numbered_variant_pair) — 'Interleukin 8'
+         vs 'Interleukin 6' scores 0.92 and only IL-6 is curated;
+      4. names measured in the SAME report are distinct markers and are never
+         paired (a panel reports Vitamin D2 and D3 side by side).
+
+    Units are deliberately NOT part of the comparison key: an OCR typo can
+    co-occur with a unit difference ('Trigylceride' in mmol/l vs 'Triglyceride'
+    in mg/dl) and is still the same marker. The units each side was measured in
+    are returned alongside the pair so the caller can show them — accepting a
+    merge renames data points only and never converts or overwrites a unit.
+
+    Merge targets are the active registry's canonical names first (so a typo
+    folds into the correctly spelled entry even when that spelling never
+    appears in the patient's data), then the patient's other stored names (so
+    two typos of a marker that is missing from the registry still pair up).
+
+    Returns a list of {'source', 'target', 'ratio', 'source_units',
+    'target_units'} sorted by descending ratio. Advisory only — callers turn
+    these into data-quality findings the user accepts or dismisses; nothing
+    here mutates the DB.
+    """
+    if registry is None:
+        registry = get_registry(session)
+
+    rows = (
+        session.query(DataPoint.canonical_name, func.count(DataPoint.id))
+        .join(Report)
+        .filter(Report.patient_id == patient_id)
+        .group_by(DataPoint.canonical_name)
+        .all()
+    )
+    # Distinct stored names, keyed by comparison key; measurement count breaks
+    # ties when two typos of each other are the only candidates.
+    stored: dict[str, tuple[str, int]] = {}
+    for name, cnt in rows:
+        if not name:
+            continue
+        key = _variant_key(name)
+        if len(key) < VARIANT_MIN_KEY_LEN:
+            continue
+        prev = stored.get(key)
+        if prev is None or cnt > prev[1]:
+            stored[key] = (name, cnt)
+    if len(stored) < 2:
+        return []
+
+    # Which reports each stored name appears in. Two names measured in the SAME
+    # report are almost certainly distinct markers — a lab panel reports
+    # HDL-/LDL-/VLDL-Cholesterin or Vitamin D2/D3 side by side, but never the
+    # same marker twice under two spellings. This is the guard that string
+    # similarity alone cannot provide: LDL vs VLDL-Cholesterin scores 0.966.
+    report_ids_by_key: dict[str, set[int]] = {}
+    units_by_key: dict[str, list[str]] = {}
+    for name, rid, unit in (
+        session.query(DataPoint.canonical_name, Report.id, DataPoint.unit)
+        .join(Report, DataPoint.report_id == Report.id)
+        .filter(Report.patient_id == patient_id)
+        .distinct()
+        .all()
+    ):
+        if not name:
+            continue
+        key = _variant_key(name)
+        report_ids_by_key.setdefault(key, set()).add(rid)
+        u = (unit or "").strip()
+        if u and u not in units_by_key.setdefault(key, []):
+            units_by_key[key].append(u)
+
+    curated = _curated_name_keys()
+
+    # Candidate targets: registry canonicals (correct spellings, real rows) plus
+    # the patient's own stored names. Registry entries win ties.
+    target_keys: dict[str, str] = {}
+    for canonical in registry:
+        key = _variant_key(canonical)
+        if len(key) >= VARIANT_MIN_KEY_LEN:
+            target_keys.setdefault(key, canonical)
+    for key, (name, _cnt) in stored.items():
+        target_keys.setdefault(key, name)
+
+    candidates: dict[str, dict] = {}
+    for key, (source, _cnt) in stored.items():
+        if key in curated:
+            continue  # curated marker — never fold a real marker into another
+        src_reports = report_ids_by_key.get(key, set())
+        best_key, best_ratio = None, 0.0
+        for tkey, target_name in target_keys.items():
+            if tkey == key:
+                continue
+            # One name is the other plus a qualifier → different analyte.
+            if _is_qualifier_pair(key, tkey):
+                continue
+            # Numbered family (Interleukin 6/8, T3/T4) → different analyte.
+            if _is_numbered_variant_pair(key, tkey):
+                continue
+            # Both sides measured in the same report → distinct markers.
+            if src_reports & report_ids_by_key.get(tkey, set()):
+                continue
+            ratio = difflib.SequenceMatcher(None, key, tkey).ratio()
+            if ratio > best_ratio:
+                best_key, best_ratio = tkey, ratio
+        if best_key is None or best_ratio < min_ratio:
+            continue
+        pair_id = "|".join(sorted((key, best_key)))
+        entry = {
+            "source": source,
+            "target": target_keys[best_key],
+            "ratio": round(best_ratio, 3),
+            "source_units": sorted(units_by_key.get(key, [])),
+            "target_units": sorted(units_by_key.get(best_key, [])),
+            "_target_curated": best_key in curated,
+            "_source_count": _cnt,
+            "_pair": pair_id,
+        }
+        # One finding per unordered pair — two non-curated typos of each other
+        # are each other's best match, so the pair is generated twice. Prefer
+        # keeping the curated side as the target, then the name with more
+        # measurements as the source (the rarer spelling is the typo).
+        existing = candidates.get(pair_id)
+        if existing is None or (entry["_target_curated"], entry["_source_count"]) > (
+            existing["_target_curated"], existing["_source_count"]
+        ):
+            candidates[pair_id] = entry
+
+    out = sorted(candidates.values(), key=lambda c: (-c["ratio"], c["source"]))
+    for c in out:
+        for internal in ("_target_curated", "_source_count", "_pair"):
+            c.pop(internal, None)
+    return out
 
 
 def merge_canonical_names(session: SASession, patient_id: int, source_names: list[str], target_name: str) -> int:
