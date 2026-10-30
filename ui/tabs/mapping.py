@@ -84,6 +84,37 @@ def _finding_proposal(f) -> str:
         return t("proposal_set_unit", new_unit=str(params.get("unit", "") or "?"))
     if action == "disable_value":
         return t("proposal_disable_value")
+    if action == "set_value":
+        value = params.get("value")
+        unit = str(params.get("unit", "") or "").strip()
+        val = f"{_fmt_num(value)}" + (f" {unit}" if unit else "")
+        return t("proposal_set_value", value=val)
+    if action == "clear_ref_range":
+        return t("proposal_clear_ref_range")
+    if action == "swap_value_ref_range":
+        low, high = params.get("low"), params.get("high")
+        value = params.get("value")
+        unit = str(params.get("unit", "") or "").strip()
+        if low is None and high is None:
+            # The auditor re-read only the measurement off the correct column and
+            # did not re-state a range — a value-only fix.
+            val = f"{_fmt_num(value)}" + (f" {unit}" if unit else "")
+            return t("proposal_swap_value_only", value=val)
+        if low is not None and high is not None:
+            rng = f"{_fmt_num(low)}–{_fmt_num(high)}"
+        elif high is not None:
+            rng = f"< {_fmt_num(high)}"
+        else:
+            rng = f"> {_fmt_num(low)}"
+        if unit:
+            rng += f" {unit}"
+        if value is None:
+            # Only the range can be repaired — the displaced measurement is unknown.
+            return t("proposal_swap_ref_only", range=rng)
+        val = f"{_fmt_num(value)}" + (f" {unit}" if unit else "")
+        return t("proposal_swap_value_ref", value=val, range=rng)
+    if action == "acknowledge":
+        return t("proposal_acknowledge")
     if action == "merge":
         return t("proposal_merge", target=str(params.get("target", "") or "?"))
     if action == "registry_name":
@@ -318,6 +349,26 @@ def render_mapping_tab(session, patient, patient_reports):
             job_label_key="job_kind_data_quality_check", key="btn_data_quality_check",
             params={"patient_id": patient.id},
             flash_key="data_quality_check",
+        )
+
+        # --- Second-pass column audit --------------------------------------
+        # The column-first extraction prompt makes the model declare the table
+        # layout before reading any row, but a model can still read a value from
+        # the wrong column. This pass re-sends each page image and asks the LLM
+        # ONLY whether every stored value came from the right column — a narrow,
+        # cheap audit whose disagreements become reviewable findings (never
+        # auto-applied). It complements the deterministic checks the extractor
+        # already ran at ingestion (those need no LLM and catch the shapes that
+        # cannot occur in a correctly read table).
+        st.markdown(f"**{t('subheader_verify')}**")
+        st.caption(t("caption_verify"))
+        _show_flash("verify_extraction")
+        _job_button(
+            session,
+            label_key="btn_verify_extraction", kind="verify_extraction",
+            job_label_key="job_kind_verify_extraction", key="btn_verify_extraction",
+            params={"patient_id": patient.id},
+            flash_key="verify_extraction", button_type="secondary",
         )
 
         # Render results queued on the previous run. Placed here, OUTSIDE the

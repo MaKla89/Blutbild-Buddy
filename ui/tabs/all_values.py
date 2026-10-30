@@ -25,7 +25,9 @@ def _build_xlsx_bytes(df_pivot: pd.DataFrame, date_list: list, marker_label: str
 
     Cached on the matrix contents: rebuilding the workbook on every rerun is
     pure CPU work, and the app reruns every 2s while a job-poll fragment is
-    live. Returns the bytes for st.download_button.
+    live. Returns the bytes for st.download_button. ``date_list`` is the list of
+    *column labels* (already display strings — a report with several result
+    columns contributes more than one, e.g. "05.03.2024 (2)").
     """
     wb = Workbook()
     ws = wb.active
@@ -56,8 +58,7 @@ def _build_xlsx_bytes(df_pivot: pd.DataFrame, date_list: list, marker_label: str
         ws.cell(row=row_idx, column=2, value=ref_low if ref_low is not None else "").alignment = white_font_alignment
         ws.cell(row=row_idx, column=3, value=ref_high if ref_high is not None else "").alignment = white_font_alignment
 
-        for col_idx, d in enumerate(date_list, 4):
-            date_str = d.strftime("%d.%m.%Y")
+        for col_idx, date_str in enumerate(date_list, 4):
             val = row_data.get(date_str, "—")
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
             cell.alignment = white_font_alignment
@@ -98,14 +99,17 @@ def render_all_values_tab(session, patient, patient_reports):
         # Disabled measurements are included on purpose: they are shown in the
         # matrix with a yellow highlight so the user can see what is excluded.
         all_entries = queries.biomarkers(patient.id, include_disabled=True)
-        date_list = queries.report_dates(patient.id)
 
-        if all_entries and date_list:
-            # Values, disabled flags and the latest reference range per marker in
-            # one cached query. The old code ran one extra query per biomarker
-            # (an N+1: ~90 round trips for a fully populated patient).
-            lookup, disabled_lookup, ref_lookup = queries.measurement_matrix(patient.id)
+        # Values, disabled flags, the latest reference range per marker AND the
+        # matrix columns in one cached query. Columns are keyed by (report_id,
+        # series-slot) so a report with several result columns contributes one
+        # column each instead of collapsing onto a single date cell.
+        lookup, disabled_lookup, ref_lookup, columns, col_labels = (
+            queries.measurement_matrix(patient.id)
+        )
+        date_list = [col_labels[c] for c in columns]
 
+        if all_entries and columns:
             # Build pivot table rows with separate ref min/max columns
             c_marker = t("col_marker")
             pivot_rows = []
@@ -115,18 +119,20 @@ def render_all_values_tab(session, patient, patient_reports):
                 ref_low, ref_high = ref_lookup.get((cname, unit), (None, None))
                 row = {c_marker: label, "Min": ref_low, "Max": ref_high}
                 has_value = False
-                for d in date_list:
-                    val = lookup.get((cname, unit, d))
+                for col_key in columns:
+                    col_label = col_labels[col_key]
+                    val = lookup.get((cname, unit, col_key))
                     if val is not None:
-                        row[d.strftime("%d.%m.%Y")] = val
+                        row[col_label] = val
                         has_value = True
                     else:
-                        row[d.strftime("%d.%m.%Y")] = "—"
+                        row[col_label] = "—"
                 # Only include rows that have at least one measured value
                 if has_value:
                     pivot_rows.append(row)
                     disabled_by_label[label] = {
-                        d.strftime("%d.%m.%Y") for d in date_list if disabled_lookup.get((cname, unit, d))
+                        col_labels[c] for c in columns
+                        if disabled_lookup.get((cname, unit, c))
                     }
 
             df_pivot = pd.DataFrame(pivot_rows)

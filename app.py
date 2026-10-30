@@ -71,7 +71,11 @@ if "llm_api_key" not in st.session_state:
 if "llm_timeout" not in st.session_state:
     st.session_state.llm_timeout = config.get_llm_timeout()
 if "pdf_dpi" not in st.session_state:
-    st.session_state.pdf_dpi = 150
+    # 200 DPI (not the old 150): a sharper render is the cheapest defence
+    # against column mix-ups — thin table rules and adjacent reference/result
+    # columns blur together at lower DPI, which is what makes the model read a
+    # value from the wrong column in the first place.
+    st.session_state.pdf_dpi = 200
 if "pdf_batch_size" not in st.session_state:
     st.session_state.pdf_batch_size = 0
 

@@ -21,7 +21,7 @@ def _fresh_db(name: str):
     return database.get_session()
 
 
-from pdf_processor import file_hash, pdf_page_count, pdf_to_images, image_to_base64_jpeg
+from pdf_processor import file_hash, pdf_page_count, pdf_to_images, image_to_base64_jpeg, _render_scale
 
 
 MOCK_EXTRACTED_PAGE = {
@@ -183,6 +183,62 @@ class TestPDFProcessor(unittest.TestCase):
         b64 = image_to_base64_jpeg(img)
         self.assertIsInstance(b64, str)
         self.assertGreater(len(b64), 50)
+
+
+class TestRenderScale(unittest.TestCase):
+    """``page.render(scale=dpi/72)`` is relative to the PAGE BOX, so a
+    shrink-wrapped scan (a tiny MediaBox around a high-res embedded JPEG) renders
+    far below the scan's real resolution and the model misreads digits.
+    ``_render_scale`` boosts such a page to the embedded image's native size,
+    while a normal page box keeps the plain DPI rendering untouched."""
+
+    def _small_page_pdf(self, scan_px=(1500, 2000)) -> Path:
+        """A 210x280 pt page box (2.9x3.9 in) holding a ``scan_px`` embedded
+        image — the shrink-wrapped-scan shape: native scan ~514 DPI, but 200 DPI
+        would render only 583x778 px and throw the detail away."""
+        from fpdf import FPDF
+        from PIL import Image
+        d = Path(tempfile.mkdtemp(prefix="bb_smallpage_"))
+        png = d / "scan.png"
+        Image.new("L", scan_px, 255).save(png)
+        doc = FPDF(unit="pt", format=(210, 280))
+        doc.add_page()
+        doc.image(str(png), x=0, y=0, w=210, h=280)
+        pdf = d / "small.pdf"
+        doc.output(str(pdf))
+        return pdf
+
+    def test_small_page_box_renders_at_native_resolution(self):
+        pdf = self._small_page_pdf()
+        w, h = pdf_to_images(pdf, dpi=200)[0].size
+        # Boosted to the embedded scan's native size, not the page-box DPI.
+        self.assertEqual((w, h), (1500, 2000))
+
+    def test_normal_page_box_uses_plain_dpi(self):
+        """An A4 box (~595x842 pt) is a real page: dpi/72 already renders ~1650
+        px, so the scale must stay exactly dpi/72 — the fix must not touch it."""
+        import pypdfium2 as pdfium
+        from fpdf import FPDF
+        d = Path(tempfile.mkdtemp(prefix="bb_normalpage_"))
+        doc = FPDF(unit="pt", format="A4")
+        doc.add_page()
+        doc.set_font("Helvetica", size=12)
+        doc.set_xy(72, 72)
+        doc.cell(text="normal page")
+        pdf = d / "normal.pdf"
+        doc.output(str(pdf))
+        with pdfium.PdfDocument(str(pdf)) as p:
+            page = p[0]
+            self.assertAlmostEqual(_render_scale(page, 200), 200 / 72, places=6)
+            self.assertAlmostEqual(_render_scale(page, 100), 100 / 72, places=6)
+
+    def test_small_page_boost_is_capped(self):
+        """A very high-res scan on a tiny box must not explode the base64
+        payload: the boosted long side is capped at ``_MAX_BOOSTED_LONG_PX``."""
+        from pdf_processor import _MAX_BOOSTED_LONG_PX
+        pdf = self._small_page_pdf(scan_px=(3000, 4000))
+        w, h = pdf_to_images(pdf, dpi=200)[0].size
+        self.assertLessEqual(max(w, h), _MAX_BOOSTED_LONG_PX + 1)
 
 
 class TestDatabase(unittest.TestCase):
@@ -6601,6 +6657,551 @@ class TestSummaryCardRendering(unittest.TestCase):
                           f"{match.group(0)!r}")
 
 
+def _single_page_pdf_dir(label: str = "ColConf") -> Path:
+    """One throwaway 1-page PDF so the extractor takes the single-page path
+    (``extract_page``) and the per-page positional mapping stays trivial."""
+    from fpdf import FPDF
+    d = Path(tempfile.mkdtemp(prefix="bb_colconf_"))
+    doc = FPDF(unit="pt", format="A4")
+    doc.add_page()
+    doc.set_font("Helvetica", size=12)
+    doc.set_xy(72, 72)
+    doc.cell(text=f"2024 - {label} - Blutbild")
+    doc.output(str(d / f"2024 - {label} - Blutbild.pdf"))
+    return d
+
+
+class TestColumnConfusion(unittest.TestCase):
+    """The column-confusion guard: the extractor declares each page's table
+    layout (columns + roles) and tags every entry with its result column. The
+    deterministic checks in ``extractor._column_findings`` turn a misread into a
+    pending DataQualityFinding (source="extraction") — NEVER applied silently."""
+
+    def setUp(self):
+        import streamlit as st
+        st.session_state.pdf_dpi = 100
+        st.session_state.pdf_batch_size = 0
+        self.session = _fresh_db(f"colconf_{self._testMethodName}.db")
+
+    def tearDown(self):
+        self.session.close()
+
+    def _extract(self, page_dict):
+        """Run process_new_pdfs over one 1-page fixture PDF with a mocked
+        extraction returning ``page_dict``. Returns (processed, errors)."""
+        from schemas import ExtractedPage, NormalizationMapping
+        import extractor
+        with patch("extractor.REPORTS_DIR", str(_single_page_pdf_dir())), \
+             patch("extractor.pdf_to_base64_jpeg", return_value=["fake_b64"]), \
+             patch("extractor.extract_page", return_value=ExtractedPage(**page_dict)), \
+             patch("extractor.normalize_names",
+                   return_value=NormalizationMapping(mappings=[])):
+            return extractor.process_new_pdfs(self.session, lang="de")
+
+    def _findings(self):
+        return self.session.query(database.DataQualityFinding).filter(
+            database.DataQualityFinding.source == "extraction").all()
+
+    # ── (1) value field holds a range → swap ──────────────────────────────
+    def test_value_is_range_creates_swap_finding(self):
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name", "header": "Parameter"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference", "header": "Referenz"},
+            ],
+            "entries": [
+                # The model read the range into "value" and the lone number into
+                # the reference field — the classic one-column-off mix-up.
+                {"name": "H\u00e4moglobin", "value": "4.2-6.1", "unit": "g/dl",
+                 "reference_range": "5.2", "column_index": 1},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(processed), 1)
+
+        findings = self._findings()
+        self.assertEqual(len(findings), 1, "exactly one swap finding expected")
+        f = findings[0]
+        self.assertEqual(f.category, "column_swap")
+        self.assertEqual(f.source, "extraction")
+        self.assertEqual(f.action, "swap_value_ref_range")
+        params = json.loads(f.params_json)
+        self.assertEqual(params["value"], 5.2)
+        self.assertEqual(params["low"], 4.2)
+        self.assertEqual(params["high"], 6.1)
+
+        # The stored data point is still wrong (value coerced to None) — the
+        # finding is a REVIEW hint, not an auto-fix.
+        dp = self.session.query(database.DataPoint).first()
+        self.assertIsNone(dp.value)
+
+        # Accepting the finding repairs it: range from the misread cell, value
+        # from the displaced number.
+        res = database.apply_data_quality_finding(self.session, f.id)
+        self.assertEqual(res["status"], "applied")
+        self.session.expire_all()
+        dp = self.session.query(database.DataPoint).first()
+        self.assertEqual(dp.value, 5.2)
+        self.assertEqual(dp.ref_low, 4.2)
+        self.assertEqual(dp.ref_high, 6.1)
+
+    # ── (2) reference field holds a bare number ───────────────────────────
+    def test_ref_holds_bare_number_uses_registry_default(self):
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                # A lone number in the reference cell — almost always a stray
+                # measurement. CRP has a registry default, so the fix restates it.
+                {"name": "CRP", "value": 5.2, "unit": "mg/dl",
+                 "reference_range": "8.0", "column_index": 1},
+            ],
+        }
+        self._extract(page)
+        findings = self._findings()
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f.category, "column_swap")
+        self.assertEqual(f.action, "set_ref_range")
+        params = json.loads(f.params_json)
+        # CRP's curated default (0.0–0.5 mg/dl) replaces the stray number.
+        self.assertEqual(params["low"], 0.0)
+        self.assertEqual(params["high"], 0.5)
+
+    def test_ref_holds_bare_number_unregistered_clears_range(self):
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                # Unknown marker → no registry default to fall back on, so the
+                # wrong range is dropped rather than replaced with a guess.
+                {"name": "Zzzunregistered", "value": 1.0, "unit": "x",
+                 "reference_range": "7.0", "column_index": 1},
+            ],
+        }
+        self._extract(page)
+        findings = self._findings()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].action, "clear_ref_range")
+
+    # ── (3) several result columns → distinct measurement series ──────────
+    def test_multi_result_columns_create_distinct_series(self):
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name", "header": "Parameter"},
+                {"index": 1, "role": "result", "header": "02.05.2024"},
+                {"index": 2, "role": "result", "header": "09.05.2024"},
+                {"index": 3, "role": "reference", "header": "Referenz"},
+            ],
+            "entries": [
+                {"name": "H\u00e4moglobin", "value": 14.0, "unit": "g/dl",
+                 "reference_range": "14-18", "column_index": 1},
+                {"name": "H\u00e4moglobin", "value": 15.0, "unit": "g/dl",
+                 "reference_range": "14-18", "column_index": 2},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        # Both columns present → no missing-column finding, no swap finding.
+        self.assertEqual(self._findings(), [])
+
+        dps = self.session.query(database.DataPoint).order_by(
+            database.DataPoint.id).all()
+        self.assertEqual(len(dps), 2)
+        # Each value carries its own series identity (result date + header label).
+        self.assertEqual(dps[0].result_date, datetime(2024, 5, 2))
+        self.assertEqual(dps[1].result_date, datetime(2024, 5, 9))
+        self.assertEqual(dps[0].column_label, "02.05.2024")
+        self.assertEqual(dps[1].column_label, "09.05.2024")
+
+        report = self.session.query(database.Report).first()
+        extra = json.loads(report.result_dates)
+        self.assertEqual(sorted(extra), ["2024-05-02", "2024-05-09"])
+
+    def test_multi_result_column_missing_entry_flags_layout(self):
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "02.05.2024"},
+                {"index": 2, "role": "result", "header": "09.05.2024"},
+                {"index": 3, "role": "reference"},
+            ],
+            "entries": [
+                # Only one of the two result columns was read for this row.
+                {"name": "H\u00e4moglobin", "value": 14.0, "unit": "g/dl",
+                 "reference_range": "14-18", "column_index": 1},
+            ],
+        }
+        self._extract(page)
+        findings = self._findings()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].category, "column_layout")
+        self.assertEqual(findings[0].action, "acknowledge")
+
+    def test_entry_pointing_at_reference_column_flagged(self):
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                # column_index 2 is the reference column, not a result column —
+                # the stored "measurement" is really a reference value.
+                {"name": "H\u00e4moglobin", "value": 16.0, "unit": "g/dl",
+                 "reference_range": "14-18", "column_index": 2},
+            ],
+        }
+        self._extract(page)
+        findings = self._findings()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].category, "column_swap")
+        self.assertEqual(findings[0].action, "disable_value")
+
+    def test_no_declared_layout_degrades_to_flat(self):
+        """A model that returns no columns must not trigger layout checks — the
+        extractor falls back to the old flat behaviour instead of failing."""
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "entries": [
+                {"name": "H\u00e4moglobin", "value": 15.0, "unit": "g/dl",
+                 "reference_range": "14-18"},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        self.assertEqual(self._findings(), [])
+        self.assertEqual(self.session.query(database.DataPoint).count(), 1)
+
+    # ── (7) systematic value == reference bound (the low-res misread) ─────
+    def test_systematic_value_equals_ref_bound_creates_finding(self):
+        """The low-resolution misread signature: at too low a render resolution
+        the model reads the REFERENCE cell's first number as the measurement, so many rows have
+        ``value == ref_low``. Every individual row looks structurally valid
+        (bare number, proper range, correct column_index) — only the aggregate
+        is wrong, so checks (1)-(4) all miss it. Check (7) catches it."""
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "14.10.2026"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                # 6 rows: every stored value equals the lower bound of its own
+                # stored range — the misread reference cell's first number.
+                {"name": "H\u00e4moglobin", "value": 13.18, "unit": "g/dl",
+                 "reference_range": "13,18-14,81", "column_index": 1},
+                {"name": "MCV", "value": 77.0, "unit": "fl",
+                 "reference_range": "77,0-98,3", "column_index": 1},
+                {"name": "HCT", "value": 37.0, "unit": "%",
+                 "reference_range": "37,0-52,4", "column_index": 1},
+                {"name": "Erythrozyten", "value": 3.92, "unit": "mio/ul",
+                 "reference_range": "3,92-5,90", "column_index": 1},
+                # Two clean rows keep the fraction at 4/6 ≥ 0.3.
+                {"name": "Thrombozyten", "value": 216.0, "unit": "/ul",
+                 "reference_range": "173-390", "column_index": 1},
+                {"name": "Leukozyten", "value": 6.3, "unit": "/ul",
+                 "reference_range": "3.3-9.3", "column_index": 1},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        findings = self._findings()
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f.category, "column_swap")
+        self.assertEqual(f.action, "acknowledge")
+        self.assertIn("4 von 6", f.description)
+        # The flagged rows are the bound-matching ones, not the clean two.
+        ids = json.loads(f.data_point_ids)
+        self.assertEqual(len(ids), 4)
+        self.assertNotIn(None, ids, "flagged data points must have real ids")
+
+    def test_isolated_value_on_ref_bound_stays_silent(self):
+        """One value sitting exactly on a limit is ordinary — the check needs a
+        systematic pattern (count AND fraction), so a single coincidence must
+        not fire and cost the user a review click."""
+        page = {
+            "patient_name": "ColConf", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                {"name": "H\u00e4moglobin", "value": 12.0, "unit": "g/dl",
+                 "reference_range": "12-16", "column_index": 1},
+                {"name": "MCV", "value": 90.0, "unit": "fl",
+                 "reference_range": "77-98", "column_index": 1},
+                {"name": "HCT", "value": 44.0, "unit": "%",
+                 "reference_range": "37-52", "column_index": 1},
+                {"name": "Erythrozyten", "value": 4.8, "unit": "mio/ul",
+                 "reference_range": "3.9-5.9", "column_index": 1},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        self.assertEqual(self._findings(), [])
+
+
+class TestColumnFixActions(unittest.TestCase):
+    """The DB fix actions the column guards / verify auditor rely on:
+    ``set_value`` (value-only, keeps the range) and the relaxed
+    ``swap_value_ref_range`` (either half of the fix is valid on its own)."""
+
+    def setUp(self):
+        self.session = _fresh_db(f"colfix_{self._testMethodName}.db")
+        self.patient = database.get_or_create_patient(self.session, "ColFix")
+        report = database.Report(
+            patient_id=self.patient.id, filename="fix.pdf",
+            file_hash="fix_hash_1", report_date=datetime(2025, 1, 1),
+        )
+        self.session.add(report)
+        self.session.commit()
+        self.report = report
+
+    def tearDown(self):
+        self.session.close()
+
+    def _dp(self, name, value, unit, low=None, high=None):
+        dp = database.DataPoint(
+            report_id=self.report.id, canonical_name=name, original_name=name,
+            value=value, unit=unit, ref_low=low, ref_high=high,
+        )
+        self.session.add(dp)
+        self.session.commit()
+        return dp
+
+    def _finding(self, action, params, dp_ids):
+        f = database.DataQualityFinding(
+            patient_id=self.patient.id, category="column_swap",
+            target_type="data_point", biomarker="X",
+            data_point_ids=json.dumps(dp_ids), description="t",
+            action=action, params_json=json.dumps(params), status="pending",
+        )
+        self.session.add(f)
+        self.session.commit()
+        return f.id
+
+    def test_set_value_keeps_reference_range(self):
+        dp = self._dp("CRP", 5.2, "mg/l", low=None, high=5.0)
+        fid = self._finding("set_value", {"value": 3.1, "unit": "mg/l"}, [dp.id])
+        res = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(res["status"], "applied")
+        self.session.expire_all()
+        dp = self.session.get(database.DataPoint, dp.id)
+        self.assertEqual(dp.value, 3.1)
+        # The range was NOT disputed by the auditor — it must survive untouched.
+        self.assertIsNone(dp.ref_low)
+        self.assertEqual(dp.ref_high, 5.0)
+        # 3.1 is now within the one-sided bound → no longer abnormal.
+        self.assertFalse(dp.is_abnormal)
+
+    def test_swap_value_only_keeps_existing_range(self):
+        dp = self._dp("H\u00e4moglobin", 4.5, "g/dl", low=14.0, high=18.0)
+        # The auditor re-read only the correct measurement, no range restated.
+        fid = self._finding("swap_value_ref_range", {"value": 15.5}, [dp.id])
+        res = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(res["status"], "applied")
+        self.session.expire_all()
+        dp = self.session.get(database.DataPoint, dp.id)
+        self.assertEqual(dp.value, 15.5)
+        # A value-only swap must NOT wipe the existing reference range.
+        self.assertEqual(dp.ref_low, 14.0)
+        self.assertEqual(dp.ref_high, 18.0)
+
+    def test_swap_empty_params_rejected(self):
+        dp = self._dp("CRP", 5.2, "mg/l", low=None, high=5.0)
+        fid = self._finding("swap_value_ref_range", {}, [dp.id])
+        res = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(res["status"], "skipped")
+
+
+class TestVerifyExtraction(unittest.TestCase):
+    """The second-pass auditor job (verify_extraction): re-sends each report page
+    to the LLM and records disagreements as pending findings (source="verify"),
+    replacing prior verify findings while leaving extraction/check findings be."""
+
+    @classmethod
+    def setUpClass(cls):
+        from fpdf import FPDF
+        cls.pdf_dir = Path(tempfile.mkdtemp(prefix="bb_verify_"))
+        doc = FPDF(unit="pt", format="A4")
+        doc.add_page()
+        doc.set_font("Helvetica", size=12)
+        doc.set_xy(72, 72)
+        doc.cell(text="verify")
+        doc.output(str(cls.pdf_dir / "verify.pdf"))
+
+    def setUp(self):
+        import streamlit as st
+        st.session_state.llm_base_url = "http://test:8888/v1"
+        st.session_state.llm_api_key = "test-key"
+        st.session_state.llm_model = "test-model"
+        st.session_state.llm_timeout = 30
+        st.session_state.pdf_dpi = 150
+        st.session_state._bb_lang = "de"
+        self.session = _fresh_db(f"verify_{self._testMethodName}.db")
+        self.patient = database.get_or_create_patient(self.session, "VerifyPat")
+        # raw_text in the column-aware JSON shape the verify job can rebuild.
+        raw = {
+            "pages": [{
+                "columns": [
+                    {"index": 0, "role": "name"},
+                    {"index": 1, "role": "result"},
+                    {"index": 2, "role": "reference"},
+                ],
+                "entries": [
+                    {"name": "H\u00e4moglobin", "value": 4.5, "unit": "g/dl",
+                     "reference_range": "14-18", "column_index": 1},
+                    {"name": "CRP", "value": 5.2, "unit": "mg/l",
+                     "reference_range": "8.0", "column_index": 1},
+                ],
+            }]
+        }
+        self.report = database.Report(
+            patient_id=self.patient.id, filename="verify.pdf",
+            file_hash="verify_hash_1", report_date=datetime(2025, 1, 1),
+            raw_text=json.dumps(raw),
+        )
+        self.session.add(self.report)
+        self.session.flush()
+        # DataPoints in the same order as the page's non-empty entries.
+        self.dp_hb = database.DataPoint(
+            report_id=self.report.id, canonical_name="H\u00e4moglobin",
+            original_name="H\u00e4moglobin", value=4.5, unit="g/dl",
+            ref_low=14.0, ref_high=18.0,
+        )
+        self.dp_crp = database.DataPoint(
+            report_id=self.report.id, canonical_name="CRP",
+            original_name="CRP", value=5.2, unit="mg/l", ref_high=8.0,
+        )
+        self.session.add_all([self.dp_hb, self.dp_crp])
+        self.session.commit()
+
+    def tearDown(self):
+        self.session.close()
+
+    def _run_verify(self, problems):
+        import llm_jobs
+        from schemas import VerifyPageResult, VerifyProblem
+        result = VerifyPageResult(
+            problems=[VerifyProblem(**p) for p in problems])
+        with patch.object(config, "REPORTS_DIR", str(self.pdf_dir)), \
+             patch("pdf_processor.pdf_to_base64_jpeg", return_value=["fake_b64"]), \
+             patch.object(llm_jobs, "verify_page_extraction", return_value=result), \
+             patch.object(llm_jobs, "_build_client", return_value=_MockLLM("{}")):
+            return llm_jobs.submit_job(
+                "verify_extraction", "job_kind_verify_extraction",
+                params={"patient_id": self.patient.id},
+                runner=llm_jobs._run_job,
+            )
+
+    def _verify_findings(self):
+        return self.session.query(database.DataQualityFinding).filter(
+            database.DataQualityFinding.source == "verify").all()
+
+    def test_verify_records_swap_finding(self):
+        # The auditor re-read the correct measurement + range off the image.
+        job = self._run_verify([{
+            "entry_index": 0, "problem": "value_from_reference_column",
+            "value": "15.5", "reference_range": "14-18",
+            "evidence": "H\u00e4moglobin 15,5",
+        }])
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done")
+        findings = self._verify_findings()
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f.category, "column_swap")
+        self.assertEqual(f.source, "verify")
+        self.assertEqual(f.action, "swap_value_ref_range")
+        params = json.loads(f.params_json)
+        self.assertEqual(params["value"], 15.5)
+        self.assertEqual(params["low"], 14.0)
+        self.assertEqual(params["high"], 18.0)
+        # The finding targets the audited data point, not the other one.
+        self.assertEqual(json.loads(f.data_point_ids), [self.dp_hb.id])
+
+    def test_verify_value_only_becomes_set_value(self):
+        # Auditor supplies a corrected value but no range → set_value, not swap.
+        self._run_verify([{
+            "entry_index": 0, "problem": "value_from_reference_column",
+            "value": "15.5",
+        }])
+        findings = self._verify_findings()
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].action, "set_value")
+
+    def test_verify_is_idempotent(self):
+        problems = [{"entry_index": 0, "problem": "value_from_reference_column",
+                     "value": "15.5", "reference_range": "14-18"}]
+        self._run_verify(problems)
+        self.assertEqual(len(self._verify_findings()), 1)
+        self._run_verify(problems)
+        # Re-running replaces the prior verify findings, never piles up.
+        self.assertEqual(len(self._verify_findings()), 1)
+
+    def test_verify_leaves_extraction_findings_untouched(self):
+        # A deterministic extraction finding already targets the CRP row.
+        ext = database.DataQualityFinding(
+            patient_id=self.patient.id, category="column_swap",
+            target_type="data_point", biomarker="CRP",
+            report_id=self.report.id,
+            data_point_ids=json.dumps([self.dp_crp.id]),
+            description="ext", action="set_ref_range",
+            params_json=json.dumps({"high": 5.0, "unit": "mg/l"}),
+            source="extraction", status="pending",
+        )
+        self.session.add(ext)
+        self.session.commit()
+        # The auditor disputes the SAME CRP row → skipped (already flagged).
+        self._run_verify([{
+            "entry_index": 1, "problem": "reference_holds_result",
+        }])
+        self.session.expire_all()
+        # The extraction finding survives; no duplicate verify finding on it.
+        self.assertEqual(len(self._verify_findings()), 0)
+        kept = self.session.query(database.DataQualityFinding).filter(
+            database.DataQualityFinding.source == "extraction").all()
+        self.assertEqual(len(kept), 1)
+
+    def test_verify_skips_reports_without_json_raw_text(self):
+        # A pre-column report (old flat raw_text) has nothing to audit.
+        self.report.raw_text = "ExtractedPage(entries=[...])  # legacy repr"
+        self.session.commit()
+        job = self._run_verify([{"entry_index": 0, "problem": "layout_mismatch"}])
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done")
+        self.assertEqual(self._verify_findings(), [])
+
+
 class TestUiBehaviourAppTest(unittest.TestCase):
     """Behavioural UI tests: run the real app.py with Streamlit's AppTest against
     a temp DB and assert the rendered element tree. These cover the responsiveness
@@ -6722,6 +7323,32 @@ class TestUiBehaviourAppTest(unittest.TestCase):
         # A fully registered marker set must NOT trigger the warning.
         at2 = self._run_app()
         self._assert_clean(at2)
+
+    def test_column_swap_finding_and_verify_button_render(self):
+        """A pending column_swap finding (from the extractor's deterministic
+        checks or the verify auditor) must render in the Mapping tab with its
+        category label, and the second-pass audit button must be present so the
+        user can trigger a re-audit. Guards the whole column-confusion UI path
+        against a widget-level crash."""
+        p = self._seed_patient()
+        report = self.session.query(database.Report).filter(
+            database.Report.patient_id == p.id).first()
+        self.session.add(database.DataQualityFinding(
+            patient_id=p.id, category="column_swap", target_type="report",
+            biomarker="H\u00e4moglobin", report_id=report.id,
+            description="Wert aus der Referenzspalte gelesen",
+            action="acknowledge", params_json="{}", source="extraction",
+            status="pending",
+        ))
+        self.session.commit()
+        at = self._run_app()
+        self._assert_clean(at)
+        # The verify (second-pass audit) button is rendered.
+        labels = " || ".join(b.label for b in at.button)
+        self.assertIn("Spaltenzuordnung", labels)
+        # The finding's category label reaches the view.
+        markdowns = " || ".join(m.value for m in at.markdown)
+        self.assertIn("Spaltenvertauschung", markdowns)
 
     # ── widget identity (selection survives unrelated reruns) ────────────────
 
@@ -6982,6 +7609,10 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestChatWithData))
     suite.addTests(loader.loadTestsFromTestCase(TestChatPersistence))
     suite.addTests(loader.loadTestsFromTestCase(TestSummaryCardRendering))
+    suite.addTests(loader.loadTestsFromTestCase(TestColumnConfusion))
+    suite.addTests(loader.loadTestsFromTestCase(TestColumnFixActions))
+    suite.addTests(loader.loadTestsFromTestCase(TestVerifyExtraction))
+    suite.addTests(loader.loadTestsFromTestCase(TestRenderScale))
     suite.addTests(loader.loadTestsFromTestCase(TestUiBehaviourAppTest))
 
     runner = unittest.TextTestRunner(verbosity=2)

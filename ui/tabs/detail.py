@@ -29,6 +29,33 @@ def _artifact_category_label(category: str, de: bool) -> str:
     return f"{icon} {de_label if de else en_label}"
 
 
+def _series_labels(dps) -> dict:
+    """dp.id → display label for its result series, or {} for a single-series report.
+
+    A report with one result column (the overwhelmingly common case) yields an
+    empty dict, so the Detail table keeps its old shape. When a PDF carried
+    several result columns, each measurement is tagged with its series' date
+    (or column header) so the repeated marker rows can be told apart.
+    """
+    series = {(dp.result_date, dp.column_label) for dp in dps}
+    if len(series) <= 1:
+        return {}
+
+    def base(rdate, label):
+        if rdate is not None:
+            return rdate.strftime("%d.%m.%Y")
+        return label or "—"
+
+    seen: dict[str, int] = {}
+    label_of: dict[tuple, str] = {}
+    for rdate, clabel in sorted(series, key=lambda s: (s[0] is None, s[0], s[1] or "")):
+        b = base(rdate, clabel)
+        n = seen.get(b, 0) + 1
+        seen[b] = n
+        label_of[(rdate, clabel)] = b if n == 1 else f"{b} ({n})"
+    return {dp.id: label_of[(dp.result_date, dp.column_label)] for dp in dps}
+
+
 def render_detail_tab(session, patient, patient_reports):
     # Confirmation for the last enable/disable toggle (queued via _flash on
     # the run where the checkbox was flipped; that run ends in st.rerun()).
@@ -57,6 +84,10 @@ def render_detail_tab(session, patient, patient_reports):
             c_status, c_marker, c_value = t("col_status"), t("col_marker"), t("col_value")
             c_reference, c_original, c_active = (
                 t("col_reference"), t("col_original"), t("col_active"))
+            # A PDF with several result columns repeats every marker once per
+            # series; only then is a series column needed to tell the rows apart.
+            series_labels = _series_labels(dps_detail)
+            c_series = t("col_series") if series_labels else None
             rows = []
             for dp in dps_detail:
                 ref_str = (
@@ -81,9 +112,11 @@ def render_detail_tab(session, patient, patient_reports):
                     c_marker: marker_name,
                     c_value: value_str,
                     c_reference: ref_str,
-                    c_original: original,
-                    c_active: not dp.is_disabled,
                 })
+                if c_series:
+                    rows[-1][c_series] = series_labels.get(dp.id, "")
+                rows[-1][c_original] = original
+                rows[-1][c_active] = not dp.is_disabled
             df = pd.DataFrame(rows)
 
             # Snapshot of the enabled state from the previous run, keyed by
@@ -104,6 +137,8 @@ def render_detail_tab(session, patient, patient_reports):
                     c_marker: st.column_config.TextColumn(disabled=True),
                     c_value: st.column_config.TextColumn(disabled=True),
                     c_reference: st.column_config.TextColumn(disabled=True),
+                    **({c_series: st.column_config.TextColumn(disabled=True)}
+                       if c_series else {}),
                     c_original: st.column_config.TextColumn(disabled=True),
                 },
             )

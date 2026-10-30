@@ -33,7 +33,7 @@ def render_llm_settings_tab(session):
     # No `index=` — the session-state keys are initialized in app.py and take
     # precedence; passing both triggers Streamlit's "default + session state" warning.
     dpi_options = [75, 100, 125, 150, 200]
-    st.selectbox("DPI", options=dpi_options, format_func=lambda x: f"{x} {'(default)' if x == 150 else ''}", key="pdf_dpi")
+    st.selectbox("DPI", options=dpi_options, format_func=lambda x: f"{x} {'(default)' if x == 200 else ''}", key="pdf_dpi")
 
     # 0 = every page of a report in ONE call ("one report = one LLM call").
     # Measured on the local endpoint this is both faster and safer than

@@ -160,6 +160,11 @@ class Report(Base):
     report_date = Column(DateTime, nullable=True)
     panel_type = Column(String(255), nullable=True)
     raw_text = Column(Text, nullable=True)
+    # JSON list of the extra measurement series this report carries, i.e. the
+    # result columns whose header was a date and which therefore have their own
+    # ``DataPoint.result_date``. A plain single-column report has none, so this
+    # stays null — the Reports tab uses it to show a "N Messreihen" badge.
+    result_dates = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     patient = relationship("Patient", back_populates="reports")
@@ -183,6 +188,17 @@ class DataPoint(Base):
     ref_low = Column(Float, nullable=True)
     ref_high = Column(Float, nullable=True)
     is_abnormal = Column(Boolean, default=False)
+    # Which measurement series this value belongs to when ONE report printed
+    # several result columns (e.g. two draw dates on one page). Null for the
+    # common single-column report, so existing data and every single-series
+    # consumer keep working unchanged. Without it, two values of the same marker
+    # in one report collapse into each other in the All-Values matrix (the
+    # (marker, unit, date) key is overwritten) and one measurement is lost.
+    result_date = Column(DateTime, nullable=True)
+    # The printed header of the result column this value came from
+    # ("02.05.2024", "lying", …) — kept verbatim so the user can always tell
+    # which column a value was read from, even when the header is not a date.
+    column_label = Column(String(120), nullable=True)
     # Disabled values are excluded from all charts and LLM analyses
     # (e.g. measurements distorted by medical procedures).
     is_disabled = Column(Boolean, default=False)
@@ -361,6 +377,12 @@ class DataQualityFinding(Base):
     description = Column(Text, nullable=False)  # human-readable explanation (translated at creation)
     action = Column(String(50), nullable=True)  # machine-applicable fix, e.g. set_ref_range | set_unit | disable_value | registry_ref_range | ...
     params_json = Column(Text, nullable=True)  # JSON params for the fix (e.g. {"low":..,"high":..,"unit":..})
+    # Who produced the finding: "check" = the on-demand data-quality check,
+    # "extraction" = the deterministic column-confusion guards inside
+    # process_new_pdfs. The check re-run clears a patient's findings before
+    # storing fresh ones, and must NOT wipe findings that extraction created —
+    # they belong to a report, not to that check.
+    source = Column(String(20), nullable=False, default="check")
     status = Column(String(20), nullable=False, default="pending", index=True)  # pending|applied|dismissed
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -460,6 +482,7 @@ def init_db():
     _migrate_clean_unit_whitespace(engine)
     _migrate_chat_conversations(engine)
     _migrate_report_artifacts(engine)
+    _migrate_data_point_result_columns(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -607,6 +630,17 @@ def _migrate_data_quality_findings(engine):
     tables = inspector.get_table_names()
     if "data_quality_findings" not in tables:
         DataQualityFinding.__table__.create(engine)
+        return
+    columns = [c["name"] for c in inspector.get_columns("data_quality_findings")]
+    if "source" not in columns:
+        # NOT NULL with a DEFAULT so existing rows (all produced by the
+        # on-demand check) become 'check' rather than NULL.
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE data_quality_findings ADD COLUMN source VARCHAR(20) "
+                "NOT NULL DEFAULT 'check'"
+            ))
+            conn.commit()
 
 
 def _migrate_patient_demographics(engine):
@@ -783,6 +817,34 @@ def _migrate_report_artifacts(engine):
     inspector = inspect(engine)
     if "report_artifacts" not in inspector.get_table_names():
         ReportArtifact.__table__.create(engine)
+
+
+def _migrate_data_point_result_columns(engine):
+    """Add the multi-result-column fields to data_points / reports.
+
+    A lab report can print several result columns (one per draw date, or a
+    lying/standing pair) plus one reference column. Before these columns existed
+    such a report collapsed into a single series and the All-Values matrix
+    silently kept only the last value per marker. All three columns are nullable,
+    so a single-column report (the overwhelming majority, and every existing
+    row) is unaffected.
+    """
+    inspector = inspect(engine)
+    dp_columns = [c["name"] for c in inspector.get_columns("data_points")]
+    r_columns = [c["name"] for c in inspector.get_columns("reports")]
+    ddls = [
+        ddl for ddl, existing in (
+            ("ALTER TABLE data_points ADD COLUMN result_date DATETIME", dp_columns),
+            ("ALTER TABLE data_points ADD COLUMN column_label VARCHAR(120)", dp_columns),
+            ("ALTER TABLE reports ADD COLUMN result_dates TEXT", r_columns),
+        )
+        if ddl.split()[5] not in existing
+    ]
+    if ddls:
+        with engine.connect() as conn:
+            for ddl in ddls:
+                conn.execute(text(ddl))
+            conn.commit()
 
 
 # ── Registry loader (cached) ─────────────────────────────────────────────────
@@ -2342,14 +2404,20 @@ def get_data_quality_findings(
     return q.order_by(DataQualityFinding.id).all()
 
 
-def clear_patient_data_quality_findings(session: SASession, patient_id: int) -> int:
-    """Delete ALL findings for a patient (used before re-running the check so
-    stale findings from a previous run don't linger)."""
-    n = (
-        session.query(DataQualityFinding)
-        .filter(DataQualityFinding.patient_id == patient_id)
-        .delete(synchronize_session=False)
-    )
+def clear_patient_data_quality_findings(session: SASession, patient_id: int, source: str | None = "check") -> int:
+    """Delete a patient's findings (used before re-running the check so stale
+    findings from a previous run don't linger).
+
+    ``source`` scopes the delete: the on-demand check clears only its own
+    findings (``"check"``) and leaves the column-confusion findings that
+    extraction produced (``"extraction"``) alone — those belong to a report, and
+    re-running the quality check must not silently discard them. Pass ``None``
+    to clear every finding for the patient.
+    """
+    q = session.query(DataQualityFinding).filter(DataQualityFinding.patient_id == patient_id)
+    if source:
+        q = q.filter(DataQualityFinding.source == source)
+    n = q.delete(synchronize_session=False)
     if n:
         session.commit()
     return n
@@ -2488,6 +2556,79 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
             dp.is_disabled = True
             session.query(RiskFlag).filter(RiskFlag.data_point_id == dp.id).delete()
         return True, f"{len(dps)} value(s) disabled"
+
+    if action == "set_value":
+        # The second-pass auditor re-read the measurement off the correct column
+        # and supplied it, without disputing the reference range. Only the value
+        # changes; the stored bounds stay. (A value/reference swap that also
+        # re-states the range uses swap_value_ref_range instead.)
+        value = params.get("value")
+        if value is None:
+            return False, "no value provided"
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return False, "value is not a number"
+        for dp in dps:
+            dp.value = value
+            _recompute_abnormal(dp)
+        return True, f"{len(dps)} value(s) corrected"
+
+    if action == "clear_ref_range":
+        # A reference range that turned out to be a stray measurement (or a
+        # degenerate single-point range) with no usable registry default to
+        # replace it with: drop the bounds rather than keep a wrong range. The
+        # measured value is untouched; abnormality is recomputed (no bounds →
+        # not abnormal, exactly like a report that printed no range at all).
+        for dp in dps:
+            dp.ref_low = None
+            dp.ref_high = None
+            dp.is_abnormal = False
+        return True, f"{len(dps)} reference range(s) cleared"
+
+    if action == "swap_value_ref_range":
+        # Undo a value/reference column mix-up: the stored bounds are replaced by
+        # the range that was misread as the measurement, and the number that was
+        # sitting in the reference field becomes the measurement. Fully determined
+        # by the finding's params, so no unit conversion is attempted — the range
+        # and the value came off the same printed row and share its unit.
+        #
+        # The second-pass auditor (verify job) may supply only a corrected value
+        # (the printed measurement, read off the right column) without re-stating
+        # the range, or only a corrected range without a value — either half is a
+        # valid fix on its own, so the guard rejects only an entirely empty fix.
+        low = params.get("low")
+        high = params.get("high")
+        value = params.get("value")
+        if low is None and high is None and value is None:
+            return False, "no reference range bounds or value provided"
+        unit = clean_unit(str(params.get("unit", "") or "")) or ""
+        import config as _config
+        updated = 0
+        for dp in dps:
+            if low is not None or high is not None:
+                # The fix restates the reference range, so swap it in. When the
+                # proposed range was printed in a different unit than this point,
+                # convert it (name-aware) rather than stamping a wrong-unit range.
+                if unit and dp.unit and normalize_unit(unit) != normalize_unit(dp.unit):
+                    c_low, c_high = _config._convert_ref_range(
+                        dp.canonical_name, low, high, unit, dp.unit
+                    )
+                    if c_low is None and c_high is None:
+                        continue
+                else:
+                    c_low, c_high = low, high
+                dp.ref_low = float(c_low) if c_low is not None else None
+                dp.ref_high = float(c_high) if c_high is not None else None
+            # A value-only fix (auditor re-read the correct measurement) must keep
+            # the existing range untouched — only restate the bounds when given.
+            if value is not None:
+                dp.value = float(value)
+            _recompute_abnormal(dp)
+            updated += 1
+        if not updated:
+            return False, "no data point could be updated (unsupported unit conversion?)"
+        return True, f"{updated} data point(s) updated"
 
     return False, f"unknown action '{action}'"
 

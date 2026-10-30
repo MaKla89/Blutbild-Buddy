@@ -7,7 +7,7 @@ from PIL import Image
 
 from config import get_unsloth_base_url, get_unsloth_model, get_unsloth_api_key, get_llm_timeout, _CANONICAL_BIOMARKERS
 from pdf_processor import image_to_base64_jpeg
-from schemas import ExtractedPage, NormalizationMapping
+from schemas import ExtractedPage, NormalizationMapping, VerifyPageResult
 from translations import _get_lang
 
 # ── Rate limiting ─────────────────────────────────────────────────────────────
@@ -89,11 +89,49 @@ def _strip_markdown_json(text: str) -> str:
 
 EXTRACTION_SYSTEM_PROMPT = """You are a medical data extraction assistant. Your task is to extract structured data from lab report PDF page images.
 
-Look at the image carefully and extract ALL test results visible. For each test, provide:
+STEP 1 — TABLE LAYOUT (do this BEFORE reading any row):
+Lab reports are tables. Mis-reading which column is which is the single most
+common extraction error, so first establish the layout and write it into "columns":
+- List EVERY column of the results table, left to right, with its 0-based "index"
+  and its header text exactly as printed.
+- Give every column exactly one "role":
+  "name"      the test/parameter name column
+  "result"    a column holding measured values
+  "reference" the column holding reference ranges
+  "unit"      a column holding measurement units
+  "flag"      an arrow/abnormality marker column
+  "other"     anything else (method, instrument, ...)
+- A table has AT MOST ONE "reference" column.
+- There can be SEVERAL "result" columns in one report — typically one per draw
+  date ("02.05.2024", "14.08.2024"), or a "lying / standing" pair. Declare each
+  one separately, and set "result_date" (YYYY-MM-DD) on a result column whose
+  header is a date.
+- Count the result columns. That count tells you how many entries each row
+  should produce.
+
+STEP 2 — ROWS: read the table cell by cell, row by row. For each test provide:
 - name (the test name exactly as printed)
-- value (numeric value — if the value is a non-numeric result like "negativ" or "nicht erhöht" set value to null)
+- value (numeric value from a "result" column — if the value is a non-numeric
+  result like "negativ" or "nicht erhöht" set value to null)
 - unit (measurement unit, e.g. g/dl, U/l, mmol/l)
 - reference_range (the reference range exactly as printed, e.g. "4.2-6.1" or "< 5.2" or "negativ")
+- column_index (the "index" of the "result" column this value was read from —
+  REQUIRED whenever you declared columns; one entry per result column per row)
+
+THE REFERENCE COLUMN MUST NEVER BE MIXED UP WITH A RESULT COLUMN:
+- reference_range comes ONLY from the column whose role is "reference".
+- NEVER put a reference value into "value", and NEVER put a measurement into
+  "reference_range".
+- A reference cell is a RANGE ("4.2-6.1", "120 - 200"), a one-sided bound
+  ("< 5.2", "> 120") or a qualitative word ("negativ"). A result cell is a
+  single number. If a "reference" cell contains a single number that equals the
+  result, you have almost certainly read the wrong column — re-read the row.
+- If you cannot tell which column is the reference column, set reference_range
+  to null. A missing range is recoverable; a swapped one is a wrong diagnosis.
+
+STEP 3 — SELF-CHECK before answering: for every row, the number of entries must
+equal the number of result columns you declared, and every entry's
+column_index must be one of them. If not, re-read that row.
 
 Also extract:
 - patient_name (full name of the patient from the report header)
@@ -107,15 +145,52 @@ Also extract NON-NUMERIC findings from the report's WRITTEN TEXT (not the numeri
 Return an empty "artifacts" list if the report contains no such written-text findings.
 
 Return ONLY valid JSON matching this structure, no markdown or explanation:
-{"patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null"}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}"""
+{"patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "columns": [{"index": 0, "header": "...", "role": "name", "result_date": null}, {"index": 1, "header": "02.05.2024", "role": "result", "result_date": "2024-05-02"}, {"index": 2, "header": "Referenzbereich", "role": "reference", "result_date": null}], "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null", "column_index": 1}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}"""
 
 EXTRACTION_SYSTEM_PROMPT_BATCH = """You are a medical data extraction assistant. Your task is to extract structured data from lab report PDF page images. You will receive multiple page images in a single request.
 
-For EACH page image, extract ALL test results visible. For each test, provide:
+For EACH page image, follow the same three steps.
+
+STEP 1 — TABLE LAYOUT (before reading any row). Establish the layout of that
+page's results table and write it into "columns":
+- List EVERY column, left to right, with its 0-based "index" and its header text
+  exactly as printed.
+- Give every column exactly one "role": "name" (the test/parameter column),
+  "result" (holds measured values), "reference" (holds reference ranges),
+  "unit" (holds units), "flag" (arrow/abnormality markers), "other".
+- A table has AT MOST ONE "reference" column.
+- There can be SEVERAL "result" columns in one report — typically one per draw
+  date ("02.05.2024", "14.08.2024"), or a "lying / standing" pair. Declare each
+  one separately, and set "result_date" (YYYY-MM-DD) on a result column whose
+  header is a date.
+- Count the result columns. That count tells you how many entries each row
+  should produce.
+- Declare the layout per page: different pages of one report can be laid out
+  differently.
+
+STEP 2 — ROWS: read that page's table cell by cell, row by row. For each test provide:
 - name (the test name exactly as printed)
-- value (numeric value — if the value is a non-numeric result like "negativ" or "nicht erhöht" set value to null)
+- value (numeric value from a "result" column — if the value is a non-numeric
+  result like "negativ" or "nicht erhöht" set value to null)
 - unit (measurement unit, e.g. g/dl, U/l, mmol/l)
 - reference_range (the reference range exactly as printed, e.g. "4.2-6.1" or "< 5.2" or "negativ")
+- column_index (the "index" of the "result" column this value was read from —
+  REQUIRED whenever you declared columns; one entry per result column per row)
+
+THE REFERENCE COLUMN MUST NEVER BE MIXED UP WITH A RESULT COLUMN:
+- reference_range comes ONLY from the column whose role is "reference".
+- NEVER put a reference value into "value", and NEVER put a measurement into
+  "reference_range".
+- A reference cell is a RANGE ("4.2-6.1", "120 - 200"), a one-sided bound
+  ("< 5.2", "> 120") or a qualitative word ("negativ"). A result cell is a
+  single number. If a "reference" cell contains a single number that equals the
+  result, you have almost certainly read the wrong column — re-read the row.
+- If you cannot tell which column is the reference column, set reference_range
+  to null. A missing range is recoverable; a swapped one is a wrong diagnosis.
+
+STEP 3 — SELF-CHECK per page: for every row, the number of entries must equal
+the number of result columns you declared for that page, and every entry's
+column_index must be one of them. If not, re-read that row.
 
 Also extract for each page:
 - patient_name (full name of the patient from the report header)
@@ -130,7 +205,27 @@ Also extract NON-NUMERIC findings from each page's WRITTEN TEXT (not the numeric
 Return an empty "artifacts" list for a page with no such findings.
 
 Return ONLY valid JSON matching this structure, no markdown or explanation:
-{"pages": [{"page_index": 0, "patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null"}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}]}"""
+{"pages": [{"page_index": 0, "patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "columns": [{"index": 0, "header": "...", "role": "name", "result_date": null}, {"index": 1, "header": "02.05.2024", "role": "result", "result_date": "2024-05-02"}, {"index": 2, "header": "Referenzbereich", "role": "reference", "result_date": null}], "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null", "column_index": 1}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}]}"""
+
+# Second pass over an already-extracted page: the model sees the page image
+# AGAIN plus its own previous output and only has to judge whether each value
+# came from the right column. Narrower than a fresh extraction (no re-reading of
+# names/units), so it stays cheap, and it never rewrites data by itself — every
+# disagreement becomes a DataQualityFinding the user accepts or dismisses.
+VERIFY_EXTRACTION_SYSTEM_PROMPT = """You are a medical data extraction auditor. You receive ONE lab report page image and the JSON that a previous extraction pass produced for that page. Your ONLY job is to check that each entry's "value" was read from the correct column.
+
+Check, in this order:
+1. LAYOUT: does the declared "columns" list match the table actually printed on the page — same number of columns, same roles? Is there exactly one "reference" column? If the page has several result columns (e.g. several draw dates), are all of them declared?
+2. SWAP: for each entry, is "value" a measurement from a "result" column, or did it come from the "reference" column? A reference cell is a range ("4.2-6.1"), a one-sided bound ("< 5.2") or a qualitative word; a result cell is a single number. An entry whose value equals its own reference bound, or whose reference_range is a single bare number, is a swap.
+3. WRONG RESULT COLUMN: with several result columns, is each entry attached to the right column_index (the value really sits under that header)?
+4. MISSING: does a row have fewer entries than the page has result columns, i.e. was a result column dropped?
+
+Be conservative. Report only problems you are sure about from the image; if the image is unclear, do not report anything for that entry. Do NOT correct names, units or spelling, and do NOT re-extract the table.
+
+Return ONLY valid JSON, no markdown or explanation:
+{"columns_ok": true or false, "columns": [{"index": 0, "header": "...", "role": "name|result|reference|unit|flag|other", "result_date": "YYYY-MM-DD or null"}], "problems": [{"entry_index": 0, "problem": "value_from_reference_column" | "reference_holds_result" | "wrong_result_column" | "missing_result_column" | "layout_mismatch", "value": "the correct value for this entry, exactly as printed, or null if unknown", "reference_range": "the correct reference range exactly as printed, or null if unknown", "column_index": 1, "evidence": "short quote of the row as printed"}]}
+"entry_index" is the 0-based position of the entry in the "entries" array you were given. Return {"columns_ok": true, "columns": [], "problems": []} when the page is correct."""
+
 
 NORMALIZATION_SYSTEM_PROMPT = """You are a medical terminology normalization assistant. You will be given a list of extracted biomarker entries (name plus measurement unit where known) from lab reports and a canonical registry of standard biomarkers.
 
@@ -339,6 +434,57 @@ def extract_page(llm: OpenAI, page_image: Image.Image | str, quality: int = 75) 
         raise LLMResponseError(f"LLM returned invalid JSON for page extraction: {e}\nResponse snippet: {raw[:200]}")
     except Exception as e:
         raise LLMResponseError(f"LLM response parsing failed for page extraction: {e}\nResponse snippet: {raw[:200]}")
+
+
+def verify_page_extraction(llm: OpenAI, page_image: Image.Image | str, page: ExtractedPage, quality: int = 75) -> VerifyPageResult:
+    """Audit an ALREADY extracted page for column mix-ups (second LLM pass).
+
+    The page image is sent again together with the previous pass's own JSON
+    (declared layout + entries), and the model only has to judge whether each
+    value came from the right column. Narrower than a fresh extraction, so it
+    stays cheap. The result is NEVER applied automatically — the caller turns
+    every problem into a DataQualityFinding the user accepts or dismisses.
+    """
+    if isinstance(page_image, str):
+        b64 = page_image
+    else:
+        b64 = image_to_base64_jpeg(page_image, quality=quality)
+
+    payload = json.dumps(
+        {"columns": [c.model_dump() for c in page.columns],
+         "entries": [e.model_dump() for e in page.entries]},
+        ensure_ascii=False,
+    )
+    user_text = (
+        "Previous extraction result for this page (JSON):\n" + payload +
+        "\n\nAudit it against the image and return the JSON described in the system prompt."
+    )
+
+    with _llm_semaphore:
+        resp = llm.chat.completions.create(
+            model=_get_model(),
+            messages=[
+                {"role": "system", "content": VERIFY_EXTRACTION_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.0,
+            timeout=_abort_timeout() or _get_timeout(),
+        )
+        raw = _strip_markdown_json(resp.choices[0].message.content or "")
+    try:
+        return VerifyPageResult(**json.loads(raw))
+    except json.JSONDecodeError as e:
+        raise LLMResponseError(f"LLM returned invalid JSON for page verification: {e}\nResponse snippet: {raw[:200]}")
+    except Exception as e:
+        raise LLMResponseError(f"LLM response parsing failed for page verification: {e}\nResponse snippet: {raw[:200]}")
+
 
 
 def normalize_names(llm: OpenAI, extracted_names: list[dict] | list[str], canonical_list: list[str] | None = None, registry: dict | None = None) -> NormalizationMapping:

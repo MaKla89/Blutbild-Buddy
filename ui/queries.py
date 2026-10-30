@@ -28,6 +28,7 @@ combined.
 """
 
 from collections import namedtuple
+from datetime import datetime
 
 import streamlit as st
 from sqlalchemy import func, text
@@ -38,7 +39,8 @@ from database import DataPoint, Report, RiskFlag, commit_version, get_session
 ReportRow = namedtuple("ReportRow", "id filename report_date panel_type")
 ValueRow = namedtuple(
     "ValueRow",
-    "id report_id canonical_name original_name value unit ref_low ref_high is_abnormal is_disabled",
+    "id report_id canonical_name original_name value unit ref_low ref_high is_abnormal "
+    "is_disabled column_label result_date",
 )
 SeriesRow = namedtuple(
     "SeriesRow", "report_date value unit ref_low ref_high is_abnormal",
@@ -185,7 +187,8 @@ def _patient_values(token, patient_id: int):
     with get_session() as s:
         return [
             ValueRow(dp.id, dp.report_id, dp.canonical_name, dp.original_name, dp.value,
-                     dp.unit, dp.ref_low, dp.ref_high, dp.is_abnormal, dp.is_disabled)
+                     dp.unit, dp.ref_low, dp.ref_high, dp.is_abnormal, dp.is_disabled,
+                     dp.column_label, dp.result_date)
             for dp in s.query(DataPoint)
             .join(Report)
             .filter(Report.patient_id == patient_id, DataPoint.is_disabled == False)  # noqa: E712
@@ -203,10 +206,15 @@ def _report_values(token, report_id: int):
     with get_session() as s:
         return [
             ValueRow(dp.id, dp.report_id, dp.canonical_name, dp.original_name, dp.value,
-                     dp.unit, dp.ref_low, dp.ref_high, dp.is_abnormal, dp.is_disabled)
+                     dp.unit, dp.ref_low, dp.ref_high, dp.is_abnormal, dp.is_disabled,
+                     dp.column_label, dp.result_date)
             for dp in s.query(DataPoint)
             .filter(DataPoint.report_id == report_id)
-            .order_by(DataPoint.canonical_name)
+            # Marker first, then the result series: a report with several result
+            # columns repeats each marker once per series, and the Detail editor
+            # diffs rows by position, so the order must be stable.
+            .order_by(DataPoint.canonical_name, DataPoint.result_date,
+                      DataPoint.column_label, DataPoint.id)
             .all()
         ]
 
@@ -248,35 +256,72 @@ def biomarker_series(patient_id: int, cname, unit) -> list:
 
 @st.cache_data(max_entries=32, show_spinner=False)
 def _matrix_rows(token, patient_id: int):
-    """Flat (marker, unit, date, value, disabled) rows for the All-Values matrix.
+    """Value/disabled/ref lookups + matrix columns for the All-Values grid.
 
-    Also yields the latest reference range per (marker, unit): walking the rows
-    in date order and overwriting gives the newest range in one query instead of
-    one query per marker (the old N+1 loop).
+    A report can carry several result columns (``DataPoint.result_date`` /
+    ``column_label``), e.g. two blood draws in one PDF, and two reports can even
+    share a date. The old ``(cname, unit, report_date)`` key silently overwrote
+    one measurement when two landed on the same cell. Here every measurement is
+    placed in a *column slot* unique to its report — ``col_key = (report_id,
+    slot)`` where ``slot`` is the ordinal of the measurement's result series
+    (``(result_date, column_label)``) within that report — so nothing collides.
+
+    Column labels are the series' own date when it has one, otherwise the report
+    date; when several columns would share a label they get a `` (2)``, `` (3)``
+    suffix in date order. Returns ``(lookup, disabled_lookup, ref_lookup,
+    columns, labels)`` where ``columns`` is the ordered list of ``col_key`` and
+    ``labels`` maps each ``col_key`` to its display string.
     """
     with get_session() as s:
         rows = (
-            s.query(DataPoint.canonical_name, DataPoint.unit, Report.report_date,
+            s.query(DataPoint.canonical_name, DataPoint.unit, Report.id,
+                    Report.report_date, DataPoint.result_date, DataPoint.column_label,
                     DataPoint.value, DataPoint.is_disabled,
                     DataPoint.ref_low, DataPoint.ref_high)
             .join(Report)
             .filter(Report.patient_id == patient_id, DataPoint.value.isnot(None))
-            .order_by(Report.report_date)
+            .order_by(Report.report_date, Report.id)
             .all()
         )
+
+    # Assign each report's distinct result series a stable slot ordinal.
+    series_by_report: dict[int, set] = {}
+    for _c, _u, rid, _rd, rdate, clabel, *_ in rows:
+        series_by_report.setdefault(rid, set()).add((rdate, clabel))
+    slot_by_report = {
+        rid: {series: i for i, series in enumerate(sorted(
+            series, key=lambda x: (x[0] is None, x[0] or datetime.min, x[1] or "")))}
+        for rid, series in series_by_report.items()
+    }
+
     lookup = {}
     disabled_lookup = {}
     ref_lookup = {}
-    for cname, unit, rdate, value, is_dis, ref_low, ref_high in rows:
-        key = (cname, unit, rdate)
-        lookup[key] = value
-        disabled_lookup[key] = bool(is_dis)
+    col_base: dict[tuple, datetime] = {}  # col_key -> date used for its label
+    for cname, unit, rid, rdate, result_date, clabel, value, is_dis, ref_low, ref_high in rows:
+        if rdate is None:
+            continue  # undated report — no matrix column to place it in
+        slot = slot_by_report[rid][(result_date, clabel)]
+        col_key = (rid, slot)
+        lookup[(cname, unit, col_key)] = value
+        disabled_lookup[(cname, unit, col_key)] = bool(is_dis)
+        col_base.setdefault(col_key, result_date or rdate)
         ref_lookup[(cname, unit)] = (ref_low, ref_high)
-    return lookup, disabled_lookup, ref_lookup
+
+    columns = sorted(col_base, key=lambda k: (col_base[k], k[0], k[1]))
+    # Deduplicate labels: identical base dates get a " (2)"-style suffix in order.
+    labels: dict[tuple, str] = {}
+    seen: dict[str, int] = {}
+    for col_key in columns:
+        base = col_base[col_key].strftime("%d.%m.%Y")
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        labels[col_key] = base if n == 1 else f"{base} ({n})"
+    return lookup, disabled_lookup, ref_lookup, columns, labels
 
 
 def measurement_matrix(patient_id: int):
-    """(value lookup, disabled lookup, latest ref-range lookup) for All-Values."""
+    """(value, disabled, ref lookups, ordered columns, col_key→label) for All-Values."""
     return _matrix_rows(cache_token(), patient_id)
 
 

@@ -50,16 +50,17 @@ from llm_client import (
     generate_biomarker_interpretation,
     run_biomarker_quality_check, run_duplicate_check,
     is_job_aborted, request_job_abort, set_current_job_id, clear_job_abort,
-    chat_with_data,
+    chat_with_data, verify_page_extraction,
 )
 from analyzer import refresh_risk_flags
-from extractor import process_new_pdfs
+from extractor import process_new_pdfs, _parse_reference_range
+from schemas import ExtractedPage, TableColumn, BiomarkerEntry
 from translations import t, _get_lang
 
 # Kinds that mutate data the main tabs render — when one of these finishes,
 # the UI requests a full app rerun so the new data is picked up.
 DATA_AFFECTING_KINDS = {
-    "process_pdfs", "reprocess_pdfs", "refresh_risks", "regen_summary",
+    "process_pdfs", "reprocess_pdfs", "verify_extraction", "refresh_risks", "regen_summary",
     "bulk_descriptions", "bulk_interpretations", "backfill",
     "data_quality_check", "gen_description", "gen_interpretation",
 }
@@ -94,7 +95,7 @@ def _capture_config_snapshot() -> dict:
         "api_key": st.session_state.get("llm_api_key"),
         "model": st.session_state.get("llm_model"),
         "timeout": st.session_state.get("llm_timeout"),
-        "dpi": st.session_state.get("pdf_dpi", 150),
+        "dpi": st.session_state.get("pdf_dpi", 200),
         "batch_size": st.session_state.get("pdf_batch_size", 0),
         "lang": _get_lang(),
     }
@@ -430,6 +431,7 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
             "panel_type": r.panel_type,
             "file_hash": r.file_hash,
             "raw_text": r.raw_text,
+            "result_dates": r.result_dates,
             "dps": [
                 (dp.original_name or "", dp.unit or "", dp.canonical_name,
                  dp.value, dp.ref_low, dp.ref_high)
@@ -441,7 +443,8 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
                 {"original_name": dp.original_name, "canonical_name": dp.canonical_name,
                  "value": dp.value, "unit": dp.unit, "ref_low": dp.ref_low,
                  "ref_high": dp.ref_high, "is_abnormal": dp.is_abnormal,
-                 "is_disabled": dp.is_disabled}
+                 "is_disabled": dp.is_disabled,
+                 "result_date": dp.result_date, "column_label": dp.column_label}
                 for dp in dps
             ],
             "artifacts": [
@@ -514,6 +517,7 @@ def _restore_reports(session, before: dict, filenames: list[str]) -> int:
             patient_id=info["patient_id"], filename=fn,
             file_hash=info["file_hash"], report_date=info["report_date"],
             panel_type=info["panel_type"], raw_text=info["raw_text"],
+            result_dates=info.get("result_dates"),
         )
         session.add(r)
         session.flush()
@@ -524,6 +528,7 @@ def _restore_reports(session, before: dict, filenames: list[str]) -> int:
                 original_name=dp["original_name"], value=dp["value"],
                 unit=dp["unit"], ref_low=dp["ref_low"], ref_high=dp["ref_high"],
                 is_abnormal=dp["is_abnormal"], is_disabled=dp["is_disabled"],
+                result_date=dp.get("result_date"), column_label=dp.get("column_label"),
             )
             session.add(new_dp)
             session.flush()
@@ -720,6 +725,17 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
             session.query(DataPoint).filter(DataPoint.report_id.in_(report_ids)).delete()
             session.query(ReportArtifact).filter(ReportArtifact.report_id.in_(report_ids)).delete()
             session.query(PatientSummary).filter(PatientSummary.report_id.in_(report_ids)).delete()
+            # Column-confusion findings produced by the OLD extraction of these
+            # reports point at data points that are about to disappear. The new
+            # extraction re-runs the same guards and recreates them from scratch,
+            # so removing the stale ones here keeps the queue honest (and avoids
+            # an accepted fix targeting rows that no longer exist). The same
+            # applies to second-pass verify findings — they too reference the
+            # rows being deleted, and a fresh verify run recreates them.
+            session.query(DataQualityFinding).filter(
+                DataQualityFinding.report_id.in_(report_ids),
+                DataQualityFinding.source.in_(["extraction", "verify"]),
+            ).delete(synchronize_session=False)
             session.query(Report).filter(Report.id.in_(report_ids)).delete()
             session.commit()
 
@@ -1379,9 +1395,290 @@ def _job_data_quality_check(session, cfg, lang, params):
     return level, text
 
 
+# ── Second-pass column audit (verify job) ────────────────────────────────────
+
+def _verify_parse_number(text):
+    """Parse a printed measurement the auditor returned into a float.
+
+    More lenient than :func:`schemas.bare_number`: accepts a comma decimal
+    separator ("12,5") and surrounding text, but rejects range-shaped strings
+    (those are handled as reference ranges, not values). Returns None when the
+    text is not a single number.
+    """
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return float(text)
+    s = str(text).strip().replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _parse_raw_pages(raw_text: str | None) -> list[dict]:
+    """The per-page {columns, entries} dict list stored in ``Report.raw_text``.
+
+    Returns [] for reports extracted before the column-aware pipeline (their
+    raw_text is the old flat repr, not JSON) — such reports simply have no
+    declared layout to audit, so the verify pass skips them.
+    """
+    if not raw_text:
+        return []
+    try:
+        data = json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    pages = data.get("pages")
+    return pages if isinstance(pages, list) else []
+
+
+_VERIFY_PROBLEM_DESC_KEYS = {
+    "value_from_reference_column": "verify_value_from_reference_column",
+    "reference_holds_result": "verify_reference_holds_result",
+    "wrong_result_column": "verify_wrong_result_column",
+    "missing_result_column": "verify_missing_result_column",
+    "layout_mismatch": "verify_layout_mismatch",
+}
+
+
+def _verify_problem_to_finding(prob, dp, registry, lang, report, skip_dp_ids):
+    """Turn one audit ``VerifyProblem`` into a DataQualityFinding dict, or None.
+
+    The auditor re-read the page image and disagreed with the stored value /
+    range / column. Like every column finding this is NEVER applied
+    automatically — it becomes a pending finding the user accepts or dismisses.
+    The fix mirrors the deterministic extractor checks where the same shape is
+    involved, but the auditor often supplies the corrected value directly (it
+    can see the image), which the deterministic pass cannot.
+    """
+    problem = (prob.problem or "").strip()
+    idx = prob.entry_index
+    dp = dp if idx is not None else None
+    name = (dp.canonical_name if dp is not None else None) or (report.panel_type or report.filename)
+    desc_key = _VERIFY_PROBLEM_DESC_KEYS.get(problem)
+    if desc_key is None:
+        return None
+    evidence = (prob.evidence or "").strip()
+
+    def finding(category, action, params, *, target_dp=None):
+        return {
+            "category": category,
+            "target_type": "data_point" if target_dp is not None else "report",
+            "biomarker": name,
+            "report_id": report.id,
+            "data_point_ids": [target_dp.id] if target_dp is not None else None,
+            "description": t(desc_key, lang=lang, name=name, evidence=evidence or "—"),
+            "action": action,
+            "params": params,
+        }
+
+    # Layout / series problems are not machine-fixable (a value cannot be moved
+    # between result series automatically) — surface them as a review note.
+    if problem in ("missing_result_column", "layout_mismatch", "wrong_result_column") or dp is None:
+        category = "column_layout" if problem in ("missing_result_column", "layout_mismatch") else "column_swap"
+        return finding(category, "acknowledge", {}, target_dp=dp)
+
+    # A deterministic extraction finding already targets this data point — don't
+    # pile a second, near-duplicate hint on the same row.
+    if dp.id in skip_dp_ids:
+        return None
+
+    if problem == "value_from_reference_column":
+        val = _verify_parse_number(prob.value)
+        low, high = (_parse_reference_range(prob.reference_range)
+                     if prob.reference_range else (None, None))
+        unit = dp.unit
+        if val is not None and (low is not None or high is not None):
+            return finding("column_swap", "swap_value_ref_range",
+                           {"value": val, "low": low, "high": high, "unit": unit}, target_dp=dp)
+        if val is not None:
+            return finding("column_swap", "set_value", {"value": val, "unit": unit}, target_dp=dp)
+        if low is not None or high is not None:
+            return finding("column_swap", "set_ref_range",
+                           {"low": low, "high": high, "unit": unit}, target_dp=dp)
+        return finding("column_swap", "acknowledge", {}, target_dp=dp)
+
+    if problem == "reference_holds_result":
+        d_low, d_high, _du = config.get_default_ref_range(dp.canonical_name, dp.unit, registry=registry)
+        if d_low is not None or d_high is not None:
+            return finding("column_swap", "set_ref_range",
+                           {"low": d_low, "high": d_high, "unit": dp.unit}, target_dp=dp)
+        return finding("column_swap", "clear_ref_range", {}, target_dp=dp)
+
+    return None
+
+
+def _job_verify_extraction(session, cfg, lang, params):
+    """Second-pass column audit: re-send each report page to the LLM and ask it
+    ONLY whether every stored value came from the right column.
+
+    This is the safety net for the failure mode the column-first extraction
+    prompt targets but cannot fully prevent: a model that mislabels a reference
+    column as a result column, or reads a value from the wrong one of several
+    result columns. The audit is narrower than a fresh extraction (the model
+    judges the previous pass's own JSON against the image), so it stays cheap.
+
+    Findings are NEVER applied automatically — each becomes a pending
+    DataQualityFinding (source="verify") the user confirms in the Mapping tab.
+    All LLM calls happen BEFORE any DB write (SQLite's single write lock must
+    not be held across a slow HTTP request). Re-running is idempotent: the
+    report's previous verify findings are replaced, while the deterministic
+    extraction findings and on-demand check findings are left untouched.
+    """
+    from pdf_processor import pdf_to_base64_jpeg
+    from pathlib import Path as _Path
+
+    patient_id = params.get("patient_id")
+    if patient_id is None:
+        raise ValueError("verify_extraction requires a patient_id")
+    report_id = params.get("report_id")
+
+    q = session.query(Report).filter(Report.patient_id == patient_id)
+    if report_id is not None:
+        q = q.filter(Report.id == report_id)
+    reports = q.order_by(Report.report_date).all()
+    if not reports:
+        return "info", t("verify_no_reports", lang=lang)
+
+    pdf_dir = _Path(config.REPORTS_DIR)
+    llm = _build_client()
+    registry = get_registry(session)
+    dpi = params.get("dpi") or cfg.get("dpi") or 200
+
+    # Only reports extracted with the column-aware pipeline (JSON raw_text) and
+    # whose PDF is still on disk can be audited.
+    auditable = []
+    missing_files: list[str] = []
+    for r in reports:
+        pages = _parse_raw_pages(r.raw_text)
+        if not pages:
+            continue  # pre-column report — nothing to audit
+        if not (pdf_dir / r.filename).exists():
+            missing_files.append(r.filename)
+            continue
+        auditable.append((r, pages))
+    if not auditable:
+        if missing_files:
+            return "info", t("verify_missing_files", lang=lang, n=len(missing_files))
+        return "info", t("verify_no_auditable_reports", lang=lang)
+
+    total_pages = sum(len(pages) for _r, pages in auditable)
+    done_pages = 0
+    new_findings: list[dict] = []
+    errors: list[str] = []
+
+    for r, pages in auditable:
+        if is_job_aborted():
+            break
+        # DataPoints in insertion order == the order the extractor wrote them
+        # (per page, entry order). Empty-name entries produced no DataPoint, so
+        # the non-empty entries of each page map, in order, to the next slice of
+        # DataPoints — exactly the extractor's own dp_by_pos reconstruction.
+        all_dps = (
+            session.query(DataPoint).filter(DataPoint.report_id == r.id)
+            .order_by(DataPoint.id).all()
+        )
+        # Data points a DETERMINISTIC extraction finding already flags — skip
+        # re-flagging them (old verify findings are replaced below, so they are
+        # deliberately NOT in this set and get re-audited fresh).
+        skip_dp_ids: set[int] = set()
+        for f in (
+            session.query(DataQualityFinding)
+            .filter(DataQualityFinding.report_id == r.id,
+                    DataQualityFinding.status == "pending",
+                    DataQualityFinding.source == "extraction")
+            .all()
+        ):
+            try:
+                skip_dp_ids.update(json.loads(f.data_point_ids) if f.data_point_ids else [])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        try:
+            b64_pages = pdf_to_base64_jpeg(pdf_dir / r.filename, dpi=dpi)
+        except Exception as exc:
+            errors.append(f"{r.filename}: {exc}")
+            done_pages += len(pages)
+            continue
+
+        cursor = 0
+        for page_idx, page in enumerate(pages):
+            if is_job_aborted():
+                break
+            done_pages += 1
+            _update_progress(session, getattr(_current_job_id_var, "job_id", None),
+                             f"{r.filename} — {t('verify_progress_page', lang=lang, page=page_idx + 1, pages=len(pages))}",
+                             done_pages / total_pages)
+            if page_idx >= len(b64_pages):
+                break  # image/page count mismatch — stop this report, keep what we have
+            entries = page.get("entries") or []
+            cols = page.get("columns") or []
+            positions = [i for i, e in enumerate(entries) if (e.get("name") or "").strip()]
+            page_dps = all_dps[cursor:cursor + len(positions)]
+            cursor += len(positions)
+            pos_to_dp = dict(zip(positions, page_dps))
+            try:
+                ep = ExtractedPage(
+                    columns=[TableColumn(**c) for c in cols if isinstance(c, dict)],
+                    entries=[BiomarkerEntry(**e) for e in entries if isinstance(e, dict)],
+                )
+                result = verify_page_extraction(llm, b64_pages[page_idx], ep)
+            except Exception as exc:
+                errors.append(f"{r.filename} p{page_idx + 1}: {exc}")
+                continue
+            for prob in result.problems:
+                dp = pos_to_dp.get(prob.entry_index) if prob.entry_index is not None else None
+                fdef = _verify_problem_to_finding(prob, dp, registry, lang, r, skip_dp_ids)
+                if fdef is not None:
+                    new_findings.append(fdef)
+
+    # ── Write phase (after every LLM call) ──────────────────────────────────
+    audited_report_ids = [r.id for r, _ in auditable]
+    if audited_report_ids:
+        session.query(DataQualityFinding).filter(
+            DataQualityFinding.report_id.in_(audited_report_ids),
+            DataQualityFinding.source == "verify",
+        ).delete(synchronize_session=False)
+    for fdef in new_findings:
+        session.add(DataQualityFinding(
+            patient_id=patient_id,
+            category=fdef["category"],
+            target_type=fdef["target_type"],
+            biomarker=fdef["biomarker"],
+            report_id=fdef["report_id"],
+            data_point_ids=json.dumps(fdef["data_point_ids"]) if fdef["data_point_ids"] else None,
+            description=fdef["description"],
+            action=fdef["action"],
+            params_json=json.dumps(fdef["params"]),
+            source="verify",
+            status="pending",
+        ))
+    session.commit()
+
+    if is_job_aborted():
+        return "info", t("job_aborted_note", lang=lang)
+
+    n_reports = len(audited_report_ids)
+    if not errors:
+        return "success", t("msg_verify_done", lang=lang,
+                            n_reports=n_reports, n_pages=done_pages, n_findings=len(new_findings))
+    level = "warning" if new_findings else "error"
+    text = t("msg_verify_partial", lang=lang, n_reports=n_reports,
+             failed=len(errors), n_findings=len(new_findings))
+    for err in errors[:5]:
+        text += f"\n⚠️ {err}"
+    for fn in missing_files[:5]:
+        text += f"\n⚠️ {t('reprocess_missing_file', lang=lang, filename=fn)}"
+    return level, text
+
+
 _WORK_FNS = {
     "process_pdfs": _job_process_pdfs,
     "reprocess_pdfs": _job_reprocess_pdfs,
+    "verify_extraction": _job_verify_extraction,
     "refresh_risks": _job_refresh_risks,
     "regen_summary": _job_regen_summary,
     "bulk_descriptions": _job_bulk_descriptions,

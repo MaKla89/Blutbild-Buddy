@@ -1,13 +1,19 @@
 from datetime import datetime
+import json
 from pathlib import Path
 
 import streamlit as st
 from sqlalchemy.orm import Session as SASession
 
 from config import REPORTS_DIR, resolve_canonical, get_default_ref_range
-from database import Report, DataPoint, Patient, ReportArtifact, get_or_create_patient, _canonical_base, get_registry, clean_unit
+from database import (
+    Report, DataPoint, Patient, ReportArtifact, DataQualityFinding,
+    get_or_create_patient, _canonical_base, get_registry, clean_unit,
+)
 from pdf_processor import pdf_to_base64_jpeg, file_hash
 from llm_client import _build_client, extract_page, extract_pages_batch, is_job_aborted, normalize_names
+from schemas import bare_number, looks_like_range
+from translations import t, _get_lang
 
 
 def _normalize_name(name: str, unit: str | None, mappings: list[dict], canonical_list: list[str], registry: dict | None = None) -> str:
@@ -90,6 +96,265 @@ def _is_value_abnormal(value: float | None, ref_low: float | None, ref_high: flo
     if ref_high is not None and value > ref_high:
         return True
     return False
+
+
+# ── Table layout / column-confusion guards ───────────────────────────────────
+# A lab report table has one name column, ONE reference column, and often
+# SEVERAL result columns (one per draw date, or a lying/standing pair). The two
+# failure modes this guards:
+#   (a) the reference cell is read as the measurement (or vice versa) — the
+#       reference and result columns are swapped;
+#   (b) a multi-column report is collapsed into one series, silently keeping
+#       only one of its measurements.
+# The extraction prompt now forces the model to declare the layout first
+# ("columns", each with a role) and to tag every entry with its result column
+# ("column_index"). Everything below validates that declaration deterministically
+# and turns a violation into a DataQualityFinding the user confirms — a detected
+# swap is NEVER applied silently, because "which cell was right" cannot always be
+# decided from the data alone.
+
+_DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%Y/%m/%d", "%d/%m/%Y", "%d %b %Y", "%d %B %Y")
+
+# Thresholds for check (7) — the systematic ``value == reference bound`` pattern.
+# A single value landing exactly on a limit is ordinary; a whole page where a
+# third of the rows do is a column misread (the model grabbed the reference
+# cell's first/second number as the measurement). Both a minimum count and a
+# minimum fraction are required so a short page with one coincidence never fires.
+_MIN_BOUND_MATCHES = 4
+_MIN_BOUND_FRACTION = 0.3
+
+
+def _parse_result_date(text: str | None) -> datetime | None:
+    """Parse a result column's header into a date, when it is one.
+
+    Only numeric/ISO shapes are accepted — a header like "lying"/"standing" or
+    "Vor Behandlung" is a series label, not a date, and stays in
+    ``DataPoint.column_label`` instead.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _page_layout(page) -> dict:
+    """Normalise the layout the LLM declared for one page.
+
+    Returns ``{"declared": bool, "result_cols": {index: (result_date, label)},
+    "ref_indexes": [int], "has_ref": bool}``. ``declared`` is False when the
+    model returned no layout at all — every check below then degrades to the old
+    flat behaviour instead of failing, so a weaker model still produces data.
+
+    Result columns are keyed by their declared index; a missing/duplicated index
+    is filled positionally so a sloppy layout declaration still yields usable
+    series identity.
+    """
+    cols = list(getattr(page, "columns", None) or [])
+    if not cols:
+        return {"declared": False, "result_cols": {}, "ref_indexes": [], "has_ref": False}
+
+    result_cols: dict[int, tuple[datetime | None, str | None]] = {}
+    ref_indexes: list[int] = []
+    for pos, col in enumerate(cols):
+        idx = col.index if isinstance(col.index, int) else pos
+        header = (col.header or "").strip() or None
+        if col.role == "result":
+            rdate = _parse_result_date(col.result_date) or _parse_result_date(header)
+            result_cols[idx] = (rdate, header)
+        elif col.role == "reference":
+            ref_indexes.append(idx)
+    return {
+        "declared": True,
+        "result_cols": result_cols,
+        "ref_indexes": ref_indexes,
+        "has_ref": bool(ref_indexes),
+    }
+
+
+def _entry_series(layout: dict, column_index: int | None) -> tuple[datetime | None, str | None]:
+    """The (result_date, column_label) a page's layout assigns to an entry.
+
+    Single-result-column pages get the series identity even when the entry does
+    not echo ``column_index`` — there is only one candidate, so it is
+    unambiguous. With several result columns an entry without ``column_index``
+    cannot be placed and stays unlabelled (the layout check flags it instead).
+    """
+    result_cols = layout.get("result_cols") or {}
+    if not result_cols:
+        return None, None
+    if column_index is not None and column_index in result_cols:
+        return result_cols[column_index]
+    if len(result_cols) == 1:
+        return next(iter(result_cols.values()))
+    return None, None
+
+
+def _column_findings(
+    page, layout: dict, entries: list, canonicals: list[str | None],
+    units: list[str | None], ref_pairs: list[tuple[float | None, float | None]],
+    from_pdf_ref: list[bool], registry: dict, lang: str,
+) -> list[dict]:
+    """Deterministic column-confusion checks for ONE page.
+
+    Returns finding dicts (category/description/action/params + the 0-based
+    positions of the affected entries on this page). Deliberately narrow: every
+    rule fires on a shape that cannot occur in a correctly read table, because a
+    false positive costs the user a review click on every report.
+    """
+    findings: list[dict] = []
+    n_result = len(layout.get("result_cols") or {})
+
+    # (6) A table has at most one reference column. Two of them means the model
+    # mislabelled a result column as the reference — every range on the page is
+    # then suspect.
+    if len(layout.get("ref_indexes") or []) > 1:
+        findings.append({
+            "category": "column_layout",
+            "entry_positions": [],
+            "description": t("dq_multiple_reference_columns", lang=lang,
+                             indexes=", ".join(str(i) for i in layout["ref_indexes"])),
+            "action": "acknowledge", "params": {},
+        })
+
+    for pos, entry in enumerate(entries):
+        name = (entry.name or "").strip()
+        if not name:
+            continue
+        canonical = canonicals[pos]
+        ref_text = (entry.reference_range or "").strip()
+        low, high = ref_pairs[pos]
+
+        # (1) The value field holds a range ("4.2-6.1"): _parse_value coerced it
+        # to None and kept the text in value_raw. A result cell is never a range,
+        # so the row was read one column off. The fix is fully determined: the
+        # range text becomes the reference range, and if the reference field
+        # holds a bare number that number is the measurement that was displaced.
+        if entry.value is None and looks_like_range(entry.value_raw or ""):
+            new_low, new_high = _parse_reference_range(entry.value_raw)
+            new_value = bare_number(ref_text)
+            findings.append({
+                "category": "column_swap",
+                "entry_positions": [pos],
+                "description": t("dq_swap_value_is_range", lang=lang,
+                                 name=name, raw=entry.value_raw),
+                "action": "swap_value_ref_range",
+                "params": {"value": new_value, "low": new_low, "high": new_high,
+                           "unit": units[pos]},
+            })
+            continue
+
+        # (2) The reference field holds a single bare number. Reference cells are
+        # ranges, one-sided bounds or qualitative words — a lone number there is
+        # almost always a measurement read from the wrong column (typically the
+        # second result column of a multi-column report).
+        stray = bare_number(ref_text)
+        if stray is not None and layout.get("has_ref"):
+            d_low, d_high, _du = get_default_ref_range(canonical, units[pos], registry=registry)
+            fix = ({"action": "set_ref_range",
+                    "params": {"low": d_low, "high": d_high, "unit": units[pos]}}
+                   if (d_low is not None or d_high is not None)
+                   else {"action": "clear_ref_range", "params": {}})
+            findings.append({
+                "category": "column_swap",
+                "entry_positions": [pos],
+                "description": t("dq_swap_ref_holds_result", lang=lang,
+                                 name=name, ref=ref_text),
+                **fix,
+            })
+
+        # (3) ref_low == ref_high: one cell was copied into both bounds. A real
+        # reference range is never a single point.
+        if low is not None and high is not None and low == high and from_pdf_ref[pos]:
+            d_low, d_high, _du = get_default_ref_range(canonical, units[pos], registry=registry)
+            if (d_low is not None or d_high is not None) and (d_low, d_high) != (low, high):
+                fix = {"action": "set_ref_range",
+                       "params": {"low": d_low, "high": d_high, "unit": units[pos]}}
+            else:
+                fix = {"action": "clear_ref_range", "params": {}}
+            findings.append({
+                "category": "column_swap",
+                "entry_positions": [pos],
+                "description": t("dq_degenerate_ref_range", lang=lang, name=name, value=low),
+                **fix,
+            })
+
+        # (4) The entry names a column that is not a declared result column —
+        # e.g. it points at the reference column, so the stored "measurement" is
+        # a reference value.
+        if layout.get("declared") and n_result and entry.column_index is not None \
+                and entry.column_index not in (layout.get("result_cols") or {}):
+            findings.append({
+                "category": "column_swap",
+                "entry_positions": [pos],
+                "description": t("dq_column_index_invalid", lang=lang,
+                                 name=name, column_index=entry.column_index,
+                                 valid=", ".join(str(i) for i in sorted(layout["result_cols"])) or "—"),
+                "action": "disable_value", "params": {},
+            })
+
+    # (5) With several result columns, every row should contribute one entry per
+    # column. A name appearing fewer times than that means a result column was
+    # dropped for that row — the series then looks complete but is not.
+    if n_result >= 2:
+        by_name: dict[str, list[int]] = {}
+        for pos, entry in enumerate(entries):
+            nm = (entry.name or "").strip().lower()
+            if nm:
+                by_name.setdefault(nm, []).append(pos)
+        for nm, positions in by_name.items():
+            if 0 < len(positions) < n_result:
+                findings.append({
+                    "category": "column_layout",
+                    "entry_positions": positions,
+                    "description": t("dq_missing_result_column", lang=lang,
+                                     name=entries[positions[0]].name,
+                                     found=len(positions), expected=n_result),
+                    "action": "acknowledge", "params": {},
+                })
+
+    # (7) Systematic value == reference bound. The signature failure of a
+    # low-resolution render: the model reads the REFERENCE cell's first number as
+    # the measurement, so ``value`` equals the lower bound of its own stored range
+    # (or the upper bound, when it grabbed the second number). A single value
+    # sitting exactly on a limit is normal — a whole page where a third of the
+    # rows do is a column misread. This is the shape checks (1)-(4) cannot see:
+    # the value is a bare number, the ref is a valid range, the column_index is
+    # correct — only the AGGREGATE is wrong. It is also the only detector for
+    # this failure that works without the LLM verify pass, so it fires on ingest.
+    # Positions already flagged above are excluded to avoid duplicate findings.
+    flagged = {p for f in findings for p in f["entry_positions"]}
+    bound_hits: list[int] = []
+    ref_rows = 0
+    for pos, entry in enumerate(entries):
+        if pos in flagged or not (entry.name or "").strip():
+            continue
+        low, high = ref_pairs[pos]
+        if entry.value is None or not from_pdf_ref[pos]:
+            continue  # a default ref range matching the value is not a misread
+        ref_rows += 1
+        if (low is not None and abs(entry.value - low) <= 1e-9) or \
+                (high is not None and abs(entry.value - high) <= 1e-9):
+            bound_hits.append(pos)
+    if len(bound_hits) >= _MIN_BOUND_MATCHES and ref_rows and \
+            len(bound_hits) / ref_rows >= _MIN_BOUND_FRACTION:
+        sample = ", ".join((entries[p].name or "").strip() for p in bound_hits[:5])
+        findings.append({
+            "category": "column_swap",
+            "entry_positions": bound_hits,
+            "description": t("dq_value_matches_ref_bound", lang=lang,
+                             count=len(bound_hits), total=ref_rows, names=sample),
+            "action": "acknowledge", "params": {},
+        })
+
+    return findings
+
 
 
 
@@ -180,7 +445,7 @@ def _apply_global_normalization(
     return changed
 
 
-def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False, only_files: set[str] | None = None) -> tuple[list[str], list[str]]:
+def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False, only_files: set[str] | None = None, lang: str | None = None) -> tuple[list[str], list[str]]:
     """Process all unprocessed PDFs in REPORTS_DIR.
 
     Two phases, so no single LLM request grows with the number of PDFs:
@@ -210,6 +475,10 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             in the DB (other patients' reports, or unprocessed uploads), and
             every one of those inserts fails on the ``file_hash`` unique
             constraint and shows up as a spurious error.
+        lang: language for the column-confusion findings this run creates.
+            Background workers MUST pass it (from their config snapshot) —
+            they run outside the Streamlit script context, where reading
+            session state is not safe.
 
     Returns:
         (processed, errors) — processed is a list of filenames, errors a list
@@ -222,6 +491,8 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
     # to the config baseline for names not yet seeded.
     registry = get_registry(session)
     canonical_names = sorted(registry.keys())
+    if lang is None:
+        lang = _get_lang()
     # Resolve render settings once: explicit params (background jobs pass a
     # snapshot captured at submit time) win over the live app settings.
     if dpi is None:
@@ -260,7 +531,14 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
 
             b64_pages = pdf_to_base64_jpeg(pdf_path, dpi=dpi)
 
-            all_entries = []
+            # Per-page grouping is needed because the column checks are per page
+            # (each page declares its own layout) and their findings address
+            # entries by position within that page. ``page_columns`` keeps the
+            # raw declared layout for raw_text, so a later audit pass can be run
+            # without re-extracting.
+            pages_entries: list[list] = []
+            page_layouts: list[dict] = []
+            page_columns: list[list[dict]] = []
             patient_name = None
             report_date = None
             panel_type = None
@@ -277,7 +555,9 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                     report_date = page_data.report_date
                 if page_data.panel_type and not panel_type:
                     panel_type = page_data.panel_type
-                all_entries.extend(page_data.entries)
+                pages_entries.append(list(page_data.entries))
+                page_layouts.append(_page_layout(page_data))
+                page_columns.append([c.model_dump() for c in (page_data.columns or [])])
                 page_no = page_idx + 1  # 1-based, matches how pages are shown to the user
                 for art in getattr(page_data, "artifacts", []) or []:
                     text = (art.text or "").strip()
@@ -308,62 +588,152 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
 
             patient = get_or_create_patient(session, patient_name or "Unknown")
 
+            # Extra measurement series this report carries: the result columns
+            # whose header was a date. A single-column report has none of these,
+            # so result_dates stays null and nothing downstream changes.
+            extra_series: list[str] = []
+            for layout in page_layouts:
+                for rdate, label in (layout.get("result_cols") or {}).values():
+                    if rdate is not None:
+                        iso = rdate.strftime("%Y-%m-%d")
+                        if iso != (parsed_date.strftime("%Y-%m-%d") if parsed_date else None) \
+                                and iso not in extra_series:
+                            extra_series.append(iso)
+
+            # raw_text is stored as JSON, grouped per page (each page declares
+            # its own column layout and its entries are addressed by position
+            # within that page). Nothing parses it for display — it exists so a
+            # later audit pass (the verify job) can re-send the exact layout +
+            # entries the model produced, without re-extracting.
             report = Report(
                 patient_id=patient.id,
                 filename=pdf_path.name,
                 file_hash=fhash,
                 report_date=parsed_date,
                 panel_type=panel_type,
-                raw_text=str([e.model_dump() for e in all_entries]),
+                result_dates=json.dumps(extra_series) if extra_series else None,
+                raw_text=json.dumps(
+                    {"pages": [
+                        {"columns": cols,
+                         "entries": [e.model_dump(mode="json") for e in ents]}
+                        for cols, ents in zip(page_columns, pages_entries)
+                    ]},
+                    default=str,
+                ),
             )
             session.add(report)
             session.flush()
 
-            for entry in all_entries:
-                if not entry.name:
-                    continue
-                # Collapse stray internal whitespace in the unit ('ml/ min' →
-                # 'ml/min') BEFORE anything uses it. OCR/LLM extraction emits
-                # these, and because merge grouping keys on the unit a stray
-                # space splits one biomarker into two entries that never merge.
-                # Cleaning at ingestion keeps every downstream consumer
-                # (registry lookup, ref-range default, dedup, storage) aligned.
-                unit = clean_unit(entry.unit)
-                # Deterministic registry resolution only — the LLM name mapping
-                # happens once for ALL reports in Phase 2, not once per PDF.
-                canonical = _normalize_name(entry.name, unit, [], canonical_names, registry=registry)
-                ref_low, ref_high = _parse_reference_range(entry.reference_range)
+            # Insert per PAGE so a finding's entry positions map to the right
+            # data point ids, and so each entry picks up its page's layout.
+            for page_idx, entries in enumerate(pages_entries):
+                layout = page_layouts[page_idx]
+                canonicals: list[str | None] = []
+                units: list[str | None] = []
+                ref_pairs: list[tuple[float | None, float | None]] = []
+                from_pdf_ref: list[bool] = []
+                dp_by_pos: dict[int, DataPoint] = {}
 
-                # Fallback to default reference ranges (active DB registry) when PDF omits them
-                if ref_low is None and ref_high is None:
-                    def_ref_low, def_ref_high, def_unit = get_default_ref_range(canonical, unit, registry=registry)
-                    if def_ref_low is not None or def_ref_high is not None:
-                        ref_low = def_ref_low
-                        ref_high = def_ref_high
+                for pos, entry in enumerate(entries):
+                    if not entry.name:
+                        canonicals.append(None)
+                        units.append(None)
+                        ref_pairs.append((None, None))
+                        from_pdf_ref.append(False)
+                        continue
+                    # Collapse stray internal whitespace in the unit ('ml/ min' →
+                    # 'ml/min') BEFORE anything uses it. OCR/LLM extraction emits
+                    # these, and because merge grouping keys on the unit a stray
+                    # space splits one biomarker into two entries that never merge.
+                    # Cleaning at ingestion keeps every downstream consumer
+                    # (registry lookup, ref-range default, dedup, storage) aligned.
+                    unit = clean_unit(entry.unit)
+                    # Deterministic registry resolution only — the LLM name mapping
+                    # happens once for ALL reports in Phase 2, not once per PDF.
+                    canonical = _normalize_name(entry.name, unit, [], canonical_names, registry=registry)
+                    ref_low, ref_high = _parse_reference_range(entry.reference_range)
+                    had_pdf_ref = ref_low is not None or ref_high is not None
 
-                # One-sided bounds count too (R3-08): "< 5.2" → high only,
-                # "> 120" → low only. A value beyond the single bound is abnormal.
-                is_abnormal = _is_value_abnormal(entry.value, ref_low, ref_high)
+                    # Fallback to default reference ranges (active DB registry) when PDF omits them
+                    if ref_low is None and ref_high is None:
+                        def_ref_low, def_ref_high, def_unit = get_default_ref_range(canonical, unit, registry=registry)
+                        if def_ref_low is not None or def_ref_high is not None:
+                            ref_low = def_ref_low
+                            ref_high = def_ref_high
 
-                dp = DataPoint(
-                    report_id=report.id,
-                    canonical_name=canonical,
-                    original_name=entry.name,
-                    value=entry.value,
-                    unit=unit,
-                    ref_low=ref_low,
-                    ref_high=ref_high,
-                    is_abnormal=is_abnormal,
-                )
-                session.add(dp)
+                    # One-sided bounds count too (R3-08): "< 5.2" → high only,
+                    # "> 120" → low only. A value beyond the single bound is abnormal.
+                    is_abnormal = _is_value_abnormal(entry.value, ref_low, ref_high)
 
-                # Deduplicate by (name case-insensitive, cleaned unit or "") so
-                # the LLM sees units — needed to disambiguate unit-qualified
-                # variants. The cleaned unit also collapses 'ml/min' vs 'ml/ min'
-                # into one pending entry.
-                key = (entry.name.strip().lower(), unit or "")
-                if key not in pending_entries:
-                    pending_entries[key] = {"name": entry.name, "unit": unit}
+                    # Which measurement series this value belongs to, from the
+                    # page's declared layout. (None, None) for the ordinary
+                    # single-column report, which keeps every existing consumer
+                    # on the (marker, unit, report_date) key.
+                    series_date, series_label = _entry_series(layout, entry.column_index)
+
+                    dp = DataPoint(
+                        report_id=report.id,
+                        canonical_name=canonical,
+                        original_name=entry.name,
+                        value=entry.value,
+                        unit=unit,
+                        ref_low=ref_low,
+                        ref_high=ref_high,
+                        is_abnormal=is_abnormal,
+                        result_date=series_date,
+                        column_label=series_label,
+                    )
+                    session.add(dp)
+                    dp_by_pos[pos] = dp
+
+                    canonicals.append(canonical)
+                    units.append(unit)
+                    ref_pairs.append((ref_low, ref_high))
+                    from_pdf_ref.append(had_pdf_ref)
+
+                    # Deduplicate by (name case-insensitive, cleaned unit or "") so
+                    # the LLM sees units — needed to disambiguate unit-qualified
+                    # variants. The cleaned unit also collapses 'ml/min' vs 'ml/ min'
+                    # into one pending entry.
+                    key = (entry.name.strip().lower(), unit or "")
+                    if key not in pending_entries:
+                        pending_entries[key] = {"name": entry.name, "unit": unit}
+
+                # Flush so every DataPoint on this page has a real id BEFORE the
+                # findings below reference ``dp_by_pos[p].id``. Without this the
+                # ids are still None, the finding's data_point_ids becomes
+                # "[null]", and an accepted swap could never be applied.
+                session.flush()
+
+                # Column-confusion checks for this page. Findings are stored as
+                # pending DataQualityFindings — a detected swap is NEVER applied
+                # silently, because which cell was correct cannot always be
+                # decided from the stored data alone; the user confirms in the
+                # Mapping tab.
+                try:
+                    page_findings = _column_findings(
+                        pages_entries[page_idx], layout, entries, canonicals, units,
+                        ref_pairs, from_pdf_ref, registry, lang,
+                    )
+                except Exception:
+                    page_findings = []  # a broken check must never lose a report
+                for fdef in page_findings:
+                    ids = [dp_by_pos[p].id for p in fdef["entry_positions"]
+                           if p in dp_by_pos and dp_by_pos[p].id is not None]
+                    session.add(DataQualityFinding(
+                        patient_id=patient.id,
+                        category=fdef["category"],
+                        target_type="data_point" if ids else "report",
+                        biomarker=(entries[fdef["entry_positions"][0]].name if fdef["entry_positions"]
+                                   else (panel_type or pdf_path.name)),
+                        report_id=report.id,
+                        data_point_ids=json.dumps(ids) if ids else None,
+                        description=fdef["description"],
+                        action=fdef["action"],
+                        params_json=json.dumps(fdef["params"]),
+                        source="extraction",
+                        status="pending",
+                    ))
 
             # Store the deduplicated written-text findings for this report.
             for category, text_val, excerpt, page_no in artifact_by_key.values():
