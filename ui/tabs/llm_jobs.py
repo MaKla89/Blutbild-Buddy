@@ -56,13 +56,22 @@ _FINISH_FLASH_KEYS = {
 }
 
 
-def render_llm_jobs_tab(session):
+def render_llm_jobs_tab(session, patient=None):
+    """Render the job list for one patient.
+
+    ``patient`` scopes the list, the 2 s poll, the abort buttons and the
+    "clear finished" action. Without it this tab showed every patient's jobs —
+    including their report filenames and result texts — and "clear finished"
+    destroyed another patient's job history. ``None`` (no patient selected) shows
+    only app-level jobs (a connection test), which carry no patient data.
+    """
+    patient_id = patient.id if patient is not None else None
     st.subheader(t("subheader_llm_jobs"))
     st.caption(t("caption_llm_jobs"))
 
     if st.button(t("btn_clear_finished_jobs"), key="clear_finished_jobs"):
         with get_session() as s:
-            n = clear_finished_llm_jobs(s)
+            n = clear_finished_llm_jobs(s, patient_id=patient_id)
         st.toast(t("msg_jobs_cleared", n=n))
 
     # Auto-poll only while a job is actually pending/running. An unconditional
@@ -75,30 +84,39 @@ def render_llm_jobs_tab(session):
     # browser interval then resolves to an unknown fragment id and is dropped).
     # run_every must be decided at definition time, hence the two branches.
     with get_session() as s:
-        jobs_active = bool(get_active_llm_jobs(s))
+        jobs_active = bool(get_active_llm_jobs(s, patient_id=patient_id))
 
     if jobs_active:
         @st.fragment(run_every=2)
         def _jobs_poll():
-            _render_jobs()
+            _render_jobs(patient_id)
 
         _jobs_poll()
     else:
-        _render_jobs()
+        _render_jobs(patient_id)
 
 
-def _render_jobs():
-    """The job list itself, with transition detection (see render_llm_jobs_tab)."""
+def _render_jobs(patient_id: int | None = None):
+    """The job list itself, with transition detection (see render_llm_jobs_tab).
+
+    ``patient_id`` filters the list — a poll must never surface another
+    patient's job, and the transition detection that fires the app rerun is
+    tracked per patient so two patients' job lists cannot clobber each other's
+    seen-status map.
+    """
     with get_session() as s:
-        jobs = list_llm_jobs(s, limit=20)
+        jobs = list_llm_jobs(s, limit=20, patient_id=patient_id)
 
     if not jobs:
         st.info(t("msg_no_jobs_yet"))
         return
 
     # Transition detection: remember the last-seen status per job id and
-    # refresh the app when a data-affecting job finishes.
-    prev = dict(st.session_state.get("_llm_job_statuses", {}))
+    # refresh the app when a data-affecting job finishes. Keyed per patient so
+    # switching the patient cannot make a job that vanished from one patient's
+    # list look like a finished transition in another's.
+    _status_key = f"_llm_job_statuses_{patient_id if patient_id is not None else 'app'}"
+    prev = dict(st.session_state.get(_status_key, {}))
     now = {j.id: j.status for j in jobs}
     just_finished = []
     for jid, old_status in list(prev.items()):
@@ -114,7 +132,7 @@ def _render_jobs():
                 just_finished.append(job)
     # Persist the new statuses BEFORE rerunning: otherwise the rerun's
     # first poll would see the same transition again and rerun forever.
-    st.session_state._llm_job_statuses = now
+    st.session_state[_status_key] = now
 
     if just_finished:
         # Tell the user the job is over (toasts live in the notification

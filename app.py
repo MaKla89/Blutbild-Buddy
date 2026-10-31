@@ -226,7 +226,12 @@ def main():
         )
 
     session = get_session()
-    patients, reports = load_data(session)
+    # The patient picker is the identity switch (there is no auth), so it must
+    # list every patient. Everything downstream is scoped to the selection: the
+    # Reports tab loads its own report list filtered to the selected patient,
+    # which is what keeps that tab's list, stats and delete picker from showing
+    # another patient's documents.
+    patients, _ = load_data(session)
 
     # Patient selector at top (not in sidebar) — labels carry report count
     # and latest report date so the choice is informative at a glance.
@@ -278,8 +283,12 @@ def main():
         mgmt_subtabs = st.tabs(management_tabs)
 
     # --- TAB: Reports ---
+    # The selected patient is passed explicitly rather than read from session
+    # state inside the tab: it is the scope of everything this tab lists and of
+    # every job it submits.
     with mgmt_subtabs[0]:
-        _render_reports_tab(session, patients, reports, _generate_summary_for_patient)
+        _render_reports_tab(session, patients, selected_patient,
+                            _generate_summary_for_patient)
 
     # --- TAB: Patients ---
     with mgmt_subtabs[1]:
@@ -291,7 +300,7 @@ def main():
 
     # --- TAB: LLM Jobs ---
     with mgmt_subtabs[3]:
-        render_llm_jobs_tab(session)
+        render_llm_jobs_tab(session, selected_patient)
 
     # First rerun check: runs after the management sub-tabs (Reports, Patients,
     # LLM Settings, LLM Jobs) have rendered. Nested tabs execute all of their

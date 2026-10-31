@@ -227,13 +227,21 @@ def render_mapping_tab(session, patient, patient_reports):
             elif final_new_name == old_name:
                 _flash("mapping_rename", "warning", t("warning_same_name"))
             elif old_name.lower() in {n.lower() for n in registry_names}:
-                # Global registry rename: renames the registry row, all data
-                # points and biomarker infos across ALL patients, and keeps
-                # the old name as an alias for incoming PDF names.
-                outcome = update_biomarker_registry(session, old_name, "name", final_new_name)
+                # Registry rename: renames the registry row (shared reference
+                # data) and keeps the old name as an alias for incoming PDF
+                # names. The DATA migration (this patient's data points +
+                # biomarker infos) is scoped to the selected patient — other
+                # patients keep their rows under the old name, which still
+                # resolves via the alias, and their own Mapping tab surfaces
+                # the now-unregistered name so they can decide to apply the
+                # same fix themselves.
+                outcome = update_biomarker_registry(session, old_name, "name",
+                                                    final_new_name,
+                                                    patient_id=patient.id)
                 if outcome["status"] == "applied":
                     _flash("mapping_rename", "success",
-                           t("msg_biomarker_renamed_global", old=old_name, new=final_new_name))
+                           t("msg_biomarker_renamed_scoped", old=old_name,
+                             new=final_new_name))
                     data_changed = True
                 else:
                     # The only remaining skip reason here is a name collision.
@@ -300,7 +308,12 @@ def render_mapping_tab(session, patient, patient_reports):
             if not edit_value.strip():
                 st.error(t("error_empty_value"))
             else:
-                outcome = update_biomarker_registry(session, edit_name, field_key, edit_value)
+                # patient_id scopes the DATA migration of a 'name' edit to this
+                # patient (the registry row itself stays global — see
+                # update_biomarker_registry). unit/ref_range edits touch only
+                # the shared reference row and never migrate measurements.
+                outcome = update_biomarker_registry(session, edit_name, field_key,
+                                                    edit_value, patient_id=patient.id)
                 # Queued via _flash: the _rerun_requested below discards this run.
                 if outcome["status"] == "applied":
                     _flash("registry_edit", "success",
@@ -311,13 +324,15 @@ def render_mapping_tab(session, patient, patient_reports):
                 st.session_state._rerun_requested = True
 
         # --- Backfill registry defaults onto missing data points -----------
-        # Applies the registry default ranges to historical DataPoints that are
-        # still missing them. Global across all patients — same operation as
-        # the Berichte-tab button (the kind lock in llm_jobs prevents double
-        # execution from either tab).
+        # Applies the registry default ranges to THIS patient's historical
+        # DataPoints that are still missing them. The registry read stays global
+        # (reference data), the writes are scoped — writing ranges into another
+        # patient's measurements would be editing their data. Same operation as
+        # the Berichte-tab button; the (kind, patient) lock in llm_jobs keeps
+        # either tab from double-running it for the same patient.
 
         # Contextual backfill: applies registry defaults to missing data points
-        # (all patients).
+        # of the selected patient.
         st.divider()
         st.caption(t("caption_backfill_from_registry"))
         # Result of the previous click: queued via _flash() because the helper's
@@ -327,6 +342,7 @@ def render_mapping_tab(session, patient, patient_reports):
             session,
             label_key="btn_backfill_ref_ranges", kind="backfill",
             job_label_key="job_kind_backfill", key="btn_backfill_ref_ranges",
+            params={"patient_id": patient.id},
             flash_key="backfill_mapping",
             button_type="secondary",
         )

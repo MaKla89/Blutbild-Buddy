@@ -115,7 +115,9 @@ DE = {
 
     # Reports tab
     "subheader_reports_manage": "Berichte verwalten",
-    "caption_reports_manage": "Laden Sie PDFs hoch, prüfen Sie den Verarbeitungsstatus und löschen Sie einzelne Berichte.",
+    "caption_reports_manage": "Laden Sie PDFs für den ausgewählten Patienten hoch, prüfen Sie den Verarbeitungsstatus und löschen Sie einzelne Berichte.",
+    "info_create_patient_first": "Legen Sie zuerst einen Patienten an (Tab „Patienten“), bevor Sie Berichte hochladen — jeder Bericht gehört genau einem Patienten.",
+    "warning_upload_needs_patient": "⚠️ Kein Patient ausgewählt — die Datei wurde nicht hochgeladen. Bitte zuerst oben einen Patienten auswählen.",
     "btn_upload_and_process": "📤 Hochladen & Verarbeiten",
     "btn_process_all": "📄 Alle PDFs verarbeiten",
     "btn_reprocess_pdfs": "♻️ Vorhandene Berichte neu extrahieren",
@@ -153,11 +155,22 @@ DE = {
     # Patients tab
     "subheader_patients_manage": "Patienten verwalten",
     "heading_patients_list": "{n} Patient{plural}",
-    "caption_patients_manage": "Liste aller Patienten, Umbenennen und Zusammenführen.",
+    "caption_patients_manage": "Liste aller Patienten, Umbenennen, Zusammenführen und Löschen.",
     "btn_select_for_merge": "Auswählen",
     "btn_merge_selected": "🔗 Ausgewählte zusammenführen",
     "msg_no_patients": "Noch keine Patienten vorhanden.",
     "info_select_patient_first": "Bitte wählen Sie einen Patienten aus, um Daten anzusehen.",
+    "subheader_delete_patient": "Patient vollständig löschen",
+    "warning_delete_patient": "⚠️ Diese Aktion löscht den Patienten samt aller Berichte, Messwerte, Risikomarkierungen, Chat-Verläufe und Jobs unwiderruflich.",
+    "btn_delete_patient": "🗑️ Patient löschen",
+    "dialog_confirm_delete_patient_title": "Patient wirklich löschen?",
+    "dialog_confirm_delete_patient_text": "Sie sind dabei, **{name}** dauerhaft zu löschen. Das umfasst {reports} Bericht(e) und {values} Messwert(e).",
+    "dialog_delete_patient_scope": "Auch Risikomarkierungen, Referenzbereiche, Chat-Verläufe, Biomarker-Notizen und offene Datenqualitäts-Funde dieses Patienten werden entfernt. PDF-Dateien bleiben erhalten, es sei denn, Sie wählen das unten aus.",
+    "label_delete_pdf_files": "Auch PDF-Dateien vom Datenträger löschen",
+    "label_confirm_patient_name": "Zum Bestätigen den Patientennamen eingeben",
+    "btn_confirm_delete_patient": "🗑️ Endgültig löschen",
+    "error_confirm_name_mismatch": "Der eingegebene Name stimmt nicht mit dem Patientennamen überein — es wurde nichts gelöscht.",
+    "msg_patient_deleted": "Patient '{name}' gelöscht: {reports} Bericht(e), {values} Messwert(e), {pdfs} PDF-Datei(en) entfernt.",
 
     # LLM Settings tab
     "subheader_llm_settings": "LLM-Einstellungen",
@@ -309,6 +322,7 @@ DE = {
     "msg_biomarker_renamed": "{count} Datenpunkt{plural} von '{old}' auf '{new}' umbenannt.",
     "warning_no_data_points": "Keine Datenpunkte mit dem Namen '{old}' gefunden.",
     "msg_biomarker_renamed_global": "'{old}' wurde global in '{new}' umbenannt — Registry und alle Datenpunkte aller Patienten. Der alte Name bleibt als Alias erhalten.",
+    "msg_biomarker_renamed_scoped": "'{old}' wurde in '{new}' umbenannt — Registry-Eintrag global aktualisiert, aber nur die Messwerte **dieses Patienten** migriert. Andere Patienten bleiben unberührt; der alte Name bleibt als Alias erhalten.",
     "warning_rename_collision": "'{new}' existiert bereits in der Registry. Es wurde nichts geändert — bitte einen anderen Namen wählen.",
 
     # Manual registry edit section
@@ -354,7 +368,7 @@ DE = {
     "field_unit": "Einheit",
     "field_ref_range": "Referenzbereich",
     "msg_suggestion_skipped": "Vorschlag nicht übernommen: {detail}",
-    "caption_backfill_from_registry": "Überträgt die Referenzbereiche aus dem Register auf alle Datenpunkte (aller Patienten), denen noch Werte fehlen — z. B. nach einer Registry-Bearbeitung.",
+    "caption_backfill_from_registry": "Überträgt die Referenzbereiche aus dem Register auf die Datenpunkte **dieses Patienten**, denen noch Werte fehlen — z. B. nach einer Registry-Bearbeitung.",
 
     # Data quality check (registry + actual patient measurements)
     "subheader_data_quality": "🩺 Datenqualität prüfen",
@@ -615,7 +629,9 @@ EN = {
 
     # Reports tab
     "subheader_reports_manage": "Manage Reports",
-    "caption_reports_manage": "Upload PDFs, check processing status, and delete individual reports.",
+    "caption_reports_manage": "Upload PDFs for the selected patient, check processing status, and delete individual reports.",
+    "info_create_patient_first": "Create a patient first (Patients tab) before uploading reports — every report belongs to exactly one patient.",
+    "warning_upload_needs_patient": "⚠️ No patient selected — the file was not uploaded. Please select a patient above first.",
     "btn_upload_and_process": "📤 Upload & Process",
     "btn_process_all": "📄 Process All PDFs",
     "btn_reprocess_pdfs": "♻️ Re-extract Existing Reports",
@@ -653,11 +669,22 @@ EN = {
     # Patients tab
     "subheader_patients_manage": "Manage Patients",
     "heading_patients_list": "{n} patient{plural}",
-    "caption_patients_manage": "List of all patients, rename and merge operations.",
+    "caption_patients_manage": "List of all patients, rename, merge and delete operations.",
     "btn_select_for_merge": "Select",
     "btn_merge_selected": "🔗 Merge Selected",
     "msg_no_patients": "No patients available yet.",
     "info_select_patient_first": "Please select a patient to view data.",
+    "subheader_delete_patient": "Delete Patient Completely",
+    "warning_delete_patient": "⚠️ This permanently deletes the patient together with all reports, measurements, risk flags, chat histories and jobs.",
+    "btn_delete_patient": "🗑️ Delete Patient",
+    "dialog_confirm_delete_patient_title": "Really delete this patient?",
+    "dialog_confirm_delete_patient_text": "You are about to permanently delete **{name}**. This includes {reports} report(s) and {values} measurement(s).",
+    "dialog_delete_patient_scope": "Risk flags, reference ranges, chat histories, biomarker notes and open data-quality findings of this patient are removed as well. PDF files stay on disk unless you opt in below.",
+    "label_delete_pdf_files": "Also delete the PDF files from disk",
+    "label_confirm_patient_name": "Type the patient name to confirm",
+    "btn_confirm_delete_patient": "🗑️ Delete Permanently",
+    "error_confirm_name_mismatch": "The typed name does not match the patient name — nothing was deleted.",
+    "msg_patient_deleted": "Patient '{name}' deleted: {reports} report(s), {values} measurement(s), {pdfs} PDF file(s) removed.",
 
     # LLM Settings tab
     "subheader_llm_settings": "LLM Settings",
@@ -808,6 +835,7 @@ EN = {
     "msg_biomarker_renamed": "{count} data point{plural} renamed from '{old}' to '{new}'.",
     "warning_no_data_points": "No data points found with name '{old}'.",
     "msg_biomarker_renamed_global": "'{old}' renamed globally to '{new}' — registry and all data points of all patients. The old name is kept as an alias.",
+    "msg_biomarker_renamed_scoped": "'{old}' renamed to '{new}' — the registry entry is global, but only **this patient's** measurements were migrated. Other patients are untouched; the old name is kept as an alias.",
     "warning_rename_collision": "'{new}' already exists in the registry. Nothing was changed — please pick a different name.",
 
     # Manual registry edit section
@@ -853,7 +881,7 @@ EN = {
     "field_unit": "Unit",
     "field_ref_range": "Reference Range",
     "msg_suggestion_skipped": "Proposal not applied: {detail}",
-    "caption_backfill_from_registry": "Copies reference ranges from the registry onto all data points (all patients) that are still missing them — e.g. after editing the registry.",
+    "caption_backfill_from_registry": "Copies reference ranges from the registry onto **this patient's** data points that are still missing them — e.g. after editing the registry.",
 
     # Data quality check (registry + actual patient measurements)
     "subheader_data_quality": "🩺 Data Quality Check",

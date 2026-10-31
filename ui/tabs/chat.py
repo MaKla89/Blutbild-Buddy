@@ -181,22 +181,24 @@ def format_chat_data_context(patient, measurements, lang, range_label="", artifa
 
 # ── Persistence helpers (plain functions — no Streamlit, unit-testable) ──────
 
-def latest_chat_answer_job(session, conversation_id: int) -> LlmJob | None:
+def latest_chat_answer_job(session, conversation_id: int,
+                          patient_id: int | None = None) -> LlmJob | None:
     """Most recent chat_answer job belonging to a conversation (any status).
 
     The conversation id lives inside ``params_json``, so the recent
     chat_answer jobs are scanned newest-first and matched in Python — cheap
-    (a handful of rows) and immune to JSON formatting differences. The scan
-    window (50) is generous: a conversation's newest job would only fall out
-    of it after 50 questions in OTHER conversations since the last visit.
+    (a handful of rows) and immune to JSON formatting differences.
+
+    ``patient_id`` narrows the scan to that patient's own jobs. That is not
+    cosmetic: the window is only 50 rows, so without the filter 50 answers from
+    *other* patients would push this patient's pending answer out of the scan and
+    it would never be adopted — a cross-patient interference bug even though no
+    data leaks (the conversation id still has to match).
     """
-    jobs = (
-        session.query(LlmJob)
-        .filter(LlmJob.kind == "chat_answer")
-        .order_by(LlmJob.id.desc())
-        .limit(50)
-        .all()
-    )
+    q = session.query(LlmJob).filter(LlmJob.kind == "chat_answer")
+    if patient_id is not None:
+        q = q.filter(LlmJob.patient_id == patient_id)
+    jobs = q.order_by(LlmJob.id.desc()).limit(50).all()
     for j in jobs:
         try:
             params = json.loads(j.params_json) if j.params_json else {}
@@ -351,7 +353,7 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
         st.caption(t("chat_no_conversation_hint"))
 
     messages = get_chat_messages(session, conv.id) if conv else []
-    job = latest_chat_answer_job(session, conv.id) if conv else None
+    job = latest_chat_answer_job(session, conv.id, patient.id) if conv else None
     pending = job is not None and job.status in ("pending", "running")
 
     # Transcript (rendered before the input is processed — st.chat_input
@@ -380,12 +382,12 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
     if conv is not None:
         if pending:
             @st.fragment(run_every=2)
-            def _chat_answer_poll(conversation_id: int):
-                _poll_chat_answer(conversation_id)
+            def _chat_answer_poll(conversation_id: int, pid: int):
+                _poll_chat_answer(conversation_id, pid)
 
-            _chat_answer_poll(conv.id)
+            _chat_answer_poll(conv.id, patient.id)
         else:
-            _poll_chat_answer(conv.id)
+            _poll_chat_answer(conv.id, patient.id)
 
     user_msg = st.chat_input(
         t("chat_input_placeholder"), key=f"chat_input_{patient.id}", disabled=pending,
@@ -412,6 +414,11 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
                 "conversation_id": conv.id,
                 "messages": build_llm_messages(get_chat_messages(session, conv.id)),
                 "data_context": context,
+                # patient_id in params scopes the (kind, patient) lock slot and
+                # is stored on the job row: another patient's in-flight answer
+                # must not block this patient's question, and the job must show
+                # up in this patient's LLM-Jobs list only.
+                "patient_id": patient.id,
             },
         )
         if submitted is None:
@@ -434,7 +441,7 @@ def render_chat_tab(session, patient, lang, min_date, max_date, time_range_key):
     st.caption(t("chat_disclaimer"))
 
 
-def _poll_chat_answer(conversation_id: int):
+def _poll_chat_answer(conversation_id: int, patient_id: int | None = None):
     """Poll this conversation's newest chat_answer job (see render_chat_tab).
 
     - pending/running → live progress bar (the worker reports chat_thinking);
@@ -444,9 +451,11 @@ def _poll_chat_answer(conversation_id: int):
       switched away stays put — the transcript updates underneath;
     - done & adopted, or error/interrupted → render nothing (the persistent
       unanswered-warning in the tab body covers failures).
+
+    ``patient_id`` scopes the job lookup (see latest_chat_answer_job).
     """
     with get_session() as s:
-        job = latest_chat_answer_job(s, conversation_id)
+        job = latest_chat_answer_job(s, conversation_id, patient_id)
         if job is None:
             return
         if job.status in ("pending", "running"):

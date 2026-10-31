@@ -3873,13 +3873,14 @@ class TestLlmJobs(unittest.TestCase):
 
     def test_duplicate_kind_rejected(self):
         import llm_jobs
+        # The lock slot is (kind, patient_id) — see llm_jobs._active_kinds.
         with llm_jobs._kind_lock:
-            llm_jobs._active_kinds.add("backfill")
+            llm_jobs._active_kinds.add(("backfill", None))
         try:
             job = llm_jobs.submit_job("backfill", "job_kind_backfill")
         finally:
             with llm_jobs._kind_lock:
-                llm_jobs._active_kinds.discard("backfill")
+                llm_jobs._active_kinds.discard(("backfill", None))
         self.assertIsNone(job)
 
     def test_error_path_sets_error_status(self):
@@ -7546,6 +7547,342 @@ class TestUiBehaviourAppTest(unittest.TestCase):
                         f"{counter['n']} translation lookups in one rerun")
 
 
+class TestPatientIsolation(unittest.TestCase):
+    """WP6/WP7: strict per-patient separation.
+
+    The whole point of the multi-user rework is that nothing a patient does can
+    read, overwrite, or delete another patient's data. These tests pin the four
+    seams where that used to leak:
+
+      * uploads are bound to the uploading patient (``pending_uploads``) and a
+        patient-scoped extraction processes ONLY that patient's queue and files
+        the report under the uploader, ignoring the name read off the PDF;
+      * ``refresh_risk_flags`` / ``backfill_reference_ranges`` write only the
+        selected patient's rows (the old global DELETE wiped everyone else's);
+      * a registry rename edits the shared registry row but migrates only the
+        acting patient's measurements;
+      * ``delete_patient`` removes every owned row and nothing else, and keeps a
+        PDF another patient still references;
+      * the LLM-job list / active set / kind lock are keyed per patient.
+
+    One fresh DB per test method — renames and deletes mutate shared state.
+    """
+
+    def setUp(self):
+        self.session = _fresh_db(f"isolation_{self._testMethodName}.db")
+        import streamlit as st
+        st.session_state.llm_base_url = "http://test:8888/v1"
+        st.session_state.llm_api_key = "test-key"
+        st.session_state.llm_model = "test-model"
+        st.session_state.llm_timeout = 30
+        st.session_state.pdf_dpi = 100
+        st.session_state.pdf_batch_size = 0
+        st.session_state._bb_lang = "de"
+
+    def tearDown(self):
+        self.session.close()
+
+    def _patient(self, name):
+        return database.get_or_create_patient(self.session, name)
+
+    def _report(self, patient, filename, file_hash, report_date=None):
+        r = database.Report(
+            patient_id=patient.id, filename=filename, file_hash=file_hash,
+            report_date=report_date or datetime(2025, 1, 1),
+        )
+        self.session.add(r)
+        self.session.commit()
+        return r
+
+    def _dp(self, report, name, value, unit, ref_low=None, ref_high=None, is_abnormal=False):
+        dp = database.DataPoint(
+            report_id=report.id, canonical_name=name, original_name=name,
+            value=value, unit=unit, ref_low=ref_low, ref_high=ref_high,
+            is_abnormal=is_abnormal,
+        )
+        self.session.add(dp)
+        self.session.commit()
+        return dp
+
+    # ── Pending uploads ──────────────────────────────────────────────────────
+
+    def test_pending_upload_binding_and_scoping(self):
+        a, b = self._patient("Alice"), self._patient("Bob")
+        self.assertTrue(database.add_pending_upload(self.session, "a.pdf", a.id))
+        self.assertTrue(database.add_pending_upload(self.session, "b.pdf", b.id))
+        # Re-adding the same file for the same patient is a no-op (no dup row).
+        self.assertFalse(database.add_pending_upload(self.session, "a.pdf", a.id))
+        # A file re-uploaded for a DIFFERENT patient is re-pointed, not duplicated.
+        self.assertTrue(database.add_pending_upload(self.session, "a.pdf", b.id))
+
+        self.assertEqual([p.filename for p in database.list_pending_uploads(self.session, a.id)], [])
+        # b.pdf was created first; a.pdf was re-pointed to Bob later, so its
+        # created_at moved to the front of the (created_at, id) order.
+        self.assertEqual([p.filename for p in database.list_pending_uploads(self.session, b.id)],
+                         ["b.pdf", "a.pdf"])
+        # Unscoped listing sees everything (admin view).
+        self.assertEqual(len(database.list_pending_uploads(self.session)), 2)
+
+        self.assertTrue(database.remove_pending_upload(self.session, "a.pdf"))
+        self.assertEqual([p.filename for p in database.list_pending_uploads(self.session, b.id)],
+                         ["b.pdf"])
+
+    def test_process_new_pdfs_forces_selected_patient(self):
+        """A patient-scoped run processes ONLY that patient's pending uploads and
+        files the report under the uploader — the name read off the PDF is ignored."""
+        from extractor import process_new_pdfs
+        from schemas import ExtractedPage, NormalizationMapping
+
+        a = self._patient("Alice")
+        b = self._patient("Bob")
+        pdf_dir = _fixture_pdf_dir(2)
+        f0, f1 = "2024 - Fixture0 - Blutbild.pdf", "2024 - Fixture1 - Blutbild.pdf"
+        database.add_pending_upload(self.session, f0, a.id)
+        database.add_pending_upload(self.session, f1, b.id)
+
+        page = ExtractedPage(**MOCK_EXTRACTED_PAGE)  # patient_name "Doe_J." on the page
+        with patch("extractor.extract_page", return_value=page), \
+             patch("extractor.extract_pages_batch",
+                   side_effect=lambda llm, pages, **kw: [page for _ in pages]), \
+             patch("extractor.normalize_names",
+                   return_value=NormalizationMapping(**MOCK_NORMALIZATION)), \
+             patch("extractor.REPORTS_DIR", str(pdf_dir)):
+            processed, errors = process_new_pdfs(self.session, patient_id=a.id)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(processed, [f0])  # only Alice's pending file ran
+        # The report belongs to Alice, NOT to the "Doe, J." the PDF name implied.
+        reports = self.session.query(database.Report).all()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].patient_id, a.id)
+        names = {p.name for p in self.session.query(database.Patient).all()}
+        self.assertNotIn("Doe, J.", names)
+        # Bob's upload is untouched and still pending; Alice's is consumed.
+        self.assertEqual([p.filename for p in database.list_pending_uploads(self.session, a.id)], [])
+        self.assertEqual([p.filename for p in database.list_pending_uploads(self.session, b.id)], [f1])
+        self.assertEqual(self.session.query(database.Report)
+                         .filter(database.Report.patient_id == b.id).count(), 0)
+
+    # ── Scoped analysis / backfill ───────────────────────────────────────────
+
+    def test_refresh_risk_flags_scoped_leaves_other_patients(self):
+        from analyzer import refresh_risk_flags
+        a, b = self._patient("Alice"), self._patient("Bob")
+        ra, rb = self._report(a, "a.pdf", "h_a"), self._report(b, "b.pdf", "h_b")
+        # Both patients have an acutely critical CRP (well above 0.5 mg/dl).
+        self._dp(ra, "CRP", 40.0, "mg/dl", ref_low=0.0, ref_high=0.5, is_abnormal=True)
+        self._dp(rb, "CRP", 40.0, "mg/dl", ref_low=0.0, ref_high=0.5, is_abnormal=True)
+
+        refresh_risk_flags(self.session, llm=None)  # global pass → both flagged
+        self.session.expire_all()
+        b_flags_before = self.session.query(database.RiskFlag).join(
+            database.Report).filter(database.Report.patient_id == b.id).count()
+        self.assertGreater(b_flags_before, 0)
+
+        # A scoped refresh of Alice must not wipe Bob's flags (the old global
+        # DELETE wiped the whole risk_flags table).
+        refresh_risk_flags(self.session, llm=None, patient_id=a.id)
+        self.session.expire_all()
+        b_flags_after = self.session.query(database.RiskFlag).join(
+            database.Report).filter(database.Report.patient_id == b.id).count()
+        a_flags = self.session.query(database.RiskFlag).join(
+            database.Report).filter(database.Report.patient_id == a.id).count()
+        self.assertEqual(b_flags_after, b_flags_before)
+        self.assertGreater(a_flags, 0)
+
+    def test_backfill_scoped_to_one_patient(self):
+        a, b = self._patient("Alice"), self._patient("Bob")
+        ra, rb = self._report(a, "a.pdf", "h_a"), self._report(b, "b.pdf", "h_b")
+        dp_a = self._dp(ra, "CRP", 5.0, "mg/dl")  # missing ref range
+        dp_b = self._dp(rb, "CRP", 5.0, "mg/dl")  # missing ref range
+
+        out = database.backfill_reference_ranges(self.session, patient_id=a.id)
+        self.session.refresh(dp_a)
+        self.session.refresh(dp_b)
+        self.assertEqual(out["updated"], 1)
+        # Alice got the registry default (0.0–0.5 mg/dl); Bob stays untouched.
+        self.assertEqual((dp_a.ref_low, dp_a.ref_high), (0.0, 0.5))
+        self.assertIsNone(dp_b.ref_low)
+        self.assertIsNone(dp_b.ref_high)
+
+    # ── Registry rename scoping ──────────────────────────────────────────────
+
+    def test_registry_rename_migrates_only_acting_patient(self):
+        a, b = self._patient("Alice"), self._patient("Bob")
+        ra, rb = self._report(a, "a.pdf", "h_a"), self._report(b, "b.pdf", "h_b")
+        dp_a = self._dp(ra, "CRP", 5.0, "mg/dl")
+        dp_b = self._dp(rb, "CRP", 5.0, "mg/dl")
+
+        out = database.update_biomarker_registry(
+            self.session, "CRP", "name", "CRP (hochsensitiv)", patient_id=a.id)
+        self.assertEqual(out["status"], "applied")
+        self.session.refresh(dp_a)
+        self.session.refresh(dp_b)
+        # Alice's measurement follows the rename; Bob's stays under the old name.
+        self.assertEqual(dp_a.canonical_name, "CRP (hochsensitiv)")
+        self.assertEqual(dp_b.canonical_name, "CRP")
+        # The registry row is global and keeps the old name resolvable as an alias.
+        row = (self.session.query(database.BiomarkerRegistry)
+               .filter_by(canonical_name="CRP (hochsensitiv)").one())
+        self.assertIn("CRP", json.loads(row.aliases))
+
+    # ── delete_patient completeness ──────────────────────────────────────────
+
+    def test_delete_patient_without_reports_returns_full_counts(self):
+        """A patient with no reports at all must still delete cleanly.
+
+        The conditional deletes only write a count key when there is something to
+        delete, so a patient created by mistake (or with uploads that were never
+        processed) used to return a dict WITHOUT ``data_points``/``risk_flags``/
+        ``artifacts``/``chat_messages`` — and the Patients tab's success message
+        reads ``result["data_points"]``, raising KeyError *after* the delete had
+        already committed (the real case: the patient vanished, the UI showed a
+        crash instead of the confirmation).
+        """
+        lonely = self._patient("Lonely")
+        self.session.commit()
+
+        counts = database.delete_patient(self.session, lonely.id)
+
+        self.assertTrue(counts.get("patient_deleted"))
+        self.assertIsNone(self.session.query(database.Patient).get(lonely.id))
+        for key in ("risk_flags", "data_points", "artifacts", "findings",
+                    "chat_messages", "chat_conversations", "summaries",
+                    "biomarker_infos", "pending_uploads", "llm_jobs", "reports",
+                    "pdf_files_deleted", "pdf_files_kept"):
+            self.assertIn(key, counts, f"counts dict missing {key!r}")
+            self.assertEqual(counts[key], 0)
+
+    def test_delete_patient_removes_everything_and_keeps_shared_pdf(self):
+        a, b = self._patient("Alice"), self._patient("Bob")
+        # Alice owns a unique PDF and one shared with Bob.
+        ra_unique = self._report(a, "unique.pdf", "h_unique")
+        ra_shared = self._report(a, "shared.pdf", "h_shared_a")
+        rb_shared = self._report(b, "shared.pdf", "h_shared_b")
+
+        dp = self._dp(ra_unique, "CRP", 5.0, "mg/dl")
+        self.session.add(database.RiskFlag(report_id=ra_unique.id, data_point_id=dp.id,
+                                           category="critical_value", severity=3,
+                                           description="x"))
+        self.session.add(database.ReportArtifact(report_id=ra_shared.id,
+                                                 category="clinical_observation", text="fatigue"))
+        self.session.add(database.PatientSummary(patient_id=a.id, summary_text="s"))
+        self.session.add(database.BiomarkerInfo(patient_id=a.id, canonical_name="CRP"))
+        self.session.add(database.DataQualityFinding(
+            patient_id=a.id, category="ref_range", target_type="registry",
+            biomarker="CRP", description="d"))
+        conv = database.create_chat_conversation(self.session, a.id, "Q?")
+        database.add_chat_message(self.session, conv.id, "user", "Q?")
+        database.add_pending_upload(self.session, "queued.pdf", a.id)
+        database.create_llm_job(self.session, "backfill", "job", patient_id=a.id)
+        # Bob also has a data point under the shared report.
+        self._dp(rb_shared, "CRP", 5.0, "mg/dl")
+        self.session.commit()
+
+        # Alice's owned ids, captured BEFORE the delete so the child tables
+        # (which key off report_id / conversation_id, not patient_id) can be
+        # checked afterwards — the reports they point at are gone by then.
+        alice_report_ids = [ra_unique.id, ra_shared.id]
+        alice_conv_ids = [conv.id]
+
+        pdf_dir = Path(tempfile.mkdtemp(prefix="bb_del_"))
+        (pdf_dir / "unique.pdf").write_bytes(b"x")
+        (pdf_dir / "shared.pdf").write_bytes(b"x")
+
+        with patch("config.REPORTS_DIR", str(pdf_dir)):
+            counts = database.delete_patient(self.session, a.id, delete_pdf_files=True)
+
+        self.assertTrue(counts.get("patient_deleted"))
+        # The patient row itself is gone.
+        self.assertIsNone(self.session.query(database.Patient).get(a.id))
+        self.assertEqual(self.session.query(database.Report)
+                         .filter(database.Report.patient_id == a.id).count(), 0)
+        # Report-keyed children (bulk deletes do NOT cascade, so these are the
+        # rows delete_patient must remove explicitly by report id).
+        for model in (database.DataPoint, database.RiskFlag, database.ReportArtifact):
+            self.assertEqual(
+                self.session.query(model)
+                .filter(model.report_id.in_(alice_report_ids)).count(), 0,
+                f"{model.__tablename__} still references Alice's reports")
+        # Patient-keyed children.
+        for model in (database.PatientSummary, database.BiomarkerInfo,
+                      database.DataQualityFinding, database.ChatConversation,
+                      database.PendingUpload, database.LlmJob):
+            self.assertEqual(
+                self.session.query(model).filter(model.patient_id == a.id).count(), 0,
+                f"{model.__tablename__} still has Alice rows")
+        # Chat messages go with their conversations.
+        self.assertEqual(
+            self.session.query(database.ChatMessage)
+            .filter(database.ChatMessage.conversation_id.in_(alice_conv_ids)).count(), 0)
+        # Bob is completely intact.
+        self.assertIsNotNone(self.session.query(database.Patient).get(b.id))
+        self.assertEqual(self.session.query(database.Report)
+                         .filter(database.Report.patient_id == b.id).count(), 1)
+        self.assertEqual(self.session.query(database.DataPoint)
+                         .filter(database.DataPoint.report_id == rb_shared.id).count(), 1)
+        # The unique PDF is deleted; the shared one is kept because Bob still uses it.
+        self.assertFalse((pdf_dir / "unique.pdf").exists())
+        self.assertTrue((pdf_dir / "shared.pdf").exists())
+        self.assertEqual(counts["pdf_files_deleted"], 1)
+        self.assertEqual(counts["pdf_files_kept"], 1)
+
+    # ── LLM job listing / kind lock scoping ──────────────────────────────────
+
+    def test_llm_job_listing_scoped(self):
+        a, b = self._patient("Alice"), self._patient("Bob")
+        ja = database.create_llm_job(self.session, "backfill", "a job", patient_id=a.id)
+        jb = database.create_llm_job(self.session, "backfill", "b job", patient_id=b.id)
+        japp = database.create_llm_job(self.session, "test_connection", "app job")  # patient NULL
+        self.session.commit()
+        # Capture ids as plain ints — after the clear the ORM instances are
+        # deleted, so touching ja.id afterwards would lazy-load a dead row.
+        ja_id, jb_id, japp_id = ja.id, jb.id, japp.id
+
+        ids_for_a = {j.id for j in database.list_llm_jobs(self.session, patient_id=a.id)}
+        self.assertIn(ja_id, ids_for_a)      # Alice's own job
+        self.assertIn(japp_id, ids_for_a)    # app-level job is visible to everyone
+        self.assertNotIn(jb_id, ids_for_a)   # Bob's job is not
+
+        # Active set is scoped the same way.
+        ja.status = jb.status = japp.status = "running"
+        self.session.commit()
+        active_a = {j.id for j in database.get_active_llm_jobs(self.session, patient_id=a.id)}
+        self.assertEqual(active_a, {ja_id, japp_id})
+
+        # Clearing finished jobs for Alice must not destroy Bob's history.
+        ja.status = jb.status = japp.status = "done"
+        self.session.commit()
+        database.clear_finished_llm_jobs(self.session, patient_id=a.id)
+        self.session.expunge_all()
+        self.assertIsNone(database.get_llm_job(self.session, ja_id))
+        self.assertIsNone(database.get_llm_job(self.session, japp_id))  # app-level cleared too
+        self.assertIsNotNone(database.get_llm_job(self.session, jb_id))
+
+    def test_kind_lock_is_per_patient(self):
+        import llm_jobs
+        a, b = self._patient("Alice"), self._patient("Bob")
+        # get_or_create_patient only flushes; commit so the test session releases
+        # its write lock before submit_job opens its own connection (SQLite is
+        # single-writer — an open txn here would block submit_job's commit).
+        self.session.commit()
+        # Simulate a running backfill for Alice: her slot is held, Bob's is free.
+        with llm_jobs._kind_lock:
+            llm_jobs._active_kinds.add(("backfill", a.id))
+        try:
+            blocked = llm_jobs.submit_job("backfill", "job_kind_backfill",
+                                          params={"patient_id": a.id})
+            other = llm_jobs.submit_job("backfill", "job_kind_backfill",
+                                        params={"patient_id": b.id}, runner=llm_jobs._run_job)
+        finally:
+            with llm_jobs._kind_lock:
+                llm_jobs._active_kinds.discard(("backfill", a.id))
+        self.assertIsNone(blocked)         # Alice's duplicate is rejected
+        self.assertIsNotNone(other)        # Bob's identical kind still runs
+        self.session.expire_all()
+        self.assertEqual(database.get_llm_job(self.session, other.id).patient_id, b.id)
+
+
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""
     if TEST_DIR.exists():
@@ -7614,6 +7951,7 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestVerifyExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestRenderScale))
     suite.addTests(loader.loadTestsFromTestCase(TestUiBehaviourAppTest))
+    suite.addTests(loader.loadTestsFromTestCase(TestPatientIsolation))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

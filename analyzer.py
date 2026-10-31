@@ -994,8 +994,16 @@ def _analyze_patient(session: SASession, patient: Patient) -> list[RiskFlag]:
     return flags
 
 
-def analyze_trends_by_patient(session: SASession) -> list[tuple[int, list[RiskFlag]]]:
-    """Detect risk flags for all patients, grouped per patient (LLM-free).
+def analyze_trends_by_patient(session: SASession,
+                              patient_id: int | None = None) -> list[tuple[int, list[RiskFlag]]]:
+    """Detect risk flags for patients, grouped per patient (LLM-free).
+
+    ``patient_id`` restricts detection to ONE patient. That is the normal path:
+    every UI trigger of a risk refresh is bound to the selected patient, and
+    detecting for the whole DB just to rebuild one patient's flags both wastes
+    work and lets one patient's flags appear in another patient's LLM ranking
+    call. ``None`` keeps the all-patient pass (used by tests and the
+    ``analyze_trends`` helper).
 
     Dedup is scoped PER PATIENT, not globally. _dedup_by_biomarker groups by
     (patient_id, base canonical name), so a global pass across all patients
@@ -1007,7 +1015,10 @@ def analyze_trends_by_patient(session: SASession) -> list[tuple[int, list[RiskFl
     be spent entirely on one patient while others get zero risk cards.
     """
     groups: list[tuple[int, list[RiskFlag]]] = []
-    for patient in session.query(Patient).all():
+    q = session.query(Patient)
+    if patient_id is not None:
+        q = q.filter(Patient.id == patient_id)
+    for patient in q.all():
         flags = _dedup_by_biomarker(
             _analyze_patient(session, patient), session, RISK_CONFIG["max_flags"]
         )
@@ -1154,8 +1165,17 @@ def _build_findings_with_context(session: SASession, flags: list[RiskFlag]) -> l
     return findings
 
 
-def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) -> int:
-    """Rebuild all risk flags and let the LLM rank + explain them PER PATIENT.
+def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None,
+                       patient_id: int | None = None) -> int:
+    """Rebuild risk flags and let the LLM rank + explain them PER PATIENT.
+
+    ``patient_id`` limits the whole operation to one patient — detection,
+    ranking AND the delete/insert. Without it the DELETE below wipes every
+    patient's flags and rebuilds all of them, which means a refresh started
+    from one patient's screen silently destroys another patient's risk cards
+    (and, if it fails or is aborted half-way, leaves them gone). Every UI
+    trigger passes the selected patient; ``None`` is only for the
+    all-patient pass (tests, startup-style rebuilds).
 
     Detection (analyze_trends_by_patient) is deterministic and LLM-free. The
     LLM then ranks each patient's own findings separately: one assess_risks
@@ -1178,7 +1198,7 @@ def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) ->
     # Detection + LLM ranking are read-only — no write lock held during the
     # (slow) LLM HTTP calls. The helpers create in-memory RiskFlag objects and
     # do not persist them, so nothing reads the old rows in between.
-    groups = analyze_trends_by_patient(session)
+    groups = analyze_trends_by_patient(session, patient_id=patient_id)
 
     from llm_client import assess_risks, is_job_aborted
 
@@ -1213,7 +1233,19 @@ def refresh_risk_flags(session: SASession, llm=None, lang: str | None = None) ->
         return 0
 
     # Only now take the write lock — for as short a time as possible.
-    session.query(RiskFlag).delete(synchronize_session=False)
+    # Scoped to the refreshed patient's own reports: deleting the whole
+    # risk_flags table here would wipe patients this run never analysed.
+    if patient_id is not None:
+        scoped_report_ids = [
+            rid for (rid,) in session.query(Report.id)
+            .filter(Report.patient_id == patient_id).all()
+        ]
+        if scoped_report_ids:
+            session.query(RiskFlag).filter(
+                RiskFlag.report_id.in_(scoped_report_ids)
+            ).delete(synchronize_session=False)
+    else:
+        session.query(RiskFlag).delete(synchronize_session=False)
     for flag in ranked_all:
         session.add(flag)
     session.commit()

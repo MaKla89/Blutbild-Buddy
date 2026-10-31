@@ -65,8 +65,14 @@ DATA_AFFECTING_KINDS = {
     "data_quality_check", "gen_description", "gen_interpretation",
 }
 
-# One worker per kind: prevents duplicate submissions of the same operation.
-_active_kinds: set[str] = set()
+# One worker per (kind, patient): prevents duplicate submissions of the same
+# operation for the same patient. Keyed by patient as well as kind because the
+# lock is process-global — keyed by kind alone, patient A's running
+# process_pdfs would make patient B's "Alle PDFs verarbeiten" button report
+# "already running" and refuse to start, which is a cross-patient interference
+# bug even though no data leaks. App-level kinds (test_connection) pass
+# patient_id=None and keep a single global slot.
+_active_kinds: set[tuple[str, int | None]] = set()
 # Job ids with a live worker thread in THIS process — startup cleanup must
 # never mark these interrupted (they are still running).
 _active_job_ids: set[int] = set()
@@ -101,29 +107,39 @@ def _capture_config_snapshot() -> dict:
     }
 
 
-def submit_job(kind: str, label_key: str, params: dict | None = None, runner=None):
-    """Submit a background job; returns the LlmJob row, or None if a job of
-    the same kind is already pending/running (UI shows "already running").
+def submit_job(kind: str, label_key: str, params: dict | None = None, runner=None,
+               patient_id: int | None = None):
+    """Submit a background job; returns the LlmJob row, or None if the same
+    operation is already pending/running **for the same patient** (UI shows
+    "already running").
 
     ``runner`` is a test hook: a callable(job_id) that executes the worker
     synchronously instead of spawning a daemon thread.
+
+    ``patient_id`` is the scope of the kind lock and is stored on the job row.
+    When not passed explicitly it is read from ``params["patient_id"]`` — every
+    patient-scoped kind already carries it there, so a call site cannot forget
+    it and accidentally share a lock slot (or a job list) with another patient.
     """
+    if patient_id is None and isinstance(params, dict):
+        patient_id = params.get("patient_id")
+    lock_key = (kind, patient_id)
     with _kind_lock:
-        if kind in _active_kinds:
+        if lock_key in _active_kinds:
             return None
-        _active_kinds.add(kind)
+        _active_kinds.add(lock_key)
 
     lang = _get_lang()
     snapshot = _capture_config_snapshot()
     session = get_session()
     try:
         job = create_llm_job(session, kind, t(label_key, lang=lang),
-                             config=snapshot, params=params)
+                             config=snapshot, params=params, patient_id=patient_id)
     except Exception:
         # Job creation failed (e.g. transient DB lock): release the kind lock
         # so this kind isn't permanently blocked in this process.
         with _kind_lock:
-            _active_kinds.discard(kind)
+            _active_kinds.discard(lock_key)
         raise
     finally:
         session.close()
@@ -139,13 +155,15 @@ def submit_job(kind: str, label_key: str, params: dict | None = None, runner=Non
                 _active_job_ids.discard(job.id)
     else:
         try:
-            threading.Thread(target=_run_job, args=(job.id, kind), daemon=True).start()
+            threading.Thread(
+                target=_run_job, args=(job.id, kind, patient_id), daemon=True,
+            ).start()
         except Exception as e:
             # Thread creation failed (e.g. OS thread limit): without this the
             # kind would stay in _active_kinds forever and the row would sit
             # 'pending' — the kind blocked for the whole process lifetime.
             with _kind_lock:
-                _active_kinds.discard(kind)
+                _active_kinds.discard(lock_key)
                 _active_job_ids.discard(job.id)
             try:
                 s = get_session()
@@ -185,22 +203,27 @@ def abort_job(job_id: int) -> bool:
     return True
 
 
-def _run_job(job_id: int, kind_hint: str = ""):
+def _run_job(job_id: int, kind_hint: str = "", patient_hint: int | None = None):
     """Worker entry point: run the job's work function and record the outcome.
 
-    ``kind_hint`` is the kind passed by submit_job(): the finally block must
-    release the kind lock even when the DB row vanished before the worker
-    started (job is None → kind never read from the row). Test runners call
-    this as ``runner(job_id)``, so the hint stays optional.
+    ``kind_hint``/``patient_hint`` are what submit_job() reserved in
+    ``_active_kinds``: the finally block must release that exact slot even when
+    the DB row vanished before the worker started (job is None → neither half
+    can be read from the row). Test runners call this as ``runner(job_id)``, so
+    both hints stay optional — the row then supplies them.
     """
     session = get_session()
     kind = kind_hint
+    lock_key: tuple[str, int | None] = (kind_hint, patient_hint)
     lang = "de"  # default; overwritten from the config snapshot below
     try:
         job = get_llm_job(session, job_id)
         if job is None:
             return
         kind = job.kind
+        # The lock slot is (kind, patient) — recover the patient half from the
+        # row so the finally block releases exactly what submit_job reserved.
+        lock_key = (kind, job.patient_id)
         cfg = json.loads(job.config_json) if job.config_json else {}
         params = json.loads(job.params_json) if job.params_json else {}
         set_job_config(cfg)
@@ -265,7 +288,7 @@ def _run_job(job_id: int, kind_hint: str = ""):
             # this worker, so it must be released even when the job row
             # vanished and `kind` was never read from it (kind_hint covers).
             if kind:
-                _active_kinds.discard(kind)
+                _active_kinds.discard(lock_key)
             _active_job_ids.discard(job_id)
 
 
@@ -359,9 +382,16 @@ def _job_process_pdfs(session, cfg, lang, params):
     def progress(msg, pct):
         _update_progress(session, getattr(_current_job_id_var, "job_id", None), msg, pct)
 
+    # The patient selected at submit time. Every upload is bound to a patient in
+    # pending_uploads, so a process_pdfs job always has one; patient_id=None only
+    # happens for legacy rows / the all-patient admin path, which keeps the old
+    # folder scan + name-derived attribution.
+    patient_id = params.get("patient_id")
+
     processed, errors = process_new_pdfs(
         session, progress_callback=progress,
         dpi=cfg.get("dpi"), batch_size=cfg.get("batch_size"),
+        patient_id=patient_id,
     )
     if is_job_aborted():
         # Partial results are already committed per PDF; skip the follow-up
@@ -370,12 +400,14 @@ def _job_process_pdfs(session, cfg, lang, params):
     n_risks = 0
     if processed:
         try:
-            n_risks = refresh_risk_flags(session, _build_client(), lang=lang)
+            # Scoped to the patient whose uploads were just processed: refreshing
+            # globally here would delete and rebuild every other patient's flags.
+            n_risks = refresh_risk_flags(session, _build_client(), lang=lang,
+                                         patient_id=patient_id)
         except Exception as e:
             errors.append(f"{t('error_risk_flags', lang=lang)}: {e}")
 
     # Auto-generate the health summary for the patient selected at submit time.
-    patient_id = params.get("patient_id")
     if processed and patient_id is not None:
         p = session.query(Patient).filter(Patient.id == patient_id).first()
         if p:
@@ -759,7 +791,7 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         processed, errors = process_new_pdfs(
             session, progress_callback=progress,
             dpi=cfg.get("dpi"), batch_size=cfg.get("batch_size"),
-            force=True, only_files=set(targets),
+            force=True, only_files=set(targets), patient_id=patient_id,
         )
     except Exception as exc:
         # process_new_pdfs builds the LLM client and the registry BEFORE its
@@ -880,7 +912,12 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
 
 
 def _job_refresh_risks(session, cfg, lang, params):
-    n = refresh_risk_flags(session, _build_client(), lang=lang)
+    # Patient-scoped: the button lives in the selected patient's Reports tab, and
+    # an unscoped refresh deletes every patient's flags before rebuilding them.
+    patient_id = params.get("patient_id")
+    n = refresh_risk_flags(session, _build_client(), lang=lang, patient_id=patient_id)
+    if patient_id is not None:
+        return "success", t("msg_risks_refreshed", lang=lang, n=n)
     return "success", t("msg_risks_refreshed_all", lang=lang, n=n)
 
 
@@ -1226,7 +1263,9 @@ def _job_test_connection(session, cfg, lang, params):
 
 
 def _job_backfill(session, cfg, lang, params):
-    result = backfill_reference_ranges(session)
+    # Patient-scoped: writing reference ranges into another patient's
+    # measurements is editing their data, not maintaining shared reference data.
+    result = backfill_reference_ranges(session, patient_id=params.get("patient_id"))
     if result["updated"] > 0:
         return "success", t("msg_backfill_complete", lang=lang, n=result["updated"])
     if (result["skipped_unknown"] or result["skipped_no_range"]

@@ -2,6 +2,7 @@ from datetime import datetime
 import difflib
 import json
 import logging
+from pathlib import Path
 import re
 
 from sqlalchemy import (
@@ -337,6 +338,13 @@ class LlmJob(Base):
     id = Column(Integer, primary_key=True)
     kind = Column(String(50), nullable=False, index=True)  # process_pdfs | refresh_risks | ...
     label = Column(String(255), nullable=False)  # human-readable description (translated at submit time)
+    # The patient a job belongs to, denormalised out of ``params_json`` at submit
+    # time. Every patient-scoped kind MUST set it: the LLM-Jobs tab filters on it
+    # so one patient never sees (or clears) another patient's job history, and the
+    # kind lock is keyed by (kind, patient_id) so patient A's run cannot block
+    # patient B's button. NULL only for genuinely app-level kinds
+    # (test_connection) and legacy rows.
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=True, index=True)
     status = Column(String(20), nullable=False, default="pending", index=True)  # pending|running|done|error|interrupted
     progress_current = Column(Integer, nullable=True)
     progress_total = Column(Integer, nullable=True)
@@ -352,6 +360,32 @@ class LlmJob(Base):
 
     def __repr__(self):
         return f"<LlmJob {self.id} {self.kind} {self.status}>"
+
+
+class PendingUpload(Base):
+    """An uploaded PDF that is waiting to be processed, bound to one patient.
+
+    Before this table existed, an upload landed in the shared ``reports_input/``
+    folder with no owner, and the patient was only decided later by reading the
+    name off the PDF. That meant every patient's Reports tab listed every other
+    patient's pending uploads, and "Alle PDFs verarbeiten" could hand another
+    patient's document to whichever name the LLM happened to read. A pending
+    upload now carries its ``patient_id`` from the moment it is saved, so the
+    file list a patient sees is exactly their own, and extraction assigns to the
+    patient who uploaded it instead of guessing.
+
+    The row is removed once the PDF is extracted; a failed extraction keeps it so
+    the upload is retried on the next run.
+    """
+    __tablename__ = "pending_uploads"
+
+    id = Column(Integer, primary_key=True)
+    filename = Column(String(500), nullable=False, unique=True)
+    patient_id = Column(Integer, ForeignKey("patients.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<PendingUpload {self.filename} patient={self.patient_id}>"
 
 
 class DataQualityFinding(Base):
@@ -483,6 +517,7 @@ def init_db():
     _migrate_chat_conversations(engine)
     _migrate_report_artifacts(engine)
     _migrate_data_point_result_columns(engine)
+    _migrate_patient_scoped_jobs(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -845,6 +880,30 @@ def _migrate_data_point_result_columns(engine):
             for ddl in ddls:
                 conn.execute(text(ddl))
             conn.commit()
+
+
+def _migrate_patient_scoped_jobs(engine):
+    """Add ``llm_jobs.patient_id`` and create the ``pending_uploads`` table.
+
+    Both exist so patient data never crosses between patients: the job row
+    carries its patient so the LLM-Jobs list can be filtered, and an upload
+    carries its patient so the pending-file list is scoped and extraction never
+    has to guess an owner from the PDF text.
+
+    Existing job rows are left with ``patient_id`` NULL rather than back-filled
+    from ``params_json``: they are finished history, and a wrong guess would
+    show a job under the wrong patient — which is exactly the leak this closes.
+    NULL rows are treated as app-level and stay visible to nobody but the
+    patient list (they simply never match a patient filter).
+    """
+    inspector = inspect(engine)
+    job_columns = [c["name"] for c in inspector.get_columns("llm_jobs")]
+    if "patient_id" not in job_columns:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE llm_jobs ADD COLUMN patient_id INTEGER"))
+            conn.commit()
+    if "pending_uploads" not in inspector.get_table_names():
+        PendingUpload.__table__.create(engine)
 
 
 # ── Registry loader (cached) ─────────────────────────────────────────────────
@@ -1663,6 +1722,171 @@ def merge_patients(session: SASession, source_patient_id: int, target_patient_id
     }
 
 
+def delete_patient(session: SASession, patient_id: int, delete_pdf_files: bool = False) -> dict:
+    """Delete a patient and EVERYTHING belonging to them.
+
+    The counterpart to :func:`merge_patients`: merging re-homes a patient's data
+    onto another patient, this destroys it. Both are admin actions in the
+    Patients tab, and both must be explicit — a patient's reports are medical
+    data, so the UI wraps this in a confirmation dialog naming the blast radius.
+
+    SQLite does not enforce the foreign keys and the ORM cascade only covers the
+    relationships declared on ``Patient`` (reports, chat conversations), so every
+    other table keyed by ``patient_id`` is removed explicitly. Missing one would
+    leave unreachable rows that still count in statistics and could resurface if
+    the rowid were ever reused:
+
+      reports → data_points, risk_flags, report_artifacts (bulk deletes do NOT
+      apply ORM cascades, so the children are deleted by report id first),
+      patient_summaries, biomarker_infos, data_quality_findings,
+      chat_conversations (+ messages), pending_uploads, llm_jobs.
+
+    ``delete_pdf_files`` additionally removes the patient's PDFs from
+    ``REPORTS_DIR``. Off by default: the file may be shared with another patient
+    (the same PDF processed twice is rejected by the unique ``file_hash``, so a
+    duplicate upload never created a second row, but a report re-attributed by a
+    merge can share one), and deleting a source document is irreversible.
+
+    Returns a dict of delete counts plus ``pdf_files_deleted`` /
+    ``pdf_files_kept`` so the UI can report exactly what happened.
+    """
+    patient = session.query(Patient).filter(Patient.id == patient_id).first()
+    if patient is None:
+        return {"error": "patient not found"}
+
+    report_ids = [
+        rid for (rid,) in session.query(Report.id).filter(Report.patient_id == patient_id).all()
+    ]
+    # Capture the report filenames NOW, before the report rows are deleted below.
+    # The PDF-cleanup loop at the end re-queries Report.filename — but by then the
+    # rows are gone, so it would find nothing and silently keep every PDF even when
+    # delete_pdf_files is set. The filename list is the only record of which files
+    # belonged to this patient once the rows are deleted.
+    report_filenames = [
+        fn for (fn,) in session.query(Report.filename)
+        .filter(Report.patient_id == patient_id).all()
+    ]
+    # Every count key is seeded with 0 so the returned dict ALWAYS has the full
+    # shape. The conditional deletes below only write a key when there is
+    # something to delete — a patient with no reports (created by mistake, or
+    # uploaded-but-never-processed) has none of them, and the Patients tab's
+    # success message reads result["data_points"] unconditionally, which raised
+    # KeyError and hid the fact that the delete had already succeeded.
+    counts: dict[str, int] = {
+        "risk_flags": 0, "data_points": 0, "artifacts": 0, "findings": 0,
+        "chat_messages": 0, "chat_conversations": 0, "summaries": 0,
+        "biomarker_infos": 0, "pending_uploads": 0, "llm_jobs": 0, "reports": 0,
+    }
+
+    def _delete(q, key):
+        counts[key] = q.delete(synchronize_session=False)
+
+    if report_ids:
+        _delete(session.query(RiskFlag).filter(RiskFlag.report_id.in_(report_ids)), "risk_flags")
+        _delete(session.query(DataPoint).filter(DataPoint.report_id.in_(report_ids)), "data_points")
+        _delete(session.query(ReportArtifact).filter(ReportArtifact.report_id.in_(report_ids)),
+                "artifacts")
+    # Findings reference reports and data points that are about to disappear;
+    # an accepted fix targeting dead rows could never be applied anyway.
+    _delete(session.query(DataQualityFinding).filter(
+        DataQualityFinding.patient_id == patient_id), "findings")
+    # Chat messages go with their conversations — the ORM cascade covers this for
+    # a Patient delete, but the explicit conversation delete keeps the count
+    # honest and works regardless of cascade configuration.
+    conv_ids = [
+        cid for (cid,) in session.query(ChatConversation.id)
+        .filter(ChatConversation.patient_id == patient_id).all()
+    ]
+    if conv_ids:
+        _delete(session.query(ChatMessage).filter(
+            ChatMessage.conversation_id.in_(conv_ids)), "chat_messages")
+    _delete(session.query(ChatConversation).filter(
+        ChatConversation.patient_id == patient_id), "chat_conversations")
+    _delete(session.query(PatientSummary).filter(
+        PatientSummary.patient_id == patient_id), "summaries")
+    _delete(session.query(BiomarkerInfo).filter(
+        BiomarkerInfo.patient_id == patient_id), "biomarker_infos")
+    _delete(session.query(PendingUpload).filter(
+        PendingUpload.patient_id == patient_id), "pending_uploads")
+    _delete(session.query(LlmJob).filter(LlmJob.patient_id == patient_id), "llm_jobs")
+    counts["reports"] = len(report_ids)
+    _delete(session.query(Report).filter(Report.patient_id == patient_id), "reports")
+
+    pdf_deleted = pdf_kept = 0
+    if delete_pdf_files and report_filenames:
+        pdf_dir = Path(_config.REPORTS_DIR)
+        for filename in report_filenames:
+            # Only drop a PDF no other patient still references.
+            still_used = (
+                session.query(Report.id)
+                .filter(Report.filename == filename, Report.patient_id != patient_id)
+                .first()
+            )
+            if still_used is not None:
+                pdf_kept += 1
+                continue
+            try:
+                (pdf_dir / filename).unlink(missing_ok=True)
+                pdf_deleted += 1
+            except OSError:
+                pdf_kept += 1
+
+    session.delete(patient)  # cascade covers any report rows not already deleted
+    session.commit()
+    counts["patient_deleted"] = True
+    counts["pdf_files_deleted"] = pdf_deleted
+    counts["pdf_files_kept"] = pdf_kept
+    return counts
+
+
+# ── Pending uploads (uploaded PDFs bound to a patient — see ui/tabs/reports.py)
+
+def add_pending_upload(session: SASession, filename: str, patient_id: int) -> bool:
+    """Record that ``filename`` was uploaded for ``patient_id``.
+
+    Returns False when the file is already pending for the same patient (a
+    re-upload of the same name is a no-op, not a duplicate row). A file pending
+    for a DIFFERENT patient is re-pointed: the upload that just happened is the
+    current intent, and the on-disk file is a single shared path anyway.
+    """
+    existing = (
+        session.query(PendingUpload).filter(PendingUpload.filename == filename).first()
+    )
+    if existing is not None:
+        if existing.patient_id == patient_id:
+            return False
+        existing.patient_id = patient_id
+        existing.created_at = datetime.utcnow()
+        session.commit()
+        return True
+    session.add(PendingUpload(filename=filename, patient_id=patient_id))
+    session.commit()
+    return True
+
+
+def list_pending_uploads(session: SASession, patient_id: int | None = None) -> list[PendingUpload]:
+    """Pending uploads, oldest first — one patient's own, or all when unscoped."""
+    q = session.query(PendingUpload)
+    if patient_id is not None:
+        q = q.filter(PendingUpload.patient_id == patient_id)
+    return q.order_by(PendingUpload.created_at, PendingUpload.id).all()
+
+
+def remove_pending_upload(session: SASession, filename: str) -> bool:
+    """Drop the pending marker once a PDF has been extracted. True if a row went.
+
+    Commits on its own: the extractor calls it right after committing the report,
+    and without a commit here the delete would sit in a fresh transaction that
+    nothing closes when the last PDF of a run succeeds — the upload would reappear
+    in the list and be re-extracted (then rejected on the unique file_hash).
+    """
+    went = bool(session.query(PendingUpload).filter(
+        PendingUpload.filename == filename).delete(synchronize_session=False))
+    if went:
+        session.commit()
+    return went
+
+
 def get_session() -> SASession:
     return _get_session_local()()
 
@@ -1788,15 +2012,24 @@ def collect_report_artifacts(
 # ── LlmJob CRUD (background jobs — see llm_jobs.py) ─────────────────────────
 
 def create_llm_job(session: SASession, kind: str, label: str,
-                   config: dict | None = None, params: dict | None = None) -> LlmJob:
+                   config: dict | None = None, params: dict | None = None,
+                   patient_id: int | None = None) -> LlmJob:
     """Insert a new job row in 'pending' state and return it.
 
     ``config`` is the LLM/render settings snapshot (base_url, model, api_key,
     timeout, dpi, batch_size, lang) captured at submit time — workers run
     outside the Streamlit script context and must not read session state.
     ``params`` holds job-specific inputs (patient_id, patient name, ...).
+
+    ``patient_id`` is stored as its own column rather than left inside
+    ``params_json`` so the LLM-Jobs list can filter it in SQL. When it is not
+    passed explicitly it is taken from ``params["patient_id"]`` — every
+    patient-scoped job already carries it there, so forgetting to pass it
+    separately cannot leak a job into another patient's list.
     """
-    job = LlmJob(kind=kind, label=label, status="pending",
+    if patient_id is None and isinstance(params, dict):
+        patient_id = params.get("patient_id")
+    job = LlmJob(kind=kind, label=label, status="pending", patient_id=patient_id,
                  config_json=json.dumps(config) if config else None,
                  params_json=json.dumps(params) if params else None)
     session.add(job)
@@ -1809,31 +2042,42 @@ def get_llm_job(session: SASession, job_id: int) -> LlmJob | None:
     return session.query(LlmJob).filter(LlmJob.id == job_id).first()
 
 
-def list_llm_jobs(session: SASession, limit: int = 20) -> list[LlmJob]:
-    """Most recent jobs first (newest id = newest job)."""
-    return (
-        session.query(LlmJob)
-        .order_by(LlmJob.id.desc())
-        .limit(limit)
-        .all()
-    )
+def list_llm_jobs(session: SASession, limit: int = 20,
+                  patient_id: int | None = None) -> list[LlmJob]:
+    """Most recent jobs first (newest id = newest job).
+
+    ``patient_id`` restricts the list to one patient's jobs (plus app-level rows
+    with no patient, e.g. a connection test). Passing it is what keeps the
+    LLM-Jobs tab from showing another patient's report names and results.
+    """
+    q = session.query(LlmJob)
+    if patient_id is not None:
+        q = q.filter((LlmJob.patient_id == patient_id) | (LlmJob.patient_id.is_(None)))
+    return q.order_by(LlmJob.id.desc()).limit(limit).all()
 
 
-def get_active_llm_jobs(session: SASession) -> list[LlmJob]:
-    """Jobs in 'pending' or 'running' state."""
-    return (
-        session.query(LlmJob)
-        .filter(LlmJob.status.in_(["pending", "running"]))
-        .order_by(LlmJob.id)
-        .all()
-    )
+def get_active_llm_jobs(session: SASession,
+                        patient_id: int | None = None) -> list[LlmJob]:
+    """Jobs in 'pending' or 'running' state.
+
+    ``patient_id`` scopes the result the same way as :func:`list_llm_jobs` — the
+    polling fragment and the "job already running" button state must both be
+    patient-scoped, or one patient's running job renders a disabled button for
+    another patient.
+    """
+    q = session.query(LlmJob).filter(LlmJob.status.in_(["pending", "running"]))
+    if patient_id is not None:
+        q = q.filter((LlmJob.patient_id == patient_id) | (LlmJob.patient_id.is_(None)))
+    return q.order_by(LlmJob.id).all()
 
 
-def clear_finished_llm_jobs(session: SASession) -> int:
+def clear_finished_llm_jobs(session: SASession, patient_id: int | None = None) -> int:
     """Delete finished job rows (done/error/interrupted); returns the count.
 
     User action from the LLM-Jobs tab — keeps the list short. Pending/running
-    jobs are never touched.
+    jobs are never touched. ``patient_id`` restricts the cleanup to one patient's
+    rows (plus app-level rows), so clearing the list can never destroy another
+    patient's job history.
 
     A finished ``chat_answer`` job whose answer has not been adopted into its
     conversation yet is adopted FIRST (the chat tab's poll may not have run
@@ -1843,8 +2087,12 @@ def clear_finished_llm_jobs(session: SASession) -> int:
     finished = (
         session.query(LlmJob)
         .filter(LlmJob.status.in_(["done", "error", "interrupted"]))
-        .all()
     )
+    if patient_id is not None:
+        finished = finished.filter(
+            (LlmJob.patient_id == patient_id) | (LlmJob.patient_id.is_(None))
+        )
+    finished = finished.all()
     for job in finished:
         if job.kind != "chat_answer" or job.status != "done" or not job.result_text:
             continue
@@ -1863,8 +2111,12 @@ def clear_finished_llm_jobs(session: SASession) -> int:
     result = (
         session.query(LlmJob)
         .filter(LlmJob.status.in_(["done", "error", "interrupted"]))
-        .delete(synchronize_session=False)
     )
+    if patient_id is not None:
+        result = result.filter(
+            (LlmJob.patient_id == patient_id) | (LlmJob.patient_id.is_(None))
+        )
+    result = result.delete(synchronize_session=False)
     session.commit()
     return result
 
@@ -2055,7 +2307,54 @@ def _parse_ref_range(proposed: str) -> tuple[float | None, float | None, str | N
     return (None, None, None)
 
 
-def _mutate_registry_row(session: SASession, row: BiomarkerRegistry, field: str, proposed: str) -> tuple[bool, str]:
+def _migrate_name_rows(session: SASession, old_name: str, new_name: str,
+                       patient_id: int | None) -> tuple[int, int]:
+    """Rename ``old_name`` → ``new_name`` on DataPoint / BiomarkerInfo rows.
+
+    ``patient_id`` scopes the migration to ONE patient. That is the whole point
+    of the parameter: the registry is a shared dictionary (canonical names,
+    aliases, default ranges — reference data, not patient data), so a registry
+    row edit may stay global, but rewriting another patient's stored
+    measurements is not a reference-data edit, it is editing their medical data
+    behind their back. With a patient scope, the other patients keep their rows
+    under the old name — which stays resolvable because the old name is recorded
+    as an alias of the survivor — and their own Mapping tab surfaces the now
+    unregistered name so THEY can decide to apply the same fix.
+
+    ``patient_id=None`` keeps the old global behaviour for admin paths that
+    genuinely intend to touch every patient. Returns (data_points, infos).
+    """
+    # The patient scope needs a JOIN, and SQLAlchemy refuses .update() on a
+    # joined Query — so resolve the matching ids first, then update by id.
+    dp_ids = [
+        dp_id
+        for (dp_id,) in (
+            session.query(DataPoint.id)
+            .join(Report, DataPoint.report_id == Report.id)
+            .filter(DataPoint.canonical_name == old_name,
+                    Report.patient_id == patient_id)
+            .all()
+        )
+    ] if patient_id is not None else [
+        dp_id
+        for (dp_id,) in session.query(DataPoint.id)
+        .filter(DataPoint.canonical_name == old_name).all()
+    ]
+    dps = (
+        session.query(DataPoint).filter(DataPoint.id.in_(dp_ids))
+        .update({DataPoint.canonical_name: new_name}, synchronize_session=False)
+        if dp_ids else 0
+    )
+    info_q = session.query(BiomarkerInfo).filter(BiomarkerInfo.canonical_name == old_name)
+    if patient_id is not None:
+        info_q = info_q.filter(BiomarkerInfo.patient_id == patient_id)
+    infos = info_q.update({BiomarkerInfo.canonical_name: new_name},
+                          synchronize_session="fetch")
+    return dps, infos
+
+
+def _mutate_registry_row(session: SASession, row: BiomarkerRegistry, field: str, proposed: str,
+                         patient_id: int | None = None) -> tuple[bool, str]:
     """Apply one field change to a registry row (no commit).
 
     Shared by the manual edit path (update_biomarker_registry) and the
@@ -2096,14 +2395,9 @@ def _mutate_registry_row(session: SASession, row: BiomarkerRegistry, field: str,
             )
             if clash is not None:
                 return False, f"registry already contains '{proposed}'"
-        # Global rename: every data point and biomarker info row across all
-        # patients, mirroring the per-patient rename_canonical_name().
-        session.query(DataPoint).filter(
-            DataPoint.canonical_name == old_name
-        ).update({DataPoint.canonical_name: proposed}, synchronize_session="fetch")
-        session.query(BiomarkerInfo).filter(
-            BiomarkerInfo.canonical_name == old_name
-        ).update({BiomarkerInfo.canonical_name: proposed}, synchronize_session="fetch")
+        # Rename the data points and biomarker info rows. Scoped to the patient
+        # who triggered the edit when one is known — see _migrate_name_rows().
+        _migrate_name_rows(session, old_name, proposed, patient_id)
         # Keep the old name resolvable as an alias for incoming PDF names.
         aliases = json.loads(row.aliases) if row.aliases else []
         if not isinstance(aliases, list):
@@ -2117,15 +2411,16 @@ def _mutate_registry_row(session: SASession, row: BiomarkerRegistry, field: str,
     return True, proposed
 
 
-def _merge_registry_rows(session: SASession, source_name: str, target_row: BiomarkerRegistry) -> tuple[bool, str]:
+def _merge_registry_rows(session: SASession, source_name: str, target_row: BiomarkerRegistry,
+                         patient_id: int | None = None) -> tuple[bool, str]:
     """Fold a biomarker name into another registry row (no commit).
 
     Used by the data-quality "merge" fix (_apply_registry_fix) to resolve
     cross-entry duplicates/typos. Everything named after ``source_name`` is
     migrated onto the target:
-      - every DataPoint and BiomarkerInfo row named ``source_name`` is renamed
-        to the target (across ALL patients), mirroring the name-rename branch of
-        _mutate_registry_row();
+      - the DataPoint and BiomarkerInfo rows named ``source_name`` are renamed
+        to the target — scoped to ``patient_id`` when given, across all patients
+        otherwise (see :func:`_migrate_name_rows`);
       - if a registry row exists for ``source_name``, its units are merged into
         the target's (case-insensitive dedup) and the row is deleted;
       - ``source_name`` is appended to the target's aliases so
@@ -2135,13 +2430,8 @@ def _merge_registry_rows(session: SASession, source_name: str, target_row: Bioma
     LLM the patient's raw data-point names, so a variant often has data points
     but no registry row yet — only the canonical target does. Returns (ok, detail).
     """
-    # Migrate data points and info rows globally, source -> target.
-    session.query(DataPoint).filter(
-        DataPoint.canonical_name == source_name
-    ).update({DataPoint.canonical_name: target_row.canonical_name}, synchronize_session="fetch")
-    session.query(BiomarkerInfo).filter(
-        BiomarkerInfo.canonical_name == source_name
-    ).update({BiomarkerInfo.canonical_name: target_row.canonical_name}, synchronize_session="fetch")
+    # Migrate data points and info rows, source -> target (patient-scoped).
+    _migrate_name_rows(session, source_name, target_row.canonical_name, patient_id)
 
     # Merge units into the target (case-insensitive dedup, keep target order).
     def _as_list(raw):
@@ -2177,12 +2467,17 @@ def _merge_registry_rows(session: SASession, source_name: str, target_row: Bioma
     return True, target_row.canonical_name
 
 
-def update_biomarker_registry(session: SASession, canonical_name: str, field: str, proposed: str) -> dict:
+def update_biomarker_registry(session: SASession, canonical_name: str, field: str, proposed: str,
+                              patient_id: int | None = None) -> dict:
     """Manually edit one field of a registry row (source='manual').
 
     If the name has no registry row yet (e.g. a custom biomarker), 'unit' and
     'ref_range' edits create the row; 'name' edits still require an existing
     row. Returns {'status': 'applied'|'skipped', 'field': str, 'detail': str}.
+
+    ``patient_id`` scopes the DATA migration of a 'name' edit to one patient.
+    The registry row itself is always global — it is shared reference data — but
+    a rename must never rewrite measurements belonging to a different patient.
     """
     field = str(field).strip()
     proposed = str(proposed).strip()
@@ -2210,7 +2505,7 @@ def update_biomarker_registry(session: SASession, canonical_name: str, field: st
         )
         session.add(row)
 
-    ok, detail = _mutate_registry_row(session, row, field, proposed)
+    ok, detail = _mutate_registry_row(session, row, field, proposed, patient_id=patient_id)
     if not ok:
         return {"status": "skipped", "field": field, "detail": detail}
 
@@ -2223,8 +2518,15 @@ def update_biomarker_registry(session: SASession, canonical_name: str, field: st
 
 # ── Reference Range Backfill ──────────────────────────────────────────────────
 
-def backfill_reference_ranges(session: SASession) -> dict:
+def backfill_reference_ranges(session: SASession, patient_id: int | None = None) -> dict:
     """Backfill missing ref_low/ref_high for DataPoints using registry defaults.
+
+    ``patient_id`` restricts the pass to one patient's measurements — the
+    button that triggers it always belongs to the selected patient, and writing
+    reference ranges into another patient's rows is editing their data. The
+    registry it reads from stays global (reference data), only the writes are
+    scoped. ``None`` keeps the all-patient pass for callers that genuinely want
+    it (none in the UI today).
 
     For each DataPoint where either ref_low or ref_high is None, looks up the
     canonical name in the active DB registry (seeded from config, mutable via
@@ -2247,12 +2549,15 @@ def backfill_reference_ranges(session: SASession) -> dict:
     skipped_no_range = 0
     skipped_unconvertible = 0
 
-    # Find all DataPoints where EITHER ref_low or ref_high is NULL
-    missing_dps = (
-        session.query(DataPoint)
-        .filter(DataPoint.ref_low.is_(None) | DataPoint.ref_high.is_(None))
-        .all()
+    # Find all DataPoints where EITHER ref_low OR ref_high is NULL
+    missing_q = session.query(DataPoint).filter(
+        DataPoint.ref_low.is_(None) | DataPoint.ref_high.is_(None)
     )
+    if patient_id is not None:
+        missing_q = missing_q.join(Report, DataPoint.report_id == Report.id).filter(
+            Report.patient_id == patient_id
+        )
+    missing_dps = missing_q.all()
 
     for dp in missing_dps:
         # Try flexible lookup: exact match, alias match, or partial match
@@ -2638,7 +2943,14 @@ def _apply_registry_fix(session: SASession, finding: DataQualityFinding, params:
 
     Returns (ok, detail). No commit — the caller commits once both the mutation
     and the status update are staged.
+
+    ``finding.patient_id`` is passed down as the scope for every DataPoint /
+    BiomarkerInfo migration. A finding is always raised in one patient's context
+    (the data-quality check, the extractor guards, the verify audit), so
+    accepting it may only rewrite that patient's measurements — never another
+    patient's, which is what the unscoped global migration used to do.
     """
+    scope = finding.patient_id
     if finding.action == "merge":
         target = str(params.get("target", "") or "").strip()
         source_name = finding.biomarker
@@ -2662,7 +2974,11 @@ def _apply_registry_fix(session: SASession, finding: DataQualityFinding, params:
             # measurements at all is a hallucination — skip it.
             has_measurements = (
                 session.query(DataPoint.id)
-                .filter(func.lower(DataPoint.canonical_name) == target.lower())
+                .join(Report, DataPoint.report_id == Report.id)
+                .filter(
+                    func.lower(DataPoint.canonical_name) == target.lower(),
+                    Report.patient_id == scope,
+                )
                 .first()
                 is not None
             )
@@ -2673,7 +2989,7 @@ def _apply_registry_fix(session: SASession, finding: DataQualityFinding, params:
                 source="llm_accepted", updated_at=datetime.utcnow(),
             )
             session.add(target_row)
-        ok, detail = _merge_registry_rows(session, source_name, target_row)
+        ok, detail = _merge_registry_rows(session, source_name, target_row, patient_id=scope)
         if ok:
             target_row.source = "llm_accepted"
             target_row.updated_at = datetime.utcnow()
@@ -2698,7 +3014,11 @@ def _apply_registry_fix(session: SASession, finding: DataQualityFinding, params:
             return False, f"'{name}' already has a registry row"
         has_measurements = (
             session.query(DataPoint.id)
-            .filter(func.lower(DataPoint.canonical_name) == name.lower())
+            .join(Report, DataPoint.report_id == Report.id)
+            .filter(
+                func.lower(DataPoint.canonical_name) == name.lower(),
+                Report.patient_id == scope,
+            )
             .first()
             is not None
         )
@@ -2749,7 +3069,7 @@ def _apply_registry_fix(session: SASession, finding: DataQualityFinding, params:
         else:
             return False, f"registry row not found for '{finding.biomarker}'"
 
-    ok, detail = _mutate_registry_row(session, row, field, proposed)
+    ok, detail = _mutate_registry_row(session, row, field, proposed, patient_id=scope)
     if ok:
         row.source = "llm_accepted"
         row.updated_at = datetime.utcnow()

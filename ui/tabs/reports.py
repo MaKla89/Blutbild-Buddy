@@ -1,4 +1,4 @@
-"""Reports management tab (moved verbatim from app.py, WP2).
+"""Reports management tab.
 
 Renders the Reports tab: PDF upload + processing, risk-flag refresh, summary
 regeneration, bulk description/interpretation generation, and the report list
@@ -8,6 +8,17 @@ tab.)
 Since WP6 all long-running operations are submitted as background jobs
 (llm_jobs.submit_job) — the buttons no longer block the UI, and progress is
 tracked in the "LLM-Jobs" tab.
+
+**Everything here is scoped to the selected patient.** The tab receives the
+patient explicitly, and so do all job submissions. Before that, uploads landed
+in one shared folder with no owner, the report list showed every patient's
+documents (with a "patient" column to tell them apart), and "Alle PDFs
+verarbeiten" extracted whatever was in the folder and assigned each report to
+whichever name the LLM read off the page — so one patient's click could process
+another patient's upload and file it under the wrong person. Now an upload is
+bound to the uploading patient in ``pending_uploads``, the list is exactly that
+patient's reports plus their own pending files, and extraction assigns to the
+patient who uploaded it.
 """
 
 from pathlib import Path
@@ -19,6 +30,7 @@ from sqlalchemy import func
 import config
 from database import (
     Report, DataPoint, RiskFlag, ReportArtifact, get_session,
+    list_pending_uploads,
 )
 from llm_jobs import submit_job
 from translations import t, _get_lang
@@ -29,25 +41,40 @@ from ui.helpers import (
 )
 
 
-def render_reports_tab(session, patients, reports, gen_summary):
-    """Render the Reports management tab."""
+def render_reports_tab(session, patients, patient, gen_summary):
+    """Render the Reports management tab for one patient.
+
+    ``patient`` is the selected patient — the scope of the upload queue, the
+    report list, the delete list and every job this tab submits. ``None`` (no
+    patient exists yet) renders only the hint to create one, because an upload
+    without an owner is exactly the leak this tab used to have.
+    """
     st.subheader(t("subheader_reports_manage"))
     st.caption(t("caption_reports_manage"))
 
-    # File upload section
+    if patient is None:
+        st.info(t("info_create_patient_first"))
+        return
+
+    # File upload section. The uploader is bound to this patient (see
+    # _handle_file_upload) — that binding is what scopes both this tab's pending
+    # list and the extraction that follows.
     st.markdown(f"**{t('btn_upload_and_process')}**")
+    if st.session_state.pop("_upload_needs_patient", False):
+        st.warning(t("warning_upload_needs_patient"))
     uploaded_files = st.file_uploader(
         t("label_upload_pdf"),
         type=["pdf"],
         accept_multiple_files=True,
         key="_uploaded_pdfs",
-        on_change=_handle_file_upload,
+        on_change=lambda: _handle_file_upload(patient.id),
     )
 
     # Pending-upload indicator: files are saved to disk on upload but only
     # processed when the user clicks "Process All PDFs" — make that explicit.
     if st.session_state.get("_files_uploaded"):
-        st.info(t("info_files_saved"))
+        queued = st.session_state.pop("_pending_queued_count", 0)
+        st.info(t("info_files_saved") + (f" ({queued})" if queued else ""))
 
     # --- Long-running operations (WP6: background jobs) ----------------------
     # Each operation submits a background job (llm_jobs.py) that runs in a
@@ -66,7 +93,7 @@ def render_reports_tab(session, patients, reports, gen_summary):
 
     @st.fragment
     def _op_reprocess_pdfs():
-        """Re-extract existing reports with the current LLM + registry.
+        """Re-extract THIS patient's existing reports with the current LLM + registry.
 
         Destructive for the selected scope (report data is replaced), so it
         goes through a confirmation dialog that shows the blast radius:
@@ -80,26 +107,25 @@ def render_reports_tab(session, patients, reports, gen_summary):
         # re-run on its own (main's session is closed by then), so this check
         # opens its own session like the blast-radius query below.
         with get_session() as _chk_session:
-            _reprocess_job = _active_job_for(_chk_session, "reprocess_pdfs")
+            _reprocess_job = _active_job_for(_chk_session, "reprocess_pdfs",
+                                             patient_id=patient.id)
         if _reprocess_job is not None:
             _render_job_state("btn_reprocess_pdfs", _reprocess_job)
         elif st.button(t("btn_reprocess_pdfs"), type="primary",
                        key="btn_reprocess_pdfs_action", width='stretch'):
-            patient = st.session_state.get("_selected_patient")
-            patient_id = patient.id if patient else None
+            # Scoped to this patient — the blast radius the dialog shows and the
+            # scope the job re-extracts are the same set of reports.
+            patient_id = patient.id
             with get_session() as op_session:
-                rq = op_session.query(Report)
-                if patient_id is not None:
-                    rq = rq.filter(Report.patient_id == patient_id)
+                rq = op_session.query(Report).filter(Report.patient_id == patient_id)
                 filenames = [r.filename for r in rq.all()]
-                dq = (
+                disabled_count = (
                     op_session.query(DataPoint)
                     .join(Report, DataPoint.report_id == Report.id)
-                    .filter(DataPoint.is_disabled == True)  # noqa: E712
+                    .filter(DataPoint.is_disabled == True,  # noqa: E712
+                            Report.patient_id == patient_id)
+                    .count()
                 )
-                if patient_id is not None:
-                    dq = dq.filter(Report.patient_id == patient_id)
-                disabled_count = dq.count()
             missing = [fn for fn in filenames if not (Path(config.REPORTS_DIR) / fn).exists()]
 
             @st.dialog(t("dialog_reprocess_title"), width="medium")
@@ -117,7 +143,7 @@ def render_reports_tab(session, patients, reports, gen_summary):
                     if st.button(t("btn_confirm_reprocess"), type="primary", key="dlg_reprocess_confirm", width='stretch'):
                         job = submit_job(
                             "reprocess_pdfs", "job_kind_reprocess_pdfs",
-                            params={"patient_id": patient_id} if patient_id is not None else None,
+                            params={"patient_id": patient_id},
                         )
                         if job is None:
                             st.session_state._flash_reprocess_pdfs = [
@@ -129,15 +155,17 @@ def render_reports_tab(session, patients, reports, gen_summary):
             _confirm_reprocess()
 
     # Button layout: 3-across row, 2-across bulk row.
+    # Every button carries params={"patient_id": patient.id} — that is what
+    # scopes the job's work AND its slot in the (kind, patient) kind lock, so a
+    # job started for another patient can never disable one of these buttons.
     col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
     with col_btn1:
         _show_flash("process_pdfs")
-        _pdf_patient = st.session_state.get("_selected_patient")
         _job_button(
             session,
             label_key="btn_process_all", kind="process_pdfs",
             job_label_key="job_kind_process_pdfs", key="btn_process_all",
-            params={"patient_id": _pdf_patient.id} if _pdf_patient else None,
+            params={"patient_id": patient.id},
             flash_key="process_pdfs",
             # Files are being processed — clear the pending-upload hint. Must be
             # a callback: the helper's st.rerun() aborts this run, so code after
@@ -150,46 +178,41 @@ def render_reports_tab(session, patients, reports, gen_summary):
             session,
             label_key="btn_refresh_risks", kind="refresh_risks",
             job_label_key="job_kind_refresh_risks", key="btn_refresh_risks",
+            params={"patient_id": patient.id},
             flash_key="refresh_risks",
         )
     with col_btn3:
         _show_flash("regen_summary")
-        _sel_patient = st.session_state.get("_selected_patient")
         _job_button(
             session,
             label_key="btn_regenerate_summary", kind="regen_summary",
             job_label_key="job_kind_regen_summary", key="reports_regenerate_summary",
-            params={"patient_id": _sel_patient.id} if _sel_patient else None,
+            params={"patient_id": patient.id},
             flash_key="regen_summary",
             button_type="secondary",
-            preconditions=((bool(_sel_patient), t("error_select_patient")),),
         )
 
     # Biomarker Info bulk buttons row
     col_bulk1, col_bulk2 = st.columns(2)
     with col_bulk1:
         _show_flash("bulk_desc")
-        _bulk_patient = st.session_state.get("_selected_patient")
         _job_button(
             session,
             label_key="btn_generate_all_descriptions", kind="bulk_descriptions",
             job_label_key="job_kind_bulk_descriptions", key="btn_bulk_gen_desc",
-            params={"patient_id": _bulk_patient.id} if _bulk_patient else None,
+            params={"patient_id": patient.id},
             flash_key="bulk_desc",
             button_type="secondary",
-            preconditions=((bool(_bulk_patient), t("error_select_patient")),),
         )
     with col_bulk2:
         _show_flash("bulk_interp")
-        _bi_patient = st.session_state.get("_selected_patient")
         _job_button(
             session,
             label_key="btn_generate_all_interpretations", kind="bulk_interpretations",
             job_label_key="job_kind_bulk_interpretations", key="btn_bulk_gen_interp",
-            params={"patient_id": _bi_patient.id} if _bi_patient else None,
+            params={"patient_id": patient.id},
             flash_key="bulk_interp",
             button_type="secondary",
-            preconditions=((bool(_bi_patient), t("error_select_patient")),),
         )
 
     # Re-extract existing reports (destructive → confirmation dialog)
@@ -197,25 +220,30 @@ def render_reports_tab(session, patients, reports, gen_summary):
 
     # Report list with status and biomarker counts.
     # The list is the union of:
-    #   (a) every report in the DB — its PDF may have been removed from the
-    #       input folder after processing, and
-    #   (b) every PDF currently in the input folder that has no DB row yet
-    #       (uploaded but not yet processed).
-    # The "file present" column shows whether the original PDF is still on
-    # disk. Files starting with "_" are skipped, matching process_new_pdfs().
+    #   (a) this patient's reports in the DB — their PDFs may have been removed
+    #       from the input folder after processing, and
+    #   (b) this patient's own pending uploads (``pending_uploads``) that have no
+    #       DB row yet.
+    # (b) used to be "every PDF in the shared input folder", which listed other
+    # patients' uploads here. The "file present" column shows whether the
+    # original PDF is still on disk. Files starting with "_" are skipped,
+    # matching process_new_pdfs().
     st.divider()
     pdf_dir = Path(config.REPORTS_DIR)
-    db_filenames = {r.filename for r in reports}
-    folder_files = (
-        sorted(p.name for p in pdf_dir.glob("*.pdf") if not p.name.startswith("_"))
-        if pdf_dir.exists() else []
+    db_reports = (
+        session.query(Report).filter(Report.patient_id == patient.id)
+        .order_by(Report.report_date).all()
     )
-    unprocessed = [fn for fn in folder_files if fn not in db_filenames]
+    db_filenames = {r.filename for r in db_reports}
+    unprocessed = [
+        u.filename for u in list_pending_uploads(session, patient.id)
+        if u.filename not in db_filenames
+    ]
 
-    total_rows = len(reports) + len(unprocessed)
+    total_rows = len(db_reports) + len(unprocessed)
     _plural = "" if total_rows == 1 else ("e" if _get_lang() == "de" else "s")
     st.markdown(f"**{t('heading_reports_list', n=total_rows, plural=_plural)}**")
-    caption = t("caption_stats", n=len(reports), m=data_point_count(session))
+    caption = t("caption_stats", n=len(db_reports), m=data_point_count(session, patient.id))
     if unprocessed:
         caption += t("caption_stats_unprocessed", n=len(unprocessed))
     st.caption(caption)
@@ -246,14 +274,13 @@ def render_reports_tab(session, patients, reports, gen_summary):
             report_data.append({
                 "filename": fn,
                 "report_date": "—",
-                "patient": "—",
                 "status": t("status_not_processed"),
-                "file_present": "✅",
+                "file_present": "✅" if (pdf_dir / fn).exists() else "❌",
                 "biomarker_count": 0,
                 "artifact_count": 0,
                 "report_id": None,
             })
-        for r in reports:
+        for r in db_reports:
             dp_count = dp_counts.get(r.id, 0)
             art_count = artifact_counts.get(r.id, 0)
             # A DB row only exists after successful extraction, so every DB
@@ -266,11 +293,9 @@ def render_reports_tab(session, patients, reports, gen_summary):
                 if dp_count or art_count
                 else t("status_processed_empty")
             )
-            patient_name = r.patient.name if r.patient else "?"
             report_data.append({
                 "filename": r.filename,
                 "report_date": r.report_date.strftime("%d.%m.%Y") if r.report_date else "?",
-                "patient": patient_name,
                 "status": status,
                 "file_present": "✅" if (pdf_dir / r.filename).exists() else "❌",
                 "biomarker_count": dp_count,
@@ -284,7 +309,6 @@ def render_reports_tab(session, patients, reports, gen_summary):
             column_config={
                 "filename": st.column_config.TextColumn(t("col_report_filename")),
                 "report_date": st.column_config.TextColumn(t("col_report_date")),
-                "patient": st.column_config.TextColumn(t("col_patient")),
                 "status": st.column_config.TextColumn(t("col_report_status")),
                 "file_present": st.column_config.TextColumn(
                     t("col_file_present"),
@@ -311,7 +335,7 @@ def render_reports_tab(session, patients, reports, gen_summary):
         st.markdown(f"**{t('btn_delete_report')}**")
         col_del1, col_del2 = st.columns([3, 1])
         with col_del1:
-            delete_options = {r.filename: r.id for r in reports}
+            delete_options = {r.filename: r.id for r in db_reports}
             selected_filename = st.selectbox(
                 t("select_report"),
                 options=list(delete_options.keys()),
@@ -339,7 +363,13 @@ def render_reports_tab(session, patients, reports, gen_summary):
                     # The dialog re-runs independently of main(), so it owns its
                     # own DB session (same pattern as the long-op fragments).
                     with get_session() as op_session:
-                        report = op_session.query(Report).filter(Report.id == delete_options[selected_filename]).first()
+                        # Scoped by patient as well as id: a filename is not
+                        # unique across patients, and this dialog only ever
+                        # offers this patient's own reports.
+                        report = op_session.query(Report).filter(
+                            Report.id == delete_options[selected_filename],
+                            Report.patient_id == patient.id,
+                        ).first()
                         if report:
                             op_session.query(DataPoint).filter(DataPoint.report_id == report.id).delete()
                             op_session.query(RiskFlag).filter(RiskFlag.report_id == report.id).delete()

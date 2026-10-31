@@ -20,7 +20,7 @@ from sqlalchemy import func
 import config
 from database import (
     Patient, Report, DataPoint, RiskFlag, upsert_biomarker_info,
-    get_active_llm_jobs,
+    get_active_llm_jobs, add_pending_upload, get_session,
 )
 from llm_jobs import submit_job
 from translations import t
@@ -30,10 +30,23 @@ from translations import t
 _MAX_FILE_SIZE = 50 * 1024 * 1024
 
 
-def _handle_file_upload():
-    """Save uploaded files to reports_input/ and set a flag to trigger processing."""
+def _handle_file_upload(patient_id: int | None = None):
+    """Save uploaded files to reports_input/ and queue them for ``patient_id``.
+
+    ``patient_id`` is the patient whose Reports tab the upload happened on. It is
+    recorded in ``pending_uploads`` (see database.PendingUpload) and is what
+    decides both which patient's "pending" list shows the file and which patient
+    the extraction assigns the report to. Without it an upload would land in the
+    shared folder with no owner at all, and every patient's Reports tab would
+    list it — and "Alle PDFs verarbeiten" would hand it to whichever name the LLM
+    happened to read off the page. Uploading without a patient selected is
+    refused for exactly that reason.
+    """
     uploaded_files = st.session_state.get("_uploaded_pdfs")
     if not uploaded_files:
+        return
+    if patient_id is None:
+        st.session_state._upload_needs_patient = True
         return
     reports_dir = Path(config.REPORTS_DIR)
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -54,9 +67,18 @@ def _handle_file_upload():
             dst.write(f.read())
         saved.append(safe_name)
     if saved:
+        # Bind every saved file to the uploading patient before anything can
+        # process it, and count how many are newly queued so the Reports tab can
+        # say so (a re-upload of the same name is not counted again).
+        with get_session() as s:
+            queued = sum(
+                1 for name in saved if add_pending_upload(s, name, patient_id)
+            )
         # Only flag when something actually landed on disk — the Reports tab
         # shows a "click Process All PDFs" hint based on this.
         st.session_state._files_uploaded = True
+        if queued:
+            st.session_state._pending_queued_count = queued
 
 
 def _flash(key: str, level: str, text: str):
@@ -76,14 +98,21 @@ def _show_flash(key: str):
         getattr(st, level)(text)
 
 
-def _active_job_for(session, kind: str, params: dict | None = None):
+def _active_job_for(session, kind: str, params: dict | None = None,
+                    patient_id: int | None = None):
     """The pending/running LlmJob matching ``kind`` and (subset-matched) ``params``.
 
-    Subset matching means a patient-scoped button only sees ITS OWN job: a
-    regen_summary job for another patient must not disable this patient's
-    button. Returns None when nothing is running.
+    ``patient_id`` restricts the search to that patient's jobs (plus app-level
+    ones with no patient, e.g. a connection test). Subset matching on ``params``
+    already keeps a patient-scoped button from locking on another patient's job,
+    but the DB filter is what makes it structural: a job kind whose params happen
+    to overlap (or a legacy row whose params are empty) can then never disable
+    the wrong patient's button.
+
+    ``patient_id=None`` searches across all patients — only the admin/all-patient
+    paths use that.
     """
-    for j in get_active_llm_jobs(session):
+    for j in get_active_llm_jobs(session, patient_id=patient_id):
         if j.kind != kind:
             continue
         try:
@@ -163,7 +192,8 @@ def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
             st.warning(message)
             return False
 
-    job = _active_job_for(session, kind, params)
+    job = _active_job_for(session, kind, params,
+                          patient_id=(params or {}).get("patient_id"))
     if job is not None:
         # The button's own key doubles as the call-site scope for the disabled
         # state key, keeping both variants of one job kind unique per tab.
@@ -237,8 +267,16 @@ def _time_range_slider(min_date, max_date, value_key, slider_key, label):
     return time_range[0], time_range[1]
 
 
-def load_data(session):
-    """Load the app-wide lists every rerun needs: all patients and all reports.
+def load_data(session, patient_id: int | None = None):
+    """Load the lists the app needs every rerun: patients, and reports.
+
+    ``patient_id`` scopes the REPORT list to one patient. Patients themselves are
+    always returned in full — the patient picker IS the identity switch (there is
+    no auth), so it has to list every patient to be usable. Everything derived
+    from the report list, and every other read in the app, is scoped.
+
+    ``patient_id=None`` returns every report — used only by the admin paths and
+    the tests that predate patient scoping.
 
     Deliberately does NOT load DataPoint/RiskFlag rows: those are by far the
     largest tables, they were fetched unfiltered (every patient) on every rerun,
@@ -246,17 +284,28 @@ def load_data(session):
     total instead.
     """
     patients = session.query(Patient).all()
-    reports = session.query(Report).order_by(Report.report_date).all()
+    q = session.query(Report)
+    if patient_id is not None:
+        q = q.filter(Report.patient_id == patient_id)
+    reports = q.order_by(Report.report_date).all()
     return patients, reports
 
 
-def data_point_count(session) -> int:
-    """Total enabled data points across all patients (cheap COUNT, not rows)."""
-    return (
+def data_point_count(session, patient_id: int | None = None) -> int:
+    """Enabled data points for one patient (all patients when ``patient_id`` is None).
+
+    A cheap COUNT, not rows. Scoped so a patient's Reports tab never shows a
+    total that includes other patients' measurements.
+    """
+    q = (
         session.query(func.count(DataPoint.id))
         .filter(DataPoint.is_disabled == False)  # noqa: E712
-        .scalar()
-    ) or 0
+    )
+    if patient_id is not None:
+        q = q.join(Report, DataPoint.report_id == Report.id).filter(
+            Report.patient_id == patient_id
+        )
+    return q.scalar() or 0
 
 
 # R3-11: cap on historical data points per biomarker in the summary prompt.

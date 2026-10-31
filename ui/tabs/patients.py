@@ -1,7 +1,15 @@
 """Patients management tab (moved verbatim from app.py, WP2).
 
 Renders the Patients tab: patient list with report/value counts, rename,
-and merge.
+merge, profile editing, and full deletion.
+
+This tab is deliberately the ONE place that is not scoped to the selected
+patient — it is the admin surface: it has to see every patient to rename,
+merge or delete them. Everything it does is an explicit, confirmed action on a
+patient chosen from its own pickers, and it never shows another patient's
+measurements, reports or job history. Deleting a patient destroys their data, so
+it goes through a confirmation dialog that names the blast radius (see
+database.delete_patient for what that covers).
 """
 
 from datetime import datetime
@@ -11,8 +19,8 @@ import streamlit as st
 from sqlalchemy import func
 
 from database import (
-    Report, DataPoint, rename_patient, merge_patients, get_session,
-    update_patient_profile,
+    Report, DataPoint, rename_patient, merge_patients, delete_patient,
+    get_session, update_patient_profile,
 )
 from translations import t, _get_lang
 from ui.helpers import _flash, _show_flash
@@ -238,3 +246,77 @@ def render_patients_tab(session, patients):
     # already reloaded all data.
     if _merge_msg := st.session_state.pop("_flash_merge", None):
         getattr(st, _merge_msg[0])(_merge_msg[1])
+
+    # ── Delete patient section ───────────────────────────────────────────────
+    # The destructive counterpart to merge: merge re-homes a patient's data onto
+    # another patient, this destroys it. Because a patient's reports are medical
+    # data, the dialog spells out the blast radius (report/value/chat counts) and
+    # asks for the patient's name to be typed back before deleting — a selectbox
+    # alone is one mis-click away from an irreversible loss.
+    st.divider()
+    st.markdown(f"🗑️ **{t('subheader_delete_patient')}**")
+    st.warning(t("warning_delete_patient"))
+
+    _show_flash("patient_delete")
+
+    col_del1, col_del2 = st.columns([3, 1])
+    with col_del1:
+        delete_name = st.selectbox(
+            t("select_patient"),
+            options=current_options,
+            key="_delete_patient_select",
+        )
+
+    @st.dialog(t("dialog_confirm_delete_patient_title"), width="medium")
+    def _confirm_delete_patient(patient_name: str):
+        patient_id = patient_options[patient_name]
+        st.markdown(
+            t("dialog_confirm_delete_patient_text",
+              name=patient_name,
+              reports=report_counts.get(patient_id, 0),
+              values=dp_counts.get(patient_id, 0))
+        )
+        st.caption(t("dialog_delete_patient_scope"))
+        keep_files = st.checkbox(t("label_delete_pdf_files"), value=False,
+                                 key="dlg_delete_patient_files")
+        confirm_text = st.text_input(t("label_confirm_patient_name"),
+                                     key="dlg_delete_patient_confirm_text",
+                                     placeholder=patient_name)
+        col_c1, col_c2 = st.columns([1, 1])
+        with col_c1:
+            if st.button(t("btn_cancel"), key="dlg_del_patient_cancel", width="stretch"):
+                st.rerun()
+        with col_c2:
+            if st.button(t("btn_confirm_delete_patient"), type="secondary",
+                         key="dlg_del_patient_confirm", width="stretch"):
+                if confirm_text.strip() != patient_name:
+                    # Stay in the dialog: the user needs to see why nothing happened.
+                    st.error(t("error_confirm_name_mismatch"))
+                    return
+                with get_session() as op_session:
+                    result = delete_patient(op_session, patient_id,
+                                            delete_pdf_files=keep_files)
+                if "error" in result:
+                    _flash("patient_delete", "error", result["error"])
+                else:
+                    # The deleted patient may be the one currently selected — drop
+                    # the picker state so the next rerun re-defaults instead of
+                    # holding a stale Patient object.
+                    selected = st.session_state.get("_selected_patient")
+                    if selected is not None and getattr(selected, "id", None) == patient_id:
+                        del st.session_state._selected_patient
+                    _flash("patient_delete", "success",
+                           t("msg_patient_deleted", name=patient_name,
+                             reports=result["reports"], values=result["data_points"],
+                             pdfs=result["pdf_files_deleted"]))
+                    for key in ("_delete_patient_select", "dlg_delete_patient_confirm_text"):
+                        st.session_state.pop(key, None)
+                st.rerun()
+
+    with col_del2:
+        if st.button(t("btn_delete_patient"), type="secondary", width="stretch",
+                     key="btn_delete_patient_action"):
+            _confirm_delete_patient(delete_name)
+
+    if _del_msg := st.session_state.pop("_flash_patient_delete", None):
+        getattr(st, _del_msg[0])(_del_msg[1])

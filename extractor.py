@@ -9,6 +9,7 @@ from config import REPORTS_DIR, resolve_canonical, get_default_ref_range
 from database import (
     Report, DataPoint, Patient, ReportArtifact, DataQualityFinding,
     get_or_create_patient, _canonical_base, get_registry, clean_unit,
+    list_pending_uploads, remove_pending_upload,
 )
 from pdf_processor import pdf_to_base64_jpeg, file_hash
 from llm_client import _build_client, extract_page, extract_pages_batch, is_job_aborted, normalize_names
@@ -445,8 +446,8 @@ def _apply_global_normalization(
     return changed
 
 
-def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False, only_files: set[str] | None = None, lang: str | None = None) -> tuple[list[str], list[str]]:
-    """Process all unprocessed PDFs in REPORTS_DIR.
+def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None = None, batch_size: int | None = None, force: bool = False, only_files: set[str] | None = None, lang: str | None = None, patient_id: int | None = None) -> tuple[list[str], list[str]]:
+    """Process the PDFs waiting for extraction.
 
     Two phases, so no single LLM request grows with the number of PDFs:
       Phase 1 — extraction: ONE LLM call per report (all of its pages in one
@@ -479,6 +480,21 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             Background workers MUST pass it (from their config snapshot) —
             they run outside the Streamlit script context, where reading
             session state is not safe.
+        patient_id: the patient whose uploads this run processes. This is the
+            normal path and it changes two things structurally:
+              * **Which files are read** — the patient's rows in
+                ``pending_uploads``, never the whole ``reports_input/`` folder.
+                Scanning the folder meant one patient's "Alle PDFs verarbeiten"
+                would pick up another patient's freshly uploaded PDF.
+              * **Who owns the report** — the report is created for this
+                patient, and the name the LLM reads off the PDF is ignored.
+                Deriving the owner from the PDF text was the single biggest
+                cross-patient leak in the app: a misread name handed one
+                patient's measurements to another patient (or invented a
+                duplicate patient).
+            ``None`` keeps the old folder-scan + name-derived assignment, which
+            only the reprocess job (``only_files`` + its own patient pinning)
+            and the admin/all-patient paths use.
 
     Returns:
         (processed, errors) — processed is a list of filenames, errors a list
@@ -502,9 +518,22 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
     batch_size = max(0, batch_size)
 
     pdf_dir = Path(REPORTS_DIR)
-    pdf_files = sorted(p for p in pdf_dir.glob("*.pdf") if not p.name.startswith("_"))
+    # Which PDFs this run may touch. A patient-scoped run reads exactly that
+    # patient's pending uploads — never the shared folder — so processing can
+    # neither see nor steal another patient's upload (see the docstring).
+    forced_patient = None
+    if patient_id is not None:
+        forced_patient = session.get(Patient, patient_id)
     if only_files is not None:
-        pdf_files = [p for p in pdf_files if p.name in only_files]
+        pdf_files = [p for p in pdf_dir.glob("*.pdf") if p.name in only_files]
+    elif forced_patient is not None:
+        pending = [
+            p.filename for p in list_pending_uploads(session, patient_id)
+        ]
+        pdf_files = [pdf_dir / fn for fn in pending if (pdf_dir / fn).exists()]
+    else:
+        pdf_files = sorted(p for p in pdf_dir.glob("*.pdf") if not p.name.startswith("_"))
+    pdf_files = sorted(pdf_files, key=lambda p: p.name)
 
     total = len(pdf_files)
     # Phase 1 collects the deduplicated (name, unit) entries and the new report
@@ -586,7 +615,14 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                     except ValueError:
                         continue
 
-            patient = get_or_create_patient(session, patient_name or "Unknown")
+            # Owner of the report. A patient-scoped run assigns to that patient
+            # and ignores the name read off the PDF — the uploader chose the
+            # patient, and a misread name must never move data to someone else.
+            # Otherwise fall back to the historical name-derived attribution.
+            if forced_patient is not None:
+                patient = forced_patient
+            else:
+                patient = get_or_create_patient(session, patient_name or "Unknown")
 
             # Extra measurement series this report carries: the result columns
             # whose header was a date. A single-column report has none of these,
@@ -748,6 +784,10 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
             session.commit()
             new_report_ids.append(report.id)
             processed.append(pdf_path.name)
+            # The upload has become a report — its pending marker is spent.
+            # Only removed on success, so a failed extraction stays queued and
+            # is retried by the next run instead of silently vanishing.
+            remove_pending_upload(session, pdf_path.name)
 
         except Exception as exc:
             session.rollback()
