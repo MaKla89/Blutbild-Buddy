@@ -7148,6 +7148,8 @@ class TestVerifyExtraction(unittest.TestCase):
         self.assertEqual(params["high"], 18.0)
         # The finding targets the audited data point, not the other one.
         self.assertEqual(json.loads(f.data_point_ids), [self.dp_hb.id])
+        # The audited page (1-based) is recorded so the Mapping tab can show it.
+        self.assertEqual(f.source_page, 1)
 
     def test_verify_value_only_becomes_set_value(self):
         # Auditor supplies a corrected value but no range → set_value, not swap.
@@ -7883,6 +7885,301 @@ class TestPatientIsolation(unittest.TestCase):
         self.assertEqual(database.get_llm_job(self.session, other.id).patient_id, b.id)
 
 
+class TestUnitHygieneConfig(unittest.TestCase):
+    """Idea 2 + 3 (config layer): sanitize a leaked header word out of the unit
+    field, snap a notation variant to the marker's registry spelling, and flag a
+    unit that is a genuine category error for the marker — while staying silent
+    on ambiguous fragments and unregistered markers."""
+
+    def test_sanitize_drops_header_words_and_punctuation(self):
+        self.assertIsNone(config.sanitize_unit("Unit"))
+        self.assertIsNone(config.sanitize_unit("Einheit"))
+        self.assertIsNone(config.sanitize_unit("Referenzbereich"))
+        self.assertIsNone(config.sanitize_unit("-"))
+        self.assertIsNone(config.sanitize_unit("n.a"))
+        self.assertIsNone(config.sanitize_unit(None))
+        # A real unit survives, whitespace collapsed.
+        self.assertEqual(config.sanitize_unit("ml/ min"), "ml/min")
+        self.assertEqual(config.sanitize_unit("mg/dl"), "mg/dl")
+
+    def test_canonicalize_snaps_notation_variants(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # Case drift → the marker's own registry spelling.
+        self.assertEqual(config.canonicalize_unit("CRP", "MG/L", reg), "mg/l")
+        # Notation variant of a registry unit → that registry spelling.
+        self.assertEqual(config.canonicalize_unit("Leukozyten (WBC)", "Tsd/µl", reg), "10³/µl")
+        self.assertEqual(config.canonicalize_unit("Erythrozyten (RBC)", "/pl", reg), "Mio./µl")
+        # A header word collapses to None before any registry lookup.
+        self.assertIsNone(config.canonicalize_unit("CRP", "Unit", reg))
+
+    def test_canonicalize_never_touches_unknown_unit(self):
+        # An ambiguous fragment with no registry match is returned unchanged so
+        # the guard (not the normalizer) decides — value-preserving only.
+        self.assertEqual(config.canonicalize_unit("CRP", "/l", config._CANONICAL_BIOMARKERS), "/l")
+
+    def test_known_for_marker_flags_category_error(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # Enzyme measured in a mass unit / concentration in an enzyme unit → False.
+        self.assertFalse(config.unit_known_for_marker("ALT (GPT)", "mg/dl", reg))
+        self.assertFalse(config.unit_known_for_marker("Glukose (nüchtern)", "U/l", reg))
+
+    def test_known_for_marker_silent_on_ambiguous_and_unregistered(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # A bare denominator is magnitude-ambiguous, never a category error.
+        self.assertTrue(config.unit_known_for_marker("Thrombozyten (PLT)", "/ul", reg))
+        # An unregistered marker has nothing to contradict the unit.
+        self.assertTrue(config.unit_known_for_marker("Ein totaler Fantasiebegriff", "mg/dl", reg))
+        # A unit the marker does list → True.
+        self.assertTrue(config.unit_known_for_marker("ALT (GPT)", "U/l", reg))
+        # Empty unit → True.
+        self.assertTrue(config.unit_known_for_marker("ALT (GPT)", None, reg))
+
+
+class TestEntryConfidenceAndRaw(unittest.TestCase):
+    """Idea 8 (schemas layer): always keep the printed value string, and coerce a
+    model-reported per-entry confidence into [0,1] (or None when not reported)."""
+
+    def test_value_raw_kept_for_clean_number_string(self):
+        from schemas import BiomarkerEntry
+        e = BiomarkerEntry(name="Hb", value="13,18", unit="g/dl")
+        self.assertEqual(e.value, 13.18)
+        self.assertEqual(e.value_raw, "13,18")  # printed form preserved
+
+    def test_value_raw_kept_for_range_string(self):
+        from schemas import BiomarkerEntry
+        e = BiomarkerEntry(name="Hb", value="4.2-6.1", unit="g/dl")
+        self.assertIsNone(e.value)
+        self.assertEqual(e.value_raw, "4.2-6.1")
+
+    def test_value_raw_none_for_native_number(self):
+        from schemas import BiomarkerEntry
+        e = BiomarkerEntry(name="Hb", value=15.0)
+        self.assertEqual(e.value, 15.0)
+        self.assertIsNone(e.value_raw)  # nothing printed to preserve
+
+    def test_confidence_normalised(self):
+        from schemas import BiomarkerEntry
+        self.assertEqual(BiomarkerEntry(name="x", value=1, confidence=0.4).confidence, 0.4)
+        self.assertEqual(BiomarkerEntry(name="x", value=1, confidence=90).confidence, 0.9)  # percent
+        self.assertEqual(BiomarkerEntry(name="x", value=1, confidence="unsicher").confidence, 0.4)
+        # A percentage above 100 clamps to 1.0 (250 → 2.5 → clamp).
+        self.assertEqual(BiomarkerEntry(name="x", value=1, confidence=250).confidence, 1.0)
+        self.assertIsNone(BiomarkerEntry(name="x", value=1, confidence="gibberish").confidence)
+        self.assertIsNone(BiomarkerEntry(name="x", value=1).confidence)  # not reported
+
+
+class TestUnitGuardExtraction(unittest.TestCase):
+    """Idea 3 (extractor): a category-error unit becomes a pending 'unit' finding
+    (action set_unit) and a low-confidence entry becomes a 'value' finding — both
+    carry source_page so the Mapping tab can show the exact source cell."""
+
+    def setUp(self):
+        import streamlit as st
+        st.session_state.pdf_dpi = 100
+        st.session_state.pdf_batch_size = 0
+        self.session = _fresh_db(f"unitguard_{self._testMethodName}.db")
+
+    def tearDown(self):
+        self.session.close()
+
+    def _extract(self, page_dict):
+        from schemas import ExtractedPage, NormalizationMapping
+        import extractor
+        with patch("extractor.REPORTS_DIR", str(_single_page_pdf_dir())), \
+             patch("extractor.pdf_to_base64_jpeg", return_value=["fake_b64"]), \
+             patch("extractor.extract_page", return_value=ExtractedPage(**page_dict)), \
+             patch("extractor.normalize_names",
+                   return_value=NormalizationMapping(mappings=[])):
+            return extractor.process_new_pdfs(self.session, lang="de")
+
+    def _findings(self):
+        return self.session.query(database.DataQualityFinding).filter(
+            database.DataQualityFinding.source == "extraction").all()
+
+    def test_unit_category_error_creates_set_unit_finding(self):
+        page = {
+            "patient_name": "UnitGuard", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                # ALT is an enzyme (U/l); mg/dl is a mass unit → category error.
+                {"name": "ALT", "value": 33.0, "unit": "mg/dl",
+                 "reference_range": "7-46", "column_index": 1},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        unit_findings = [f for f in self._findings() if f.category == "unit"]
+        self.assertEqual(len(unit_findings), 1)
+        f = unit_findings[0]
+        self.assertEqual(f.action, "set_unit")
+        self.assertEqual(json.loads(f.params_json)["unit"], "U/l")
+        self.assertEqual(f.source_page, 1)
+        # The stored unit is NOT silently rewritten — the user confirms.
+        dp = self.session.query(database.DataPoint).filter_by(canonical_name="ALT (GPT)").one()
+        self.assertEqual(dp.unit, "mg/dl")
+
+    def test_notation_variant_is_silently_canonicalised(self):
+        page = {
+            "patient_name": "UnitGuard", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                {"name": "Leukozyten", "value": 6.5, "unit": "Tsd/µl",
+                 "reference_range": "4.0-11.0", "column_index": 1},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        self.assertEqual(self._findings(), [])  # no finding for a mere notation variant
+        dp = self.session.query(database.DataPoint).filter_by(canonical_name="Leukozyten (WBC)").one()
+        self.assertEqual(dp.unit, "10³/µl")  # snapped to registry spelling, value kept
+
+    def test_low_confidence_creates_acknowledge_finding(self):
+        page = {
+            "patient_name": "UnitGuard", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                {"name": "Hämatokrit", "value": 45.0, "unit": "%",
+                 "reference_range": "40-54", "column_index": 1, "confidence": 0.3},
+                # A clean read (no confidence) stays silent.
+                {"name": "MCV", "value": 88.0, "unit": "fl",
+                 "reference_range": "80-100", "column_index": 1},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        low = [f for f in self._findings() if f.action == "acknowledge" and f.category == "value"]
+        self.assertEqual(len(low), 1)
+        self.assertEqual(low[0].source_page, 1)
+        self.assertIn("Hämatokrit", low[0].description)
+
+
+class TestSetUnitRelabelIfImplausible(unittest.TestCase):
+    """Idea 2 (database): accepting a set_unit fix must RELABEL (keep the number)
+    when the old unit is foreign to the marker and the value fits the new unit's
+    range — the live DB's ALT-in-mg/dl case — but still CONVERT a legitimate
+    change (Glukose 100 mg/dl → mmol/l)."""
+
+    def setUp(self):
+        self.session = _fresh_db(f"setunit_{self._testMethodName}.db")
+        self.patient = database.get_or_create_patient(self.session, "SU_Patient")
+        report = database.Report(
+            patient_id=self.patient.id, filename="su.pdf",
+            file_hash=f"su_{self._testMethodName}", report_date=datetime(2025, 1, 1),
+        )
+        self.session.add(report)
+        self.session.flush()
+        self.report = report
+
+    def tearDown(self):
+        self.session.close()
+
+    def _add(self, canonical, value, unit):
+        dp = database.DataPoint(report_id=self.report.id, canonical_name=canonical,
+                                original_name=canonical, value=value, unit=unit)
+        self.session.add(dp)
+        self.session.commit()
+        return dp
+
+    def _finding(self, dp, unit):
+        f = database.DataQualityFinding(
+            patient_id=self.patient.id, category="unit", target_type="data_point",
+            biomarker=dp.canonical_name, report_id=self.report.id,
+            data_point_ids=json.dumps([dp.id]), description="x", action="set_unit",
+            params_json=json.dumps({"unit": unit}), status="pending",
+        )
+        self.session.add(f)
+        self.session.commit()
+        return f.id
+
+    def test_alt_in_mgdl_relabels_without_conversion(self):
+        # ALT value 33 is enzyme-scale; mg/dl is foreign to ALT, U/l is native and
+        # 33 fits ALT's 7-46 U/l range → keep 33, relabel to U/l.
+        dp = self._add("ALT (GPT)", 33.0, "mg/dl")
+        out = database.apply_data_quality_finding(self.session, self._finding(dp, "U/l"))
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(dp.value, 33.0)  # NOT converted
+        self.assertEqual(dp.unit, "U/l")
+
+    def test_glukose_mgdl_to_mmol_still_converts(self):
+        # 100 mg/dl is plausible under mg/dl (Glukose's native unit) → convert.
+        dp = self._add("Glukose (nüchtern)", 100.0, "mg/dl")
+        out = database.apply_data_quality_finding(self.session, self._finding(dp, "mmol/l"))
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertAlmostEqual(dp.value, 100.0 / 18.0)
+        self.assertEqual(dp.unit, "mmol/l")
+
+    def test_harnsaure_ul_relabels_to_mgdl(self):
+        # Harnsäure in U/l (foreign); value 5.5 fits mg/dl 2.0-7.5 → relabel.
+        dp = self._add("Harnsäure", 5.5, "U/l")
+        out = database.apply_data_quality_finding(self.session, self._finding(dp, "mg/dl"))
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(dp.value, 5.5)
+        self.assertEqual(dp.unit, "mg/dl")
+
+
+class TestSourcePageMigration(unittest.TestCase):
+    """The data_quality_findings.source_page column is added by migration and
+    populated by the verify job's findings."""
+
+    def setUp(self):
+        self.session = _fresh_db(f"srcpage_{self._testMethodName}.db")
+
+    def tearDown(self):
+        self.session.close()
+
+    def test_migration_adds_source_page_column(self):
+        from database import _migrate_data_quality_findings
+        engine = database._get_engine()
+        from sqlalchemy import inspect as _inspect
+        cols = [c["name"] for c in _inspect(engine).get_columns("data_quality_findings")]
+        self.assertIn("source_page", cols)
+
+    def test_unit_notation_migration_is_value_preserving(self):
+        patient = database.get_or_create_patient(self.session, "NotationMig")
+        report = database.Report(patient_id=patient.id, filename="nm.pdf",
+                                 file_hash="nm_1", report_date=datetime(2024, 1, 1))
+        self.session.add(report)
+        self.session.flush()
+        self.session.add(database.DataPoint(
+            report_id=report.id, canonical_name="Leukozyten (WBC)",
+            original_name="Leukozyten", value=6.5, unit="Tsd/µl"))
+        self.session.add(database.DataPoint(
+            report_id=report.id, canonical_name="ALT (GPT)",
+            original_name="ALT", value=33.0, unit="mg/dl"))  # category error — untouched
+        self.session.commit()
+
+        from database import _migrate_unit_notation_cleanup
+        _migrate_unit_notation_cleanup(database._get_engine())
+        self.session.expire_all()
+        wbc = self.session.query(database.DataPoint).filter_by(canonical_name="Leukozyten (WBC)").one()
+        alt = self.session.query(database.DataPoint).filter_by(canonical_name="ALT (GPT)").one()
+        self.assertEqual(wbc.unit, "10³/µl")   # notation snapped
+        self.assertEqual(wbc.value, 6.5)
+        self.assertEqual(alt.unit, "mg/dl")    # category error NOT rewritten by migration
+        # Idempotent.
+        _migrate_unit_notation_cleanup(database._get_engine())
+        self.session.expire_all()
+        self.assertEqual(self.session.query(database.DataPoint).filter_by(canonical_name="Leukozyten (WBC)").one().unit, "10³/µl")
+
+
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""
     if TEST_DIR.exists():
@@ -7949,6 +8246,11 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestColumnConfusion))
     suite.addTests(loader.loadTestsFromTestCase(TestColumnFixActions))
     suite.addTests(loader.loadTestsFromTestCase(TestVerifyExtraction))
+    suite.addTests(loader.loadTestsFromTestCase(TestUnitHygieneConfig))
+    suite.addTests(loader.loadTestsFromTestCase(TestEntryConfidenceAndRaw))
+    suite.addTests(loader.loadTestsFromTestCase(TestUnitGuardExtraction))
+    suite.addTests(loader.loadTestsFromTestCase(TestSetUnitRelabelIfImplausible))
+    suite.addTests(loader.loadTestsFromTestCase(TestSourcePageMigration))
     suite.addTests(loader.loadTestsFromTestCase(TestRenderScale))
     suite.addTests(loader.loadTestsFromTestCase(TestUiBehaviourAppTest))
     suite.addTests(loader.loadTestsFromTestCase(TestPatientIsolation))

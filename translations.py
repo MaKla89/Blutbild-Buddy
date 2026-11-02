@@ -387,6 +387,10 @@ DE = {
     "dq_missing_result_column": "'{name}': Bericht meldet {expected} Ergebnis-Spalten, aber dieser Marker hat nur {found} Wert(e) — eine Spalte wurde überlesen.",
     "dq_multiple_reference_columns": "Mehr als eine Referenz-Spalte gemeldet ({indexes}) — eine davon ist vermutlich eine Messwert-Spalte.",
     "dq_value_matches_ref_bound": "{count} von {total} Werten entsprechen exakt einer Grenze ihres eigenen Referenzbereichs ({names}). Einzelne Zufälle sind normal — ein ganzer Bericht mit diesem Muster ist eine Spaltenfehlesung: Der Messwert wurde vermutlich aus der Referenzspalte gelesen.",
+    "dq_unit_mismatch": "'{name}': Einheit '{unit}' passt nicht zu diesem Marker — üblich sind {expected}. Wahrscheinlich wurde die Einheit einer anderen Zeile gelesen; der Wert selbst bleibt, nur das Label wird korrigiert.",
+    "dq_low_confidence": "'{name}': Beim Auslesen dieser Zelle unsicher (Konfidenz {confidence}%). Bitte die Quelldatei prüfen — der Wert kann stimmen, muss aber nicht.",
+    "caption_finding_source_page": "Quelle: Seite {page} von {filename}",
+    "caption_finding_source_missing": "Quelseite {page} nicht mehr auf der Festplatte gefunden.",
     "error_data_quality_failed": "Datenqualitätsprüfung fehlgeschlagen",
 
     # Second-pass column audit (verify job) — re-sends each page image and asks
@@ -900,6 +904,10 @@ EN = {
     "dq_missing_result_column": "'{name}': the report declares {expected} result columns but this marker has only {found} value(s) — a column was missed.",
     "dq_multiple_reference_columns": "More than one reference column reported ({indexes}) — one of them is likely a result column.",
     "dq_value_matches_ref_bound": "{count} of {total} values exactly match a bound of their own reference range ({names}). A single coincidence is normal — a whole report like this is a column misread: the measurement was likely read from the reference column.",
+    "dq_unit_mismatch": "'{name}': unit '{unit}' does not fit this marker — expected {expected}. The unit was likely read from another row; the value itself is kept, only the label is corrected.",
+    "dq_low_confidence": "'{name}': the reader was unsure about this cell (confidence {confidence}%). Please check the source file — the value may be right, but it may not.",
+    "caption_finding_source_page": "Source: page {page} of {filename}",
+    "caption_finding_source_missing": "Source page {page} could no longer be found on disk.",
     "error_data_quality_failed": "Data quality check failed",
 
     # Second-pass column audit (verify job) — re-sends each page image and asks

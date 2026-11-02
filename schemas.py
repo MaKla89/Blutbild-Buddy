@@ -110,6 +110,40 @@ def _parse_value(v: str | float | None) -> float | None:
         return None
 
 
+def _normalise_confidence(raw: object) -> float | None:
+    """Coerce a model-reported confidence into a float in [0, 1], or None.
+
+    Models word/scale this inconsistently ('high', '0.9', 90, 'unsicher'). A
+    number >1 is read as a percentage; a word maps to a fixed point; anything
+    unrecognisable becomes None so the extractor never flags an entry the model
+    did not actually rate.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+    else:
+        text = str(raw).strip().lower()
+        if not text:
+            return None
+        words = {
+            "high": 0.95, "sehr hoch": 0.95, "sicher": 0.95, "certain": 0.95,
+            "medium": 0.6, "mittel": 0.6, "medium-high": 0.75, "unsicher": 0.4,
+            "low": 0.3, "niedrig": 0.3, "gering": 0.3, "uncertain": 0.4,
+        }
+        if text in words:
+            return words[text]
+        try:
+            val = float(text.replace(",", "."))
+        except ValueError:
+            return None
+    if val > 1.0:  # reported as a percentage (e.g. 90)
+        val = val / 100.0
+    return max(0.0, min(1.0, val))
+
+
 class TableColumn(BaseModel):
     """One column of a report's results table, as declared by the extractor.
 
@@ -149,11 +183,20 @@ class BiomarkerEntry(BaseModel):
         default=None,
         description="Index of the result column this value was read from; must match a "
                     "declared column whose role is 'result'")
-    # The un-coerced value string, kept only when coercion loses something, so a
-    # value/reference swap can be undone: a range-shaped string in "value"
-    # becomes None via _parse_value, and without the original text the range
-    # would be unrecoverable.
+    # The un-coerced value string, kept whenever the model returned a string so a
+    # value/reference swap can be undone AND the review UI can show exactly what
+    # was printed. A range-shaped string in "value" becomes None via _parse_value,
+    # and without the original text the range would be unrecoverable; for an
+    # ordinary number it lets the Mapping tab show the printed form ('13,18')
+    # beside the parsed value (13.18) so the user can eyeball the read.
     value_raw: str | None = Field(default=None, description="Raw value string as returned, before numeric coercion")
+    # The model's own confidence (0..1) that THIS value came from the right cell.
+    # Opt-in: only present when the extraction prompt asks for it. The extractor
+    # turns a low value into a review finding; None (not reported) is never flagged.
+    confidence: float | None = Field(
+        default=None,
+        description="Model self-reported confidence 0..1 that this value was read "
+                    "correctly; null when the model did not report one")
 
     @model_validator(mode="before")
     @classmethod
@@ -162,10 +205,14 @@ class BiomarkerEntry(BaseModel):
             raw = data.get("value")
             if raw is not None and not isinstance(raw, (int, float)):
                 text = str(raw).strip()
-                # Only keep the raw text when coercion actually loses content.
-                if text and _parse_value(raw) is None:
+                # Keep the printed text whenever the model returned a string:
+                # always when coercion loses content (a range/qualitative string),
+                # and otherwise too so the review UI can show the exact reading.
+                if text:
                     data["value_raw"] = text
                 data["value"] = _parse_value(raw)
+            if "confidence" in data:
+                data["confidence"] = _normalise_confidence(data.get("confidence"))
         return data
 
 

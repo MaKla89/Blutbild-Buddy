@@ -408,6 +408,12 @@ class DataQualityFinding(Base):
     biomarker = Column(String(255), nullable=False)  # canonical name the finding is about
     report_id = Column(Integer, ForeignKey("reports.id"), nullable=True)  # set for data_point findings
     data_point_ids = Column(Text, nullable=True)  # JSON list of DataPoint ids (data_point findings)
+    # Which page of the report the affected entries came from (1-based). Set by
+    # the extraction/verify producers so the Mapping tab can show the source
+    # page image beside the finding — the user eyeballs the actual cell instead
+    # of guessing which column was misread. NULL for the on-demand check (which
+    # reasons over stored data, not a page) and for report-level findings.
+    source_page = Column(Integer, nullable=True)
     description = Column(Text, nullable=False)  # human-readable explanation (translated at creation)
     action = Column(String(50), nullable=True)  # machine-applicable fix, e.g. set_ref_range | set_unit | disable_value | registry_ref_range | ...
     params_json = Column(Text, nullable=True)  # JSON params for the fix (e.g. {"low":..,"high":..,"unit":..})
@@ -514,6 +520,7 @@ def init_db():
     _migrate_fix_implausible_ref_ranges(engine)
     _migrate_patient_demographics(engine)
     _migrate_clean_unit_whitespace(engine)
+    _migrate_unit_notation_cleanup(engine)
     _migrate_chat_conversations(engine)
     _migrate_report_artifacts(engine)
     _migrate_data_point_result_columns(engine)
@@ -676,6 +683,14 @@ def _migrate_data_quality_findings(engine):
                 "NOT NULL DEFAULT 'check'"
             ))
             conn.commit()
+    if "source_page" not in columns:
+        # Nullable — only the extraction/verify producers set it; the on-demand
+        # check and any existing row stay NULL (no page to show).
+        with engine.connect() as conn:
+            conn.execute(text(
+                "ALTER TABLE data_quality_findings ADD COLUMN source_page INTEGER"
+            ))
+            conn.commit()
 
 
 def _migrate_patient_demographics(engine):
@@ -824,6 +839,50 @@ def _migrate_clean_unit_whitespace(engine):
                     )
                     cleaned_any = True
         if cleaned_any:
+            conn.commit()
+
+
+def _migrate_unit_notation_cleanup(engine):
+    """One-time, value-preserving relabel of stored units to registry spelling.
+
+    The live DB accumulated the same marker under several spellings: 'Tsd/µl'
+    beside '10³/µl', '/pl' beside 'Mio./µl', 'mU/l' beside 'µIU/ml',
+    'ml/min/1.73' beside 'ml/min/1.73m²', '10^3/µl' beside '10³/µl'. All are
+    numerically identical — only the label drifted — yet every view keys on
+    (canonical_name, unit), so one marker showed up as two rows and the trends
+    chart split one series in half.
+
+    ``config.canonicalize_unit`` rewrites a unit to the marker's own registry
+    spelling ONLY when the rewrite is value-preserving (same unit modulo case,
+    spacing, or notation group). It never touches a genuine category error
+    (ALT in 'mg/dl') or an ambiguous fragment ('/l') — those are left for the
+    ingestion guard / the Mapping tab to flag, because fixing them is NOT
+    value-preserving. Rows whose label is unchanged are skipped, so the
+    migration is idempotent.
+    """
+    inspector = inspect(engine)
+    if "data_points" not in inspector.get_table_names():
+        return
+    registry = _config._CANONICAL_BIOMARKERS
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, canonical_name, unit FROM data_points "
+            "WHERE unit IS NOT NULL"
+        )).fetchall()
+        changed_any = False
+        for dp_id, canonical_name, unit in rows:
+            new_unit = _config.canonicalize_unit(canonical_name, unit, registry=registry)
+            if new_unit is not None and new_unit != unit:
+                _logger.info(
+                    "Canonicalising unit on data_point %s (%s): %r -> %r",
+                    dp_id, canonical_name, unit, new_unit,
+                )
+                conn.execute(
+                    text("UPDATE data_points SET unit = :u WHERE id = :i"),
+                    {"u": new_unit, "i": dp_id},
+                )
+                changed_any = True
+        if changed_any:
             conn.commit()
 
 
@@ -2762,6 +2821,56 @@ def _recompute_abnormal(dp: DataPoint) -> None:
     dp.is_abnormal = below or above
 
 
+def _value_implausible_under_old_unit(dp: DataPoint, old_unit: str, new_unit: str,
+                                      _config) -> bool:
+    """True when a ``set_unit`` fix should RELABEL (keep the number) not CONVERT.
+
+    The category-error signature the live DB showed: ALT/AST stored in 'mg/dl'
+    while the values are enzyme-scale (they belong in U/l), or Harnsäure in 'U/l'
+    while the values are mg/dl-scale. The stored LABEL is the error, not the
+    number — converting such a value invents a wrong measurement.
+
+    Fires only when ALL hold, so a legitimate conversion (Glukose 100 mg/dl →
+    mmol/l) still converts:
+      1. the OLD unit is NOT a unit this marker is ever reported in (foreign →
+         the label itself is the mistake);
+      2. the NEW unit IS one of the marker's registry units;
+      3. the value fits the marker's default range under the NEW unit within a
+         wide tolerance (right order of magnitude, so the number really was
+         printed in the new unit).
+    """
+    if not old_unit or not new_unit or dp.value is None:
+        return False
+    info = (_config._CANONICAL_BIOMARKERS.get(dp.canonical_name)
+            if dp.canonical_name else None)
+    reg_units = list((info or {}).get("units") or [])
+    if not reg_units:
+        return False
+
+    def _matches(unit: str) -> bool:
+        u = _config._norm_unit(unit)
+        return any(_config._norm_unit(ru) == u or _config._units_equivalent(u, _config._norm_unit(ru))
+                   for ru in reg_units)
+
+    # (1) old unit foreign to the marker, (2) new unit native to it.
+    if _matches(old_unit) or not _matches(new_unit):
+        return False
+
+    # (3) value plausible under the new unit's default range (wide tolerance so a
+    # genuinely pathological-but-right-magnitude value still relabels).
+    d_low, d_high, _du = _config.get_default_ref_range(
+        dp.canonical_name, new_unit, registry=_config._CANONICAL_BIOMARKERS
+    )
+    if d_low is None and d_high is None:
+        return False
+    value = dp.value
+    if d_low is not None and value < d_low / 10.0:
+        return False
+    if d_high is not None and value > d_high * 10.0:
+        return False
+    return True
+
+
 def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, params: dict) -> tuple[bool, str]:
     """Apply a data-point-level fix. Returns (ok, detail). No commit.
 
@@ -2832,6 +2941,27 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
                 updated += 1
                 continue
             if dp.value is None:
+                continue
+            # Notation variant of the SAME physical unit ('/nl' → '10^3/µl',
+            # 'ng/l' → 'pg/ml', 'Tsd/µl' → '10³/µl'): numerically identical, so
+            # relabel WITHOUT touching the value or the stored range.
+            if _config._units_equivalent(old_unit, new_unit):
+                dp.unit = new_unit
+                _recompute_abnormal(dp)
+                updated += 1
+                continue
+            # A genuine unit change. Before converting, check whether the stored
+            # value is even PLAUSIBLE under the old unit: if it is wildly off the
+            # marker's registry range under the old unit but lands in range under
+            # the new one, the number was almost certainly printed in the NEW unit
+            # and the old label is the error (the live DB's ALT/AST stored in
+            # 'mg/dl' while the values are enzyme-scale). Converting such a value
+            # would invent a wrong number, so relabel it instead. When the value
+            # IS plausible under the old unit (Glukose 100 mg/dl), convert.
+            if _value_implausible_under_old_unit(dp, old_unit, new_unit, _config):
+                dp.unit = new_unit
+                _recompute_abnormal(dp)
+                updated += 1
                 continue
             # Convert the measured value (name-aware). An unsupported
             # conversion skips the point rather than storing a value in the

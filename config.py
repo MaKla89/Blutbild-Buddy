@@ -199,7 +199,8 @@ _CANONICAL_BIOMARKERS: dict[str, dict] = {
         "default_ref": {"low": 30.0, "high": 200.0, "unit": "U/l"}},
     "CK-MB": {"units": ["U/l", "IU/l", "U/L", "ng/ml", "ng/mL"], "aliases": ["CK-MB", "CK-Mass", "CK-MB Mass"],
         "default_ref": {"low": 0.0, "high": 5.0, "unit": "U/l"}},
-    "Troponin T": {"units": ["ng/ml", "ng/mL", "µg/l", "µg/L"], "aliases": ["TnT", "cTnT", "cardiac Troponin T", "Troponin"],
+    "Troponin T": {"units": ["ng/ml", "ng/mL", "µg/l", "µg/L", "ng/l", "ng/L", "pg/ml", "pg/mL"],
+        "aliases": ["TnT", "cTnT", "cardiac Troponin T", "Troponin", "hs-TnT", "high-sens Troponin T"],
         "default_ref": {"low": 0.0, "high": 0.01, "unit": "ng/ml"}},
     "NT-proBNP": {"units": ["pg/ml", "pg/mL", "ng/l", "ng/L"], "aliases": ["NT-pro-BNP", "N-terminal pro B-type Natriuretic Peptide"],
         "default_ref": {"low": 0.0, "high": 125.0, "unit": "pg/ml"}},
@@ -398,7 +399,169 @@ _UNIT_EQUIV: dict[str, str] = {
     # Flow: ml per minute. Spacing variants ('ml/ min', 'ml /min') are handled
     # by _norm_unit collapsing whitespace, so only the canonical form is listed.
     "ml/min": "ml_per_min",
+    # eGFR is reported per minute normalised to body surface. The printed form
+    # varies ('ml/min/1.73m²', 'ml/min/1.73m2', and the truncated 'ml/min/1.73'
+    # an OCR pass emits when the superscript is dropped). All three are the SAME
+    # quantity; 'ml/min' (the plain group above) is a DIFFERENT quantity (not
+    # BSA-normalised) and must never collapse into this one.
+    "ml/min/1.73m²": "ml_per_min_173",
+    "ml/min/1.73m2": "ml_per_min_173",
+    "ml/min/1.73": "ml_per_min_173",
+    # Mass concentration where the metric prefix moved between numerator and
+    # denominator but the ratio is identical: 1 ng/l == 1 pg/ml (both 10⁻⁹ g per
+    # litre). Troponin T is printed both ways by different labs.
+    "ng/l": "pg_per_ml",
+    "pg/ml": "pg_per_ml",
+    # Count per litre with a thousands prefix written as a word: 'Tsd/µl'
+    # (Tausend) is the same magnitude as 10³/µl. Already covered above via
+    # 'tsd/ul'; the bare '/µl' with no prefix is NOT here — it is ambiguous
+    # about magnitude and handled by the ingestion guard, not silently rewritten.
 }
+
+# A display spelling to rewrite each notation group to when the marker has no
+# registry unit to defer to (see canonicalize_unit). Keys are group ids.
+_UNIT_CANONICAL_DISPLAY: dict[str, str] = {
+    "1e3_per_ul": "10³/µl",
+    "1e6_per_ul": "10⁶/µl",
+    "miu_per_l": "mIU/l",
+    "ml_per_min": "ml/min",
+    "ml_per_min_173": "ml/min/1.73m²",
+    "pg_per_ml": "pg/ml",
+}
+
+# Words that are column HEADERS, never measurement units. A vision model that
+# reads the table header into the "unit" field emits exactly these (the live DB
+# had the literal string "Unit" stored as a unit). Matching is on the
+# whitespace-collapsed, lower-cased form. Deliberately only whole dictionary
+# words — a real unit is never one of these, so dropping them is lossless.
+_UNIT_TOKEN_BLACKLIST: frozenset[str] = frozenset({
+    "unit", "units", "einheit", "u.e", "ue", "messgroesse", "messgröße",
+    "ref", "refs", "referenz", "referenzbereich", "refrange", "reference",
+    "norm", "normbereich", "soll", "sollbereich", "sollwert", "target",
+    "wert", "messwert", "value", "result", "ergebnis", "messergebnis",
+    "method", "methode", "methodik", "parameter", "label", "bezeichnung",
+    "flag", "status", "hinweis", "test", "testart", "analyse", "parameter",
+    "kuerzel", "kürzel", "abk", "abkuerzung", "abkürzung", "column", "spalte",
+})
+
+
+def _is_header_token(unit_norm: str) -> bool:
+    """True when a normalised unit string is really a leaked column header."""
+    return unit_norm in _UNIT_TOKEN_BLACKLIST
+
+
+def sanitize_unit(unit: str | None) -> str | None:
+    """Clean an extracted unit at ingestion. Returns None when it is not a unit.
+
+    Collapses stray internal whitespace (like ``database.clean_unit``) and drops
+    two classes of garbage the model emits: an empty/punctuation-only string,
+    and a leaked column-header word ("Unit", "Einheit", "Referenzbereich", …).
+    A header word is never a real unit, so returning None is lossless — the
+    caller then falls back to the marker's registry default range, which is
+    exactly what a missing unit should do.
+    """
+    if unit is None:
+        return None
+    cleaned = re.sub(r"\s+", "", str(unit))
+    if not cleaned or cleaned in ("-", "—", "–", ".", "n.a", "n.n", "na", "nn"):
+        return None
+    if _is_header_token(cleaned.lower()):
+        return None
+    return cleaned
+
+
+def canonicalize_unit(canonical_name: str | None, unit: str | None,
+                      registry: dict | None = None) -> str | None:
+    """Rewrite a unit to the marker's own registry spelling when safe.
+
+    Value-preserving ONLY — it never changes the number, just the label, so it
+    is safe to run on existing rows. Two rewrites:
+      1. The unit already matches one of the marker's registry units
+         (case/spacing-insensitive) → return that registry spelling. This fixes
+         case drift ('ML/MIN' → 'ml/min') and keeps one marker on one spelling.
+      2. The unit is a notation variant (same physical unit, see ``_UNIT_EQUIV``)
+         of exactly one of the marker's registry units → return that registry
+         spelling ('Tsd/µl' → '10³/µl', 'ng/l' → 'pg/ml', 'µIU/ml' → 'mIU/l').
+    Anything else (an unknown or ambiguous unit) is returned unchanged so the
+    ingestion guard can flag it rather than guess.
+    """
+    if unit is None:
+        return None
+    cleaned = sanitize_unit(unit)
+    if cleaned is None:
+        return None
+    info = (registry if registry is not None else _CANONICAL_BIOMARKERS).get(canonical_name) if canonical_name else None
+    reg_units = list((info or {}).get("units") or [])
+    if not reg_units:
+        return cleaned
+
+    u_norm = _norm_unit(cleaned)
+    # 1) Already one of the marker's units (modulo case/spacing) → registry spelling.
+    for ru in reg_units:
+        if _norm_unit(ru) == u_norm:
+            return ru
+    # 2) Notation variant of one or more registry units → the first such
+    #    registry spelling ('Tsd/µl' → '10³/µl', 'ng/l' → 'pg/ml',
+    #    'µIU/ml' → 'mIU/l', '/pl' → 'Mio./µl'). All are numerically identical.
+    group = _UNIT_EQUIV.get(u_norm)
+    if group is not None:
+        matches = [ru for ru in reg_units if _UNIT_EQUIV.get(_norm_unit(ru)) == group]
+        if matches:
+            return matches[0]
+        # The marker lists no unit in this group; normalise the notation to the
+        # group's canonical display so at least the spelling is standard.
+        return _UNIT_CANONICAL_DISPLAY.get(group, cleaned)
+    return cleaned
+
+
+def unit_known_for_marker(canonical_name: str | None, unit: str | None,
+                          registry: dict | None = None) -> bool:
+    """True when ``unit`` is a plausible unit for this marker.
+
+    Plausible means EITHER it matches (or is a notation variant of) one of the
+    marker's own registry units, OR it is not a recognised lab unit anywhere in
+    the registry. The second clause keeps the guard quiet on ambiguous fragments
+    ('/l', '/ml' — a truncated mantissa, not a category error) and on a real
+    unit a marker happens not to list. Only a unit that IS a known unit for some
+    marker but incompatible with THIS one — ALT in 'mg/dl', Glukose in 'U/l', a
+    gross enzyme↔mass mix-up — returns False and gets flagged. An unregistered
+    marker or an empty unit returns True (nothing to contradict the unit).
+    Callers run this AFTER :func:`canonicalize_unit`, so a mere notation
+    difference ('Tsd/µl' vs '10³/µl') is already reconciled and never reaches
+    here as a mismatch."""
+    if not unit:
+        return True
+    active = registry if registry is not None else _CANONICAL_BIOMARKERS
+    u_norm = _norm_unit(unit)
+    info = active.get(canonical_name) if canonical_name else None
+    reg_units = list((info or {}).get("units") or [])
+    # An unregistered marker (or one with no units listed) has nothing to
+    # contradict the unit — we do not know what it is ever measured in, so a
+    # unit that happens to match some OTHER marker is NOT evidence of a mix-up.
+    # Flagging it would punish the very markers the Mapping tab already surfaces
+    # as 'unregistered' (they have no registry units to compare against).
+    if not reg_units:
+        return True
+    for ru in reg_units:
+        if _norm_unit(ru) == u_norm or _units_equivalent(u_norm, _norm_unit(ru)):
+            return True
+    # Not compatible with this marker — is it a recognised lab unit at all? If it
+    # is (used by some other marker), this is a category mix-up worth flagging;
+    # if not, it is an unknown/ambiguous string we deliberately leave alone.
+    #
+    # A bare denominator with no numerator magnitude ('/l', '/ml', '/µl', '/ul')
+    # is magnitude-AMBIGUOUS, not a category error: a count written '/µl' could
+    # be 10³/µl or 10⁶/µl, and the guard cannot know which. So it is never
+    # flagged, even though some marker (Leukozyten) lists a bare '/µl' — without
+    # this, Thrombozyten stored as '/ul' would false-flag against Leukozyten's
+    # '/µl'. Ambiguous fragments stay silent by design (see AGENTS notes).
+    if u_norm.startswith("/"):
+        return True
+    recognised = any(
+        _norm_unit(ru) == u_norm or _units_equivalent(u_norm, _norm_unit(ru))
+        for entry in active.values() for ru in (entry.get("units") or [])
+    )
+    return not recognised
 
 
 def _units_equivalent(from_unit: str, to_unit: str) -> bool:

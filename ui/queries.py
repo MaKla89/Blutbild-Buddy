@@ -29,10 +29,12 @@ combined.
 
 from collections import namedtuple
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 from sqlalchemy import func, text
 
+import config
 from database import DataPoint, Report, RiskFlag, commit_version, get_session
 
 # Lightweight, ORM-free stand-ins for the rows the tabs render.
@@ -346,6 +348,40 @@ def _mapping_rows(token, patient_id: int, report_id):
 def mapping_rows(patient_id: int, report_id=None) -> list:
     """Rows of the Mapping tab (all reports, or one when `report_id` is given)."""
     return _mapping_rows(cache_token(), patient_id, report_id)
+
+
+# ── Report page images (for the Mapping tab's finding review) ─────────────────
+
+@st.cache_data(max_entries=16, show_spinner=False)
+def _report_page_image(report_id: int, filename: str, page: int) -> str | None:
+    """Render ONE page of a report PDF as base64 JPEG, or None when unavailable.
+
+    ``page`` is 1-based (matching ``DataQualityFinding.source_page`` and how
+    pages are shown to the user). Deliberately NOT keyed on the cache token:
+    rendering a scan is expensive, and the PDF behind a given ``report_id`` is
+    immutable (a reprocess deletes the row and inserts a new id), so the token
+    would only force needless re-renders on every unrelated DB write. The
+    filename is part of the key so a (practically impossible) id reuse can never
+    serve the wrong scan. Returns None when the file is gone or the page number
+    is out of range, so the caller can show a 'source missing' caption instead of
+    crashing the tab.
+    """
+    from pdf_processor import pdf_to_base64_jpeg
+    path = Path(config.REPORTS_DIR) / filename
+    if not path.exists():
+        return None
+    try:
+        pages = pdf_to_base64_jpeg(path, dpi=150)
+    except Exception:
+        return None
+    if page < 1 or page > len(pages):
+        return None
+    return pages[page - 1]
+
+
+def report_page_image(report_id: int, filename: str, page: int) -> str | None:
+    """Base64 JPEG of a report page (1-based), or None when it can't be rendered."""
+    return _report_page_image(report_id, filename, page)
 
 
 # ── Risk flags ────────────────────────────────────────────────────────────────

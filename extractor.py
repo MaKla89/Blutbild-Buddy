@@ -5,10 +5,13 @@ from pathlib import Path
 import streamlit as st
 from sqlalchemy.orm import Session as SASession
 
-from config import REPORTS_DIR, resolve_canonical, get_default_ref_range
+from config import (
+    REPORTS_DIR, resolve_canonical, get_default_ref_range,
+    sanitize_unit, canonicalize_unit, unit_known_for_marker,
+)
 from database import (
     Report, DataPoint, Patient, ReportArtifact, DataQualityFinding,
-    get_or_create_patient, _canonical_base, get_registry, clean_unit,
+    get_or_create_patient, _canonical_base, get_registry,
     list_pending_uploads, remove_pending_upload,
 )
 from pdf_processor import pdf_to_base64_jpeg, file_hash
@@ -123,6 +126,13 @@ _DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y", "%Y/%m/%d", "%d/%m/%Y", "%d
 # minimum fraction are required so a short page with one coincidence never fires.
 _MIN_BOUND_MATCHES = 4
 _MIN_BOUND_FRACTION = 0.3
+
+# Confidence below which the extractor surfaces a "the reader wasn't sure about
+# this cell" finding (check C). The prompt asks the model to emit a confidence
+# ONLY for a cell it had to guess at, so a value this low is an explicit signal,
+# not a default. 0.5 keeps it strictly on the "more likely wrong than right" side
+# of the scale — a model that merely felt "pretty good" (0.7) stays silent.
+_LOW_CONFIDENCE_THRESHOLD = 0.5
 
 
 def _parse_result_date(text: str | None) -> datetime | None:
@@ -298,6 +308,45 @@ def _column_findings(
                                  name=name, column_index=entry.column_index,
                                  valid=", ".join(str(i) for i in sorted(layout["result_cols"])) or "—"),
                 "action": "disable_value", "params": {},
+            })
+
+        # (U) Unit category error. The unit is a recognised lab unit for SOME
+        # marker but incompatible with THIS one — ALT/AST printed in 'mg/dl'
+        # (an enzyme is measured in U/l), Glukose/Harnsäure in 'U/l' (a
+        # concentration, not an enzyme). ``canonicalize_unit`` already reconciled
+        # mere notation drift ('Tsd/µl' vs '10³/µl'), so anything still failing
+        # here is a genuine mix-up worth a review click. Ambiguous fragments
+        # ('/l', '/ml') and unknown strings return True and stay silent, so this
+        # never fires on a marker the registry simply doesn't cover. The fix
+        # proposes the marker's own first registry unit; applying it relabels
+        # (and converts only when the stored value is implausible under the old
+        # unit — see _apply_data_point_fix).
+        marker_unit = units[pos]
+        if marker_unit and canonical and not unit_known_for_marker(canonical, marker_unit, registry):
+            reg_units = list((registry.get(canonical) or {}).get("units") or [])
+            if reg_units:
+                findings.append({
+                    "category": "unit",
+                    "entry_positions": [pos],
+                    "description": t("dq_unit_mismatch", lang=lang,
+                                     name=name, unit=marker_unit,
+                                     expected=", ".join(reg_units)),
+                    "action": "set_unit", "params": {"unit": reg_units[0]},
+                })
+
+        # (C) Low extraction confidence. The model flagged THIS cell as a guess
+        # (blurry, overlapping columns, an unclear digit). Nothing is determinable
+        # from the stored data — the point is to surface exactly the cells the
+        # reader itself was unsure about, so the user eyeballs the source page.
+        # Only fires when the model actually emitted a confidence below the
+        # threshold; a clean read (no confidence field) stays silent.
+        if entry.confidence is not None and entry.confidence < _LOW_CONFIDENCE_THRESHOLD:
+            findings.append({
+                "category": "value",
+                "entry_positions": [pos],
+                "description": t("dq_low_confidence", lang=lang,
+                                 name=name, confidence=int(round(entry.confidence * 100))),
+                "action": "acknowledge", "params": {},
             })
 
     # (5) With several result columns, every row should contribute one entry per
@@ -677,16 +726,24 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                         ref_pairs.append((None, None))
                         from_pdf_ref.append(False)
                         continue
-                    # Collapse stray internal whitespace in the unit ('ml/ min' →
-                    # 'ml/min') BEFORE anything uses it. OCR/LLM extraction emits
-                    # these, and because merge grouping keys on the unit a stray
-                    # space splits one biomarker into two entries that never merge.
-                    # Cleaning at ingestion keeps every downstream consumer
-                    # (registry lookup, ref-range default, dedup, storage) aligned.
-                    unit = clean_unit(entry.unit)
+                    # Sanitize the extracted unit at ingestion: collapse stray
+                    # internal whitespace ('ml/ min' → 'ml/min') AND drop garbage
+                    # the vision model emits — a leaked column-header word
+                    # ("Unit", "Einheit", "Referenzbereich") or a punctuation-only
+                    # placeholder. A header word is never a real unit, so dropping
+                    # it to None lets the registry default range apply, which is
+                    # exactly what a missing unit should do. (The live DB had the
+                    # literal string "Unit" stored as a unit.)
+                    unit = sanitize_unit(entry.unit)
                     # Deterministic registry resolution only — the LLM name mapping
                     # happens once for ALL reports in Phase 2, not once per PDF.
                     canonical = _normalize_name(entry.name, unit, [], canonical_names, registry=registry)
+                    # Snap the unit to the marker's own registry spelling when the
+                    # rewrite is value-preserving (case drift 'ML/MIN' → 'ml/min',
+                    # notation variant 'Tsd/µl' → '10³/µl', 'ng/l' → 'pg/ml'). This
+                    # keeps one marker on one spelling so merge grouping, the
+                    # ref-range default and dedup all stay aligned.
+                    unit = canonicalize_unit(canonical, unit, registry=registry)
                     ref_low, ref_high = _parse_reference_range(entry.reference_range)
                     had_pdf_ref = ref_low is not None or ref_high is not None
 
@@ -764,6 +821,11 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                                    else (panel_type or pdf_path.name)),
                         report_id=report.id,
                         data_point_ids=json.dumps(ids) if ids else None,
+                        # Which page of the report the affected entries came from
+                        # (1-based, matching how pages are shown). The Mapping tab
+                        # renders this page's image next to the finding so the
+                        # user can eyeball the source cell instead of guessing.
+                        source_page=page_idx + 1,
                         description=fdef["description"],
                         action=fdef["action"],
                         params_json=json.dumps(fdef["params"]),

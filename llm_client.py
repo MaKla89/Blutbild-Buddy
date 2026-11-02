@@ -117,6 +117,10 @@ STEP 2 — ROWS: read the table cell by cell, row by row. For each test provide:
 - reference_range (the reference range exactly as printed, e.g. "4.2-6.1" or "< 5.2" or "negativ")
 - column_index (the "index" of the "result" column this value was read from —
   REQUIRED whenever you declared columns; one entry per result column per row)
+- confidence (OPTIONAL, only when unsure): a number 0..1 for how sure you are
+  that THIS entry's value came from the correct cell. Add it ONLY for a cell you
+  had to guess at (blurry, overlapping columns, an unclear digit). Omit it
+  entirely for cells you read cleanly — do not pad every entry with 1.0.
 
 THE REFERENCE COLUMN MUST NEVER BE MIXED UP WITH A RESULT COLUMN:
 - reference_range comes ONLY from the column whose role is "reference".
@@ -145,7 +149,7 @@ Also extract NON-NUMERIC findings from the report's WRITTEN TEXT (not the numeri
 Return an empty "artifacts" list if the report contains no such written-text findings.
 
 Return ONLY valid JSON matching this structure, no markdown or explanation:
-{"patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "columns": [{"index": 0, "header": "...", "role": "name", "result_date": null}, {"index": 1, "header": "02.05.2024", "role": "result", "result_date": "2024-05-02"}, {"index": 2, "header": "Referenzbereich", "role": "reference", "result_date": null}], "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null", "column_index": 1}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}"""
+{"patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "columns": [{"index": 0, "header": "...", "role": "name", "result_date": null}, {"index": 1, "header": "02.05.2024", "role": "result", "result_date": "2024-05-02"}, {"index": 2, "header": "Referenzbereich", "role": "reference", "result_date": null}], "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null", "column_index": 1, "confidence": 0.4}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}"""
 
 EXTRACTION_SYSTEM_PROMPT_BATCH = """You are a medical data extraction assistant. Your task is to extract structured data from lab report PDF page images. You will receive multiple page images in a single request.
 
@@ -176,6 +180,10 @@ STEP 2 — ROWS: read that page's table cell by cell, row by row. For each test 
 - reference_range (the reference range exactly as printed, e.g. "4.2-6.1" or "< 5.2" or "negativ")
 - column_index (the "index" of the "result" column this value was read from —
   REQUIRED whenever you declared columns; one entry per result column per row)
+- confidence (OPTIONAL, only when unsure): a number 0..1 for how sure you are
+  that THIS entry's value came from the correct cell. Add it ONLY for a cell you
+  had to guess at (blurry, overlapping columns, an unclear digit). Omit it
+  entirely for cells you read cleanly — do not pad every entry with 1.0.
 
 THE REFERENCE COLUMN MUST NEVER BE MIXED UP WITH A RESULT COLUMN:
 - reference_range comes ONLY from the column whose role is "reference".
@@ -205,7 +213,7 @@ Also extract NON-NUMERIC findings from each page's WRITTEN TEXT (not the numeric
 Return an empty "artifacts" list for a page with no such findings.
 
 Return ONLY valid JSON matching this structure, no markdown or explanation:
-{"pages": [{"page_index": 0, "patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "columns": [{"index": 0, "header": "...", "role": "name", "result_date": null}, {"index": 1, "header": "02.05.2024", "role": "result", "result_date": "2024-05-02"}, {"index": 2, "header": "Referenzbereich", "role": "reference", "result_date": null}], "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null", "column_index": 1}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}]}"""
+{"pages": [{"page_index": 0, "patient_name": "... or null", "report_date": "... or null", "panel_type": "... or null", "columns": [{"index": 0, "header": "...", "role": "name", "result_date": null}, {"index": 1, "header": "02.05.2024", "role": "result", "result_date": "2024-05-02"}, {"index": 2, "header": "Referenzbereich", "role": "reference", "result_date": null}], "entries": [{"name": "...", "value": number or null, "unit": "... or null", "reference_range": "... or null", "column_index": 1, "confidence": 0.4}], "artifacts": [{"category": "...", "text": "...", "source_excerpt": "... or null"}]}]}"""
 
 # Second pass over an already-extracted page: the model sees the page image
 # AGAIN plus its own previous output and only has to judge whether each value

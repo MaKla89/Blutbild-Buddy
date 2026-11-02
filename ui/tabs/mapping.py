@@ -426,6 +426,9 @@ def render_mapping_tab(session, patient, patient_reports):
                     hc.markdown(f"**{label}**")
 
             any_changed = False
+            # report_id → filename, so a finding can name the PDF its source page
+            # came from (the image helper needs the filename, not just the id).
+            filename_by_report = {r.id: r.filename for r in patient_reports}
             for idx, f in enumerate(findings):
                 c_cat, c_bio, c_target, c_desc, c_prop, c_accept, c_dismiss = st.columns(col_widths)
                 c_cat.markdown(t(f"cat_{f.category}"))
@@ -449,6 +452,23 @@ def render_mapping_tab(session, patient, patient_reports):
                 if c_dismiss.button(t("btn_dismiss_finding"), key=f"dismiss_finding_{f.id}"):
                     dismiss_data_quality_finding(session, f.id)
                     any_changed = True
+
+                # Show the exact source cell the finding is about: the report
+                # page it came from, rendered next to the finding. The user
+                # eyeballs the real table instead of guessing which column the
+                # model misread. Only extraction/verify findings carry a page;
+                # the on-demand check reasons over stored data and has none.
+                if f.report_id and getattr(f, "source_page", None):
+                    fname = filename_by_report.get(f.report_id)
+                    if fname:
+                        with st.expander(
+                            t("caption_finding_source_page", page=f.source_page, filename=fname)
+                        ):
+                            img = queries.report_page_image(f.report_id, fname, f.source_page)
+                            if img:
+                                st.image(f"data:image/jpeg;base64,{img}", use_container_width=True)
+                            else:
+                                st.caption(t("caption_finding_source_missing", page=f.source_page))
                 if idx < len(findings) - 1:
                     st.divider()
 

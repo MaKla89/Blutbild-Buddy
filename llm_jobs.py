@@ -1483,7 +1483,7 @@ _VERIFY_PROBLEM_DESC_KEYS = {
 }
 
 
-def _verify_problem_to_finding(prob, dp, registry, lang, report, skip_dp_ids):
+def _verify_problem_to_finding(prob, dp, registry, lang, report, skip_dp_ids, source_page=None):
     """Turn one audit ``VerifyProblem`` into a DataQualityFinding dict, or None.
 
     The auditor re-read the page image and disagreed with the stored value /
@@ -1492,6 +1492,9 @@ def _verify_problem_to_finding(prob, dp, registry, lang, report, skip_dp_ids):
     The fix mirrors the deterministic extractor checks where the same shape is
     involved, but the auditor often supplies the corrected value directly (it
     can see the image), which the deterministic pass cannot.
+
+    ``source_page`` (1-based) is the page the audited entry came from, so the
+    Mapping tab can show that page's image beside the finding.
     """
     problem = (prob.problem or "").strip()
     idx = prob.entry_index
@@ -1508,6 +1511,7 @@ def _verify_problem_to_finding(prob, dp, registry, lang, report, skip_dp_ids):
             "target_type": "data_point" if target_dp is not None else "report",
             "biomarker": name,
             "report_id": report.id,
+            "source_page": source_page,
             "data_point_ids": [target_dp.id] if target_dp is not None else None,
             "description": t(desc_key, lang=lang, name=name, evidence=evidence or "—"),
             "action": action,
@@ -1670,7 +1674,8 @@ def _job_verify_extraction(session, cfg, lang, params):
                 continue
             for prob in result.problems:
                 dp = pos_to_dp.get(prob.entry_index) if prob.entry_index is not None else None
-                fdef = _verify_problem_to_finding(prob, dp, registry, lang, r, skip_dp_ids)
+                fdef = _verify_problem_to_finding(prob, dp, registry, lang, r, skip_dp_ids,
+                                                  source_page=page_idx + 1)
                 if fdef is not None:
                     new_findings.append(fdef)
 
@@ -1688,6 +1693,7 @@ def _job_verify_extraction(session, cfg, lang, params):
             target_type=fdef["target_type"],
             biomarker=fdef["biomarker"],
             report_id=fdef["report_id"],
+            source_page=fdef.get("source_page"),
             data_point_ids=json.dumps(fdef["data_point_ids"]) if fdef["data_point_ids"] else None,
             description=fdef["description"],
             action=fdef["action"],
