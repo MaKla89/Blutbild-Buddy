@@ -203,6 +203,12 @@ class DataPoint(Base):
     # Disabled values are excluded from all charts and LLM analyses
     # (e.g. measurements distorted by medical procedures).
     is_disabled = Column(Boolean, default=False)
+    # The user hand-corrected this row (value / unit / reference range). Set by
+    # ``update_data_point`` and honoured by the extraction pipeline: a reprocess
+    # re-applies the correction instead of letting a fresh LLM reading overwrite
+    # it, and the second-pass auditor stops proposing fixes for it. Without this
+    # flag, a manual correction is silently destroyed by the next reprocess.
+    is_corrected = Column(Boolean, default=False)
 
     report = relationship("Report", back_populates="data_points")
     risk_flags = relationship("RiskFlag", back_populates="data_point", cascade="all, delete-orphan")
@@ -525,6 +531,7 @@ def init_db():
     _migrate_report_artifacts(engine)
     _migrate_data_point_result_columns(engine)
     _migrate_patient_scoped_jobs(engine)
+    _migrate_data_point_corrected(engine)
     # Invalidate the registry cache — init_db() may have pointed the engine
     # at a different DB file (tests create several temp DBs per process).
     _registry_cache_invalidate()
@@ -602,6 +609,22 @@ def _migrate_data_point_disabled(engine):
     if "is_disabled" not in columns:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE data_points ADD COLUMN is_disabled BOOLEAN DEFAULT 0"))
+            conn.commit()
+
+
+def _migrate_data_point_corrected(engine):
+    """Add ``data_points.is_corrected`` — the manual-correction marker.
+
+    Nullable-free with a 0 default, so every pre-existing row reads as
+    "not corrected" and behaves exactly as before. Existing rows can never have
+    been hand-edited (no edit UI existed), so the default is truthful rather
+    than merely convenient.
+    """
+    inspector = inspect(engine)
+    columns = [c["name"] for c in inspector.get_columns("data_points")]
+    if "is_corrected" not in columns:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE data_points ADD COLUMN is_corrected BOOLEAN DEFAULT 0"))
             conn.commit()
 
 
@@ -1038,6 +1061,235 @@ def set_data_point_disabled(session, dp_id: int, disabled: bool) -> DataPoint | 
         session.query(RiskFlag).filter(RiskFlag.data_point_id == dp_id).delete()
     session.commit()
     return dp
+
+
+# Sentinel distinguishing "field not supplied" from "field supplied as None" —
+# a manual edit must be able to CLEAR a value or a bound, so None is meaningful.
+_UNSET = object()
+
+
+def _parse_single_value(text):
+    """Parse one measurement cell into a float. Returns (value, error).
+
+    Accepts a number or a numeric string with either decimal separator (German
+    reports print '13,18'). An empty cell is a legitimate clear — a qualitative
+    result has no number. A range-shaped cell ('13,18-14,81') is REJECTED: that
+    is the value/reference column mix-up the extractor guards flag, and silently
+    taking its first bound would bake the misread back into the data. The user
+    belongs in the reference-range field instead.
+    """
+    if text is None:
+        return None, None
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        return float(text), None
+    s = str(text).strip()
+    if not s or s in ("—", "-", "–", "n.a", "n.n"):
+        return None, None
+    # A range-shaped cell ('13,18-14,81', '< 5.2') is the value/reference column
+    # mix-up the extractor guards flag. Reject rather than silently take the
+    # first bound, which would bake the misread back into the measurement.
+    if re.match(r"^[<>]?\s*[\d.,]+\s*[\u2013\u2014~-]\s*[\d.,]+", s):
+        return None, "range_not_a_value"
+    num = s.replace(" ", "").replace(",", ".")
+    # Keep only the leading numeric run so a stray unit typed into the value
+    # cell ('13.18 mg/l') still parses — the unit has its own field.
+    m = re.match(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)", num)
+    if not m:
+        return None, "not_a_number"
+    try:
+        return float(m.group(0)), None
+    except ValueError:
+        return None, "not_a_number"
+
+
+def _set_dp_unit(dp: DataPoint, new_unit: str) -> bool:
+    """Change one data point's unit, converting or relabelling as appropriate.
+
+    Shared by the LLM ``set_unit`` fix and the manual editor so the two paths
+    can never drift apart on the question that matters most: when a unit change
+    is a relabel (keep the number) versus a conversion (rewrite it). Returns
+    False when the point must be skipped rather than given a wrong number.
+    """
+    import config as _config
+    old_unit = clean_unit(dp.unit) or ""
+    if old_unit and old_unit.lower() == new_unit.lower():
+        # Same unit — nothing to convert, just normalize the label.
+        dp.unit = new_unit
+        _recompute_abnormal(dp)
+        return True
+    if dp.value is None:
+        # Nothing numeric to convert; relabelling a qualitative row is harmless
+        # and is what the user asked for.
+        dp.unit = new_unit
+        _recompute_abnormal(dp)
+        return True
+    # Notation variant of the SAME physical unit ('/nl' → '10^3/µl',
+    # 'ng/l' → 'pg/ml', 'Tsd/µl' → '10³/µl'): numerically identical, so
+    # relabel WITHOUT touching the value or the stored range.
+    if _config._units_equivalent(old_unit, new_unit):
+        dp.unit = new_unit
+        _recompute_abnormal(dp)
+        return True
+    # A genuine unit change. Before converting, check whether the stored value
+    # is even PLAUSIBLE under the old unit: if it is wildly off the marker's
+    # registry range under the old unit but lands in range under the new one,
+    # the number was almost certainly printed in the NEW unit and the old label
+    # is the error (the live DB's ALT/AST stored in 'mg/dl' while the values are
+    # enzyme-scale). Converting such a value would invent a wrong number, so
+    # relabel it instead. When the value IS plausible under the old unit
+    # (Glukose 100 mg/dl), convert.
+    if _value_implausible_under_old_unit(dp, old_unit, new_unit, _config):
+        dp.unit = new_unit
+        _recompute_abnormal(dp)
+        return True
+    # Convert the measured value (name-aware). An unsupported conversion skips
+    # the point rather than storing a value in the wrong unit.
+    conv_value, _ = _config._convert_ref_range(
+        dp.canonical_name, dp.value, dp.value, old_unit, new_unit
+    )
+    if conv_value is None:
+        return False
+    dp.value = float(conv_value)
+    # Convert stored ref bounds when present (assumed to be in the old unit);
+    # an unsupported conversion drops them.
+    if dp.ref_low is not None or dp.ref_high is not None:
+        c_low, c_high = _config._convert_ref_range(
+            dp.canonical_name, dp.ref_low, dp.ref_high, old_unit, new_unit
+        )
+        dp.ref_low, dp.ref_high = c_low, c_high
+    dp.unit = new_unit
+    _recompute_abnormal(dp)
+    return True
+
+
+def update_data_point(session: SASession, dp_id: int, patient_id: int, *,
+                      value=_UNSET, unit=_UNSET, ref_range=_UNSET) -> dict:
+    """Hand-correct ONE measurement: its value, unit and/or reference range.
+
+    The manual counterpart to accepting an LLM finding — same effect on the row,
+    but the user supplies the correct number instead of the model. Deliberately
+    narrow:
+      * ``patient_id`` is required and the row's report must belong to that
+        patient. Editing another patient's measurement through a widget that
+        only ever shows the selected patient is the leak the multi-user rework
+        closed everywhere else; a write primitive must enforce it too rather
+        than trust its caller.
+      * ``original_name`` is NOT editable. It is the verbatim PDF spelling and
+        the identity a reprocess uses to find this row again after deleting it
+        (see ``llm_jobs._reapply_corrections``). Editing it would silently
+        orphan the correction.
+      * the biomarker NAME is not editable here either, on purpose. A name
+        belongs to the rename path, which records the old name as a registry
+        ALIAS — so the next extraction resolves the PDF spelling to the
+        corrected name on its own and the fix is durable. A per-row name edit
+        has no such anchor and would be undone by the next reprocess.
+
+    Returns {'status': applied|unchanged|skipped|not_found, 'detail': str,
+    'changed': [field names]}. Commits only when something changed.
+    """
+    dp = session.get(DataPoint, dp_id)
+    if dp is None:
+        return {"status": "not_found", "detail": "data point not found", "changed": []}
+    report = session.get(Report, dp.report_id)
+    if report is None or report.patient_id != patient_id:
+        return {"status": "skipped", "detail": "data point belongs to another patient",
+                "changed": []}
+
+    changed: list[str] = []
+
+    if unit is not _UNSET:
+        raw_unit = "" if unit is None else str(unit)
+        if raw_unit.strip():
+            cleaned = _config.sanitize_unit(raw_unit)
+            if cleaned is None:
+                # sanitize_unit drops a leaked column-header word or a
+                # punctuation-only placeholder. A user typing 'Unit' meant a
+                # unit, so say so instead of quietly clearing the field.
+                return {"status": "skipped",
+                        "detail": f"'{raw_unit.strip()}' is not a unit", "changed": changed}
+            # Snap to the marker's own registry spelling when the rewrite is
+            # value-preserving (case/spacing drift, notation variants) — the
+            # same call the extractor makes, so a hand-entered 'Tsd/µl' lands
+            # on '10³/µl' like an extracted one would.
+            target = _config.canonicalize_unit(dp.canonical_name, cleaned,
+                                               registry=get_registry(session))
+            if target != (clean_unit(dp.unit) or ""):
+                if not _set_dp_unit(dp, target):
+                    return {"status": "skipped",
+                            "detail": f"cannot convert to '{target}'",
+                            "changed": changed}
+                changed.append("unit")
+        elif dp.unit:
+            dp.unit = None
+            changed.append("unit")
+
+    if ref_range is not _UNSET:
+        low = high = None
+        if isinstance(ref_range, (tuple, list)):
+            low, high = (ref_range + (None, None))[:2]
+        else:
+            raw = "" if ref_range is None else str(ref_range)
+            if raw.strip():
+                low, high, _ru = _parse_ref_range(raw)
+                if low is None and high is None:
+                    return {"status": "skipped",
+                            "detail": f"could not read a range from '{raw.strip()}'",
+                            "changed": changed}
+        if (dp.ref_low, dp.ref_high) != (low, high):
+            dp.ref_low = float(low) if low is not None else None
+            dp.ref_high = float(high) if high is not None else None
+            _recompute_abnormal(dp)
+            changed.append("ref_range")
+
+    if value is not _UNSET:
+        parsed, err = _parse_single_value(value)
+        if err:
+            return {"status": "skipped",
+                    "detail": ("a range belongs in the reference field, not the value"
+                               if err == "range_not_a_value" else "value is not a number"),
+                    "changed": changed}
+        if dp.value != parsed:
+            dp.value = parsed
+            _recompute_abnormal(dp)
+            changed.append("value")
+
+    if not changed:
+        return {"status": "unchanged", "detail": "", "changed": []}
+
+    dp.is_corrected = True
+    # A hand-edit supersedes any pending machine suggestion about the same row:
+    # leaving it pending would offer to overwrite the value the user just typed.
+    _dismiss_findings_for_data_points(session, [dp.id])
+    session.commit()
+    return {"status": "applied", "detail": ", ".join(changed), "changed": changed}
+
+
+def _dismiss_findings_for_data_points(session: SASession, dp_ids: list[int]) -> int:
+    """Dismiss pending data-point findings that target any of ``dp_ids``.
+
+    Used after a manual correction. The finding stays in the table as
+    'dismissed' rather than being deleted, so the history still shows that the
+    pipeline suspected this cell — and the Mapping tab's 'clear resolved'
+    housekeeping removes it on the user's next explicit click.
+    """
+    if not dp_ids:
+        return 0
+    id_set = {str(i) for i in dp_ids}
+    dismissed = 0
+    for f in (
+        session.query(DataQualityFinding)
+        .filter(DataQualityFinding.status == "pending",
+                DataQualityFinding.target_type == "data_point")
+        .all()
+    ):
+        try:
+            ids = json.loads(f.data_point_ids) if f.data_point_ids else []
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if id_set & {str(i) for i in ids}:
+            f.status = "dismissed"
+            dismissed += 1
+    return dismissed
 
 
 def set_report_artifact_disabled(session, artifact_id: int, disabled: bool) -> ReportArtifact | None:
@@ -2813,8 +3065,16 @@ def clear_resolved_data_quality_findings(session: SASession, patient_id: int | N
 
 
 def _recompute_abnormal(dp: DataPoint) -> None:
-    """Recompute is_abnormal from value + bounds (one-sided ranges aware)."""
+    """Recompute is_abnormal from value + bounds (one-sided ranges aware).
+
+    Mirrors the extractor's ``_is_value_abnormal``: with no number or no bound
+    nothing can be flagged, so the flag is CLEARED rather than left as it was.
+    A manual edit that clears a value (or its range) must not keep a red badge
+    on a cell that no longer holds an abnormal measurement — the early-return
+    this replaces used to strand ``is_abnormal=True`` on an emptied cell.
+    """
     if dp.value is None or (dp.ref_low is None and dp.ref_high is None):
+        dp.is_abnormal = False
         return
     below = dp.ref_low is not None and dp.value < dp.ref_low
     above = dp.ref_high is not None and dp.value > dp.ref_high

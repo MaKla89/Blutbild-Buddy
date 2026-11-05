@@ -52,7 +52,8 @@ RiskRow = namedtuple(
 )
 MappingRow = namedtuple(
     "MappingRow",
-    "id report_date filename original_name canonical_name value unit ref_low ref_high",
+    "id report_date filename original_name canonical_name value unit ref_low ref_high "
+    "is_disabled is_corrected",
 )
 
 
@@ -333,7 +334,8 @@ def _mapping_rows(token, patient_id: int, report_id):
         q = (
             s.query(DataPoint.id, Report.report_date, Report.filename,
                     DataPoint.original_name, DataPoint.canonical_name, DataPoint.value,
-                    DataPoint.unit, DataPoint.ref_low, DataPoint.ref_high)
+                    DataPoint.unit, DataPoint.ref_low, DataPoint.ref_high,
+                    DataPoint.is_disabled, DataPoint.is_corrected)
             .join(Report, DataPoint.report_id == Report.id)
             .filter(Report.patient_id == patient_id)
         )
@@ -341,7 +343,8 @@ def _mapping_rows(token, patient_id: int, report_id):
             q = q.filter(DataPoint.report_id == report_id)
         return [
             MappingRow(*r)
-            for r in q.order_by(DataPoint.canonical_name, Report.report_date).all()
+            for r in q.order_by(DataPoint.canonical_name, Report.report_date,
+                                DataPoint.id).all()
         ]
 
 

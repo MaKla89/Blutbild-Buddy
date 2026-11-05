@@ -4349,6 +4349,51 @@ class TestReprocessPdfs(unittest.TestCase):
         self.assertTrue(new_dp.is_disabled)
         self.assertIn("wiederhergestellt", stored.result_text or "")
 
+    def test_reprocess_reapplies_manual_correction(self):
+        """A hand-corrected value survives a re-extraction that reads it differently.
+
+        The mocked extraction always returns value 1.0; the user corrected the
+        row to 99.0. Without the re-apply pass the fresh reading would silently
+        win and the correction would be lost.
+        """
+        dp = self.session.query(database.DataPoint).first()
+        dp.value = 99.0
+        dp.is_corrected = True
+        self.session.commit()
+        job = self._run_reprocess(patient_id=self.patient.id)
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done")
+        new_dp = self.session.query(database.DataPoint).first()
+        # The corrected number is back, not the freshly-read 1.0.
+        self.assertEqual(new_dp.value, 99.0)
+        self.assertTrue(new_dp.is_corrected)
+        # The snapshot also restores the corrected reference bounds (the fresh
+        # extraction printed no range, so it would otherwise be None).
+        self.assertEqual((new_dp.ref_low, new_dp.ref_high), (0.5, 2.0))
+        self.assertIn("manuell korrigierter", stored.result_text or "")
+
+    def test_reprocess_reports_lost_correction(self):
+        """A correction whose row the new extraction can't match is reported, not hidden.
+
+        Keying on original_name means a re-extraction that reads the marker name
+        differently can't be re-matched — the correction is genuinely lost, and
+        the job must say so rather than quietly reverting a medical value.
+        """
+        dp = self.session.query(database.DataPoint).first()
+        dp.original_name = "ZzzMarker"  # extraction will emit "A" → no key match
+        dp.value = 99.0
+        dp.is_corrected = True
+        self.session.commit()
+        job = self._run_reprocess(patient_id=self.patient.id)
+        self.session.expire_all()
+        stored = database.get_llm_job(self.session, job.id)
+        self.assertEqual(stored.status, "done")
+        new_dp = self.session.query(database.DataPoint).first()
+        # The correction could not be re-applied → the fresh reading stands.
+        self.assertEqual(new_dp.value, 1.0)
+        self.assertIn("NICHT wiederhergestellt", stored.result_text or "")
+
     def test_reprocess_diff_detects_name_change(self):
         """When the improved registry maps a name differently, the diff says so."""
         job = self._run_reprocess(
@@ -8180,6 +8225,232 @@ class TestSourcePageMigration(unittest.TestCase):
         self.assertEqual(self.session.query(database.DataPoint).filter_by(canonical_name="Leukozyten (WBC)").one().unit, "10³/µl")
 
 
+class TestUpdateDataPoint(unittest.TestCase):
+    """update_data_point: the manual-edit API behind the Mapping tab data editor."""
+
+    def setUp(self):
+        self.session = _fresh_db(f"udp_{self._testMethodName}.db")
+        self.patient = database.get_or_create_patient(self.session, "UDP_Patient")
+        other = database.get_or_create_patient(self.session, "UDP_Other")
+        self.report = database.Report(
+            patient_id=self.patient.id, filename="udp.pdf",
+            file_hash="udp_hash_1", report_date=datetime(2025, 1, 1),
+        )
+        foreign_report = database.Report(
+            patient_id=other.id, filename="udp_other.pdf",
+            file_hash="udp_hash_2", report_date=datetime(2025, 1, 1),
+        )
+        self.session.add_all([self.report, foreign_report])
+        self.session.flush()
+        self.dp = database.DataPoint(
+            report_id=self.report.id, canonical_name="CRP", original_name="CRP",
+            value=5.2, unit="mg/l", ref_low=None, ref_high=5.0, is_abnormal=True,
+        )
+        self.foreign_dp = database.DataPoint(
+            report_id=foreign_report.id, canonical_name="CRP",
+            original_name="CRP", value=1.0, unit="mg/l",
+        )
+        self.session.add_all([self.dp, self.foreign_dp])
+        self.session.commit()
+        self.pid = self.patient.id
+
+    def tearDown(self):
+        self.session.close()
+
+    def _pending_finding(self):
+        f = database.DataQualityFinding(
+            patient_id=self.pid, category="value", target_type="data_point",
+            biomarker="CRP", data_point_ids=json.dumps([self.dp.id]),
+            description="test", action="set_value", params_json="{}",
+            status="pending",
+        )
+        self.session.add(f)
+        self.session.commit()
+        return f.id
+
+    # ── value edits ─────────────────────────────────────────────────────
+
+    def test_value_edit_marks_corrected_and_recomputes_abnormal(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="3.1")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.dp.value, 3.1)
+        self.assertTrue(self.dp.is_corrected)
+        self.assertFalse(self.dp.is_abnormal)  # 3.1 <= 5.0
+
+    def test_value_edit_accepts_german_comma(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="13,18")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertAlmostEqual(self.dp.value, 13.18)
+
+    def test_value_edit_clears_value_with_empty_cell(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertIsNone(self.dp.value)
+        self.assertFalse(self.dp.is_abnormal)
+        self.assertTrue(self.dp.is_corrected)
+
+    def test_range_shaped_value_rejected(self):
+        # The classic column-confusion reading: a reference range pasted into
+        # the value cell must never become a measurement.
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="5,0 - 10,0")
+        self.assertEqual(out["status"], "skipped")
+        self.assertIn("reference", out["detail"])
+        self.session.expire_all()
+        self.assertEqual(self.dp.value, 5.2)
+        self.assertFalse(bool(self.dp.is_corrected))
+
+    def test_garbage_value_rejected(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="abc")
+        self.assertEqual(out["status"], "skipped")
+        self.session.expire_all()
+        self.assertEqual(self.dp.value, 5.2)
+
+    # ── unit edits ──────────────────────────────────────────────────────
+
+    def test_unit_edit_converts_value_and_range(self):
+        # Glucose 100 mg/dl → mmol/l: 100 is plausible under mg/dl, so this is
+        # a real conversion, not a relabel.
+        self.dp.canonical_name = "Glukose (nüchtern)"
+        self.dp.value = 100.0
+        self.dp.unit = "mg/dl"
+        self.dp.ref_low = 70.0
+        self.dp.ref_high = 110.0
+        self.session.commit()
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         unit="mmol/l")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.dp.unit, "mmol/l")
+        self.assertAlmostEqual(self.dp.value, 100.0 / 18.0, places=3)
+        self.assertAlmostEqual(self.dp.ref_low, 70.0 / 18.0, places=3)
+        self.assertTrue(self.dp.is_corrected)
+
+    def test_unit_edit_relables_when_value_implausible_under_old_unit(self):
+        # ALT stored in mg/dl (a category error): value 33 is enzyme-scale,
+        # converting would invent a wrong number → relabel keeps it.
+        self.dp.canonical_name = "ALT (GPT)"
+        self.dp.value = 33.0
+        self.dp.unit = "mg/dl"
+        self.dp.ref_low = None
+        self.dp.ref_high = 40.0
+        self.session.commit()
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         unit="U/l")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.dp.unit, "U/l")
+        self.assertEqual(self.dp.value, 33.0)
+
+    def test_unit_edit_notation_variant_relabels_without_conversion(self):
+        self.dp.canonical_name = "Leukozyten (WBC)"
+        self.dp.value = 7.1
+        self.dp.unit = "Tsd/µl"
+        self.dp.ref_low = 4.0
+        self.dp.ref_high = 10.0
+        self.session.commit()
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         unit="10³/µl")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.dp.unit, "10³/µl")
+        self.assertEqual(self.dp.value, 7.1)
+
+    def test_unit_edit_placeholder_rejected(self):
+        # A leaked column header must never be stored as a unit.
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         unit="Unit")
+        self.assertEqual(out["status"], "skipped")
+        self.session.expire_all()
+        self.assertEqual(self.dp.unit, "mg/l")
+
+    # ── reference-range edits ───────────────────────────────────────────
+
+    def test_ref_range_edit_textual(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         ref_range="0 - 5")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual((self.dp.ref_low, self.dp.ref_high), (0.0, 5.0))
+        self.assertTrue(self.dp.is_corrected)
+
+    def test_ref_range_edit_one_sided(self):
+        # Low-only bound ('>'): flips which bound is set and clears the other.
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         ref_range="> 10")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.dp.ref_low, 10.0)
+        self.assertIsNone(self.dp.ref_high)
+        self.assertTrue(self.dp.is_abnormal)  # 5.2 < 10.0
+
+    def test_ref_range_edit_clears_range_with_empty_cell(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         ref_range="")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertIsNone(self.dp.ref_low)
+        self.assertIsNone(self.dp.ref_high)
+
+    def test_unparseable_ref_range_rejected(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         ref_range="unsicher")
+        self.assertEqual(out["status"], "skipped")
+        self.session.expire_all()
+        self.assertEqual(self.dp.ref_high, 5.0)
+
+    # ── scoping, idempotence, findings ──────────────────────────────────
+
+    def test_foreign_patient_row_rejected(self):
+        out = database.update_data_point(self.session, self.foreign_dp.id,
+                                         self.pid, value="1.0")
+        self.assertEqual(out["status"], "skipped")
+        self.session.expire_all()
+        self.assertEqual(self.foreign_dp.value, 1.0)
+
+    def test_unknown_id_not_found(self):
+        out = database.update_data_point(self.session, 999999, self.pid,
+                                         value="1.0")
+        self.assertEqual(out["status"], "not_found")
+
+    def test_unchanged_edit_is_noop(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="5.2")
+        self.assertEqual(out["status"], "unchanged")
+        self.session.expire_all()
+        self.assertFalse(bool(self.dp.is_corrected))
+
+    def test_no_kwargs_unchanged(self):
+        out = database.update_data_point(self.session, self.dp.id, self.pid)
+        self.assertEqual(out["status"], "unchanged")
+
+    def test_pending_finding_on_edited_row_dismissed(self):
+        fid = self._pending_finding()
+        out = database.update_data_point(self.session, self.dp.id, self.pid,
+                                         value="3.1")
+        self.assertEqual(out["status"], "applied")
+        self.session.expire_all()
+        self.assertEqual(self.session.get(database.DataQualityFinding, fid).status,
+                         "dismissed")
+
+    def test_corrected_flag_survives_across_edits(self):
+        database.update_data_point(self.session, self.dp.id, self.pid,
+                                   value="3.1")
+        database.update_data_point(self.session, self.dp.id, self.pid,
+                                   ref_range="0 - 10")
+        self.session.expire_all()
+        self.assertTrue(self.dp.is_corrected)
+        self.assertEqual(self.dp.value, 3.1)
+        self.assertEqual(self.dp.ref_high, 10.0)
+
+
 def tearDownModule():
     """Clean up test artifacts (temp directory and files)."""
     if TEST_DIR.exists():
@@ -8254,6 +8525,9 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestRenderScale))
     suite.addTests(loader.loadTestsFromTestCase(TestUiBehaviourAppTest))
     suite.addTests(loader.loadTestsFromTestCase(TestPatientIsolation))
+    # Manual-edit feature: the update_data_point write primitive behind the
+    # Mapping tab data editor (the reprocess side is covered in TestReprocessPdfs).
+    suite.addTests(loader.loadTestsFromTestCase(TestUpdateDataPoint))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

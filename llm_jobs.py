@@ -475,7 +475,7 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
                 {"original_name": dp.original_name, "canonical_name": dp.canonical_name,
                  "value": dp.value, "unit": dp.unit, "ref_low": dp.ref_low,
                  "ref_high": dp.ref_high, "is_abnormal": dp.is_abnormal,
-                 "is_disabled": dp.is_disabled,
+                 "is_disabled": dp.is_disabled, "is_corrected": dp.is_corrected,
                  "result_date": dp.result_date, "column_label": dp.column_label}
                 for dp in dps
             ],
@@ -524,7 +524,29 @@ def _snapshot_reprocess(session, patient_id: int | None) -> dict:
         (filename, art.category or "", art.text or ""): True
         for art, filename in aq.all()
     }
-    return {"reports": reports, "disabled": disabled, "disabled_artifacts": disabled_artifacts}
+    # Hand-corrected measurements, keyed by the identity a re-extraction
+    # reproduces: (filename, original_name, result_date, column_label).
+    # Deliberately NOT keyed on unit or canonical_name — those are exactly the
+    # fields the user may have corrected, so including them would break the
+    # lookup the moment the correction is saved (the trap _restore_disabled's
+    # unit key falls into). original_name is the verbatim PDF spelling the
+    # extractor re-reads unchanged, and the editor refuses to touch it.
+    cq = session.query(DataPoint, Report.filename).join(
+        Report, DataPoint.report_id == Report.id,
+    ).filter(DataPoint.is_corrected == True)  # noqa: E712
+    if patient_id is not None:
+        cq = cq.filter(Report.patient_id == patient_id)
+    corrected = {
+        (filename, dp.original_name or "",
+         dp.result_date.isoformat() if dp.result_date else None,
+         dp.column_label or ""): {
+            "value": dp.value, "unit": dp.unit,
+            "ref_low": dp.ref_low, "ref_high": dp.ref_high,
+        }
+        for dp, filename in cq.all()
+    }
+    return {"reports": reports, "disabled": disabled,
+            "disabled_artifacts": disabled_artifacts, "corrected": corrected}
 
 
 def _restore_reports(session, before: dict, filenames: list[str]) -> int:
@@ -560,6 +582,7 @@ def _restore_reports(session, before: dict, filenames: list[str]) -> int:
                 original_name=dp["original_name"], value=dp["value"],
                 unit=dp["unit"], ref_low=dp["ref_low"], ref_high=dp["ref_high"],
                 is_abnormal=dp["is_abnormal"], is_disabled=dp["is_disabled"],
+                is_corrected=dp.get("is_corrected", False),
                 result_date=dp.get("result_date"), column_label=dp.get("column_label"),
             )
             session.add(new_dp)
@@ -595,6 +618,14 @@ def _diff_reprocess(before: dict, session, filenames: list[str]) -> dict:
     Data points are matched by (original_name, unit) — the LLM's raw output is
     stable across runs even when canonicalization changes; canonical name and
     reference ranges are what we want to see move.
+
+    Hand-corrected rows need no special handling here: ``_reapply_corrections``
+    runs BEFORE this diff, so the "after" side already holds the user's values
+    and a corrected row diffs clean against itself — the honest result, since
+    the stored number is still the one the user typed. A correction that could
+    NOT be re-applied shows up as a value/ref change, and the caller's
+    ``corrections_lost`` warning names it explicitly so it is never mistaken for
+    an improvement.
     """
     after = {}
     for fn in filenames:
@@ -673,6 +704,67 @@ def _restore_disabled(session, disabled: dict) -> int:
                 restored += 1
     session.commit()
     return restored
+
+
+def _reapply_corrections(session, corrected: dict) -> tuple[int, int]:
+    """Re-apply the user's hand corrections after a re-extraction.
+
+    Reprocess deletes the old rows before extracting (the ``file_hash`` unique
+    constraint leaves no other order), so a fresh LLM reading overwrites every
+    value the user corrected by hand. This puts them back.
+
+    Matches (filename, original_name, result_date, column_label) — the identity
+    the extractor reproduces, and the one field set the user is NOT allowed to
+    edit. Keying on unit or canonical_name (the trick ``_restore_disabled``
+    uses) would fail precisely for a corrected unit, which is the common case.
+
+    Returns (reapplied, unmatched). ``unmatched`` counts corrections whose row
+    the new extraction did NOT reproduce — the LLM read the name differently, or
+    dropped the marker entirely. Those corrections are LOST, and the caller must
+    say so: silently reverting a user's medical-data correction is the exact
+    failure this whole path exists to prevent.
+
+    Abnormality is recomputed from the restored bounds, matching what
+    ``database.update_data_point`` does on the original edit.
+    """
+    if not corrected:
+        return 0, 0
+    reapplied = unmatched = 0
+    for (filename, original_name, rdate_iso, clabel), fix in corrected.items():
+        r = session.query(Report).filter(Report.filename == filename).first()
+        if r is None:
+            unmatched += 1
+            continue
+        rdate = datetime.fromisoformat(rdate_iso) if rdate_iso else None
+        dps = (
+            session.query(DataPoint)
+            .filter(
+                DataPoint.report_id == r.id,
+                DataPoint.original_name == original_name,
+                DataPoint.result_date == rdate,
+                DataPoint.column_label == (clabel or None),
+            )
+            .all()
+        )
+        if not dps:
+            unmatched += 1
+            continue
+        for dp in dps:
+            dp.value = fix["value"]
+            dp.unit = fix["unit"]
+            dp.ref_low = fix["ref_low"]
+            dp.ref_high = fix["ref_high"]
+            dp.is_corrected = True
+            if dp.value is not None and (dp.ref_low is not None or dp.ref_high is not None):
+                dp.is_abnormal = (
+                    (dp.ref_low is not None and dp.value < dp.ref_low)
+                    or (dp.ref_high is not None and dp.value > dp.ref_high)
+                )
+            else:
+                dp.is_abnormal = False
+            reapplied += 1
+    session.commit()
+    return reapplied, unmatched
 
 
 def _restore_disabled_artifacts(session, disabled: dict) -> int:
@@ -838,6 +930,12 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
     # Restore the user's manual disabling (matched by filename+name+unit).
     disabled_restored = _restore_disabled(session, before["disabled"])
     artifact_restored = _restore_disabled_artifacts(session, before.get("disabled_artifacts", {}))
+    # Re-apply hand corrections AFTER the new extraction and BEFORE the risk
+    # refresh, so the rebuilt risk cards judge the corrected numbers rather than
+    # the raw re-read. Runs on the abort path too — rows that were re-extracted
+    # before the abort exist now and must not sit there un-corrected.
+    corrections_reapplied, corrections_lost = _reapply_corrections(
+        session, before.get("corrected", {}))
 
     if is_job_aborted():
         # Partial results are kept; the reports we had deleted but not yet
@@ -845,6 +943,10 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         note = t("job_aborted_note", lang=lang)
         if restored_reports:
             note += f"\n{t('reprocess_restored', lang=lang, n=restored_reports)}"
+        if corrections_reapplied:
+            note += f"\n{t('reprocess_corrections_reapplied', lang=lang, n=corrections_reapplied)}"
+        if corrections_lost:
+            note += f"\n⚠️ {t('reprocess_corrections_lost', lang=lang, n=corrections_lost)}"
         return "info", note
 
     n_risks = 0
@@ -893,6 +995,12 @@ def _job_reprocess_pdfs(session, cfg, lang, params):
         parts.append(t("reprocess_disabled_restored", lang=lang, n=disabled_restored))
     if artifact_restored:
         parts.append(t("reprocess_artifacts_restored", lang=lang, n=artifact_restored))
+    if corrections_reapplied:
+        parts.append(t("reprocess_corrections_reapplied", lang=lang, n=corrections_reapplied))
+    if corrections_lost:
+        # Loud, not a footnote: these are hand-entered medical values that the
+        # new extraction could not be matched to, so they are gone.
+        parts.append(f"⚠️ {t('reprocess_corrections_lost', lang=lang, n=corrections_lost)}")
     if diff["patient_moves"]:
         parts.append(t("reprocess_patient_pinned", lang=lang, n=diff["patient_moves"]))
     for fn in missing_files[:5]:
@@ -1639,6 +1747,11 @@ def _job_verify_extraction(session, cfg, lang, params):
                 skip_dp_ids.update(json.loads(f.data_point_ids) if f.data_point_ids else [])
             except (json.JSONDecodeError, TypeError):
                 pass
+        # Rows the user hand-corrected: the auditor must not propose overwriting
+        # a value the user deliberately typed in. The audit still runs (the
+        # corrected row is sent with the page), only its disagreements are
+        # dropped — same skip channel as the extraction findings above.
+        skip_dp_ids.update(dp.id for dp in all_dps if dp.is_corrected)
 
         try:
             b64_pages = pdf_to_base64_jpeg(pdf_dir / r.filename, dpi=dpi)

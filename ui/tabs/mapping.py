@@ -11,12 +11,14 @@ import json
 import pandas as pd
 import streamlit as st
 
+from analyzer import refresh_patient_risk_flags
 from config import resolve_canonical
 from database import (
     get_registry, get_registry_names, get_custom_biomarkers, _canonical_base,
     rename_canonical_name, add_custom_biomarker, update_biomarker_registry,
     get_data_quality_findings, apply_data_quality_finding,
     dismiss_data_quality_finding, clear_resolved_data_quality_findings,
+    update_data_point,
 )
 from translations import t
 from ui import queries
@@ -178,23 +180,143 @@ def render_mapping_tab(session, patient, patient_reports):
         c_original, c_canonical = t("col_original"), t("col_canonical")
         c_value, c_unit, c_reference = t("col_value"), t("col_unit"), t("col_reference")
         c_registered = t("col_registered")
+        c_corrected = t("col_corrected")
         badge_unregistered = t("badge_unregistered")
+        badge_corrected = t("badge_corrected")
         unregistered_lower = {n.lower() for n in unregistered}
+
+        def _ref_text(dp) -> str:
+            if dp.ref_low is None and dp.ref_high is None:
+                return ""
+            if dp.ref_low is not None and dp.ref_high is not None:
+                return f"{_fmt_num(dp.ref_low)}–{_fmt_num(dp.ref_high)}"
+            if dp.ref_high is not None:
+                return f"< {_fmt_num(dp.ref_high)}"
+            return f"> {_fmt_num(dp.ref_low)}"
+
         mapping_rows = []
         for dp in dp_results:
-            ref_str = f"{dp.ref_low}–{dp.ref_high}" if dp.ref_low is not None and dp.ref_high is not None else "—"
             mapping_rows.append({
-                c_date: dp.report_date.strftime("%d.%m.%Y") if dp.report_date else "?",
+                c_date: (dp.report_date.strftime("%d.%m.%Y")
+                         if dp.report_date else "?"),
                 c_report: dp.filename,
                 c_original: dp.original_name or "—",
                 c_canonical: dp.canonical_name,
-                c_value: f"{dp.value} {dp.unit or ''}" if dp.value is not None else "—",
-                c_unit: dp.unit or "—",
-                c_reference: ref_str,
+                # Editable cells stay plain strings: the user may type a German
+                # decimal ('13,18') and a float column would silently drop it.
+                c_value: "" if dp.value is None else _fmt_num(dp.value),
+                c_unit: dp.unit or "",
+                c_reference: _ref_text(dp),
                 c_registered: badge_unregistered if dp.canonical_name.lower() in unregistered_lower else "",
+                c_corrected: badge_corrected if dp.is_corrected else "",
             })
         df_mapping = pd.DataFrame(mapping_rows)
-        st.dataframe(df_mapping, width='stretch', hide_index=True)
+
+        # Editable measurement table. This is the manual counterpart to the
+        # findings below: the deterministic guards and the LLM auditor can only
+        # propose a fix they recognised, and a misread they missed (or got
+        # wrong) had no recovery path at all — the page image showed the user
+        # the evidence with nowhere to act on it.
+        #
+        # What is deliberately NOT editable:
+        #  * original_name — the verbatim PDF spelling, and the key
+        #    llm_jobs._reapply_corrections uses to find this row again after a
+        #    reprocess deletes it. Editing it would silently orphan the
+        #    correction.
+        #  * canonical_name — a name change belongs to the rename section below,
+        #    which records the old name as a registry ALIAS so the next
+        #    extraction resolves to the corrected name on its own. A per-row
+        #    rename has no such anchor and the next reprocess would undo it.
+        # The editor and its snapshot are keyed on the cache token, so a
+        # committed edit changes the key and the widget is rebuilt from the
+        # freshly-queried df_mapping (DB truth: normalized unit spelling, the
+        # '✏️' badge, recomputed range). Without this, the widget would keep its
+        # own copy of the user's raw input and diff against a stale snapshot
+        # forever — re-applying the same edit each rerun, and for a REJECTED
+        # edit (bad unit, range typed into the value cell) re-rejecting it on
+        # every rerun in an endless warning loop. Keying on the token makes the
+        # rejected input disappear and the reason show once.
+        token = queries.cache_token()
+        editor_key = f"mapping_editor_{patient.id}_{selected_report_id}_{token}"
+        snap_key = f"mapping_snapshot_{patient.id}_{selected_report_id}_{token}"
+        _show_flash("mapping_edit")
+        st.caption(t("caption_edit_values"))
+
+        edited_df = st.data_editor(
+            df_mapping,
+            key=editor_key,
+            hide_index=True,
+            num_rows="fixed",
+            width="stretch",
+            column_config={
+                c_date: st.column_config.TextColumn(disabled=True),
+                c_report: st.column_config.TextColumn(disabled=True),
+                c_original: st.column_config.TextColumn(disabled=True),
+                c_canonical: st.column_config.TextColumn(disabled=True),
+                c_value: st.column_config.TextColumn(
+                    c_value, help=t("help_edit_value")),
+                c_unit: st.column_config.TextColumn(
+                    c_unit, help=t("help_edit_unit")),
+                c_reference: st.column_config.TextColumn(
+                    c_reference, help=t("help_edit_reference")),
+                c_registered: st.column_config.TextColumn(disabled=True),
+                c_corrected: st.column_config.TextColumn(disabled=True),
+            },
+        )
+
+        # Snapshot of the stored cell text, keyed by position. The editor keeps
+        # row order (num_rows="fixed", and mapping_rows orders by
+        # canonical_name, report_date, id), so row i is dp_results[i]; diffing
+        # the editor output against this snapshot yields exactly the cells the
+        # user changed. Same pattern as the Detail tab's enable/disable column.
+        prev = st.session_state.get(snap_key)
+        if prev is None or len(prev) != len(dp_results) or any(
+            p[0] != dp.id for p, dp in zip(prev, dp_results)
+        ):
+            st.session_state[snap_key] = [
+                (dp.id, "" if dp.value is None else _fmt_num(dp.value),
+                 dp.unit or "", _ref_text(dp))
+                for dp in dp_results
+            ]
+        else:
+            applied = rejected = 0
+            for idx, dp in enumerate(dp_results):
+                row = edited_df.iloc[idx]
+                _old_id, old_val, old_unit, old_ref = prev[idx]
+                new_val = str(row[c_value] or "").strip()
+                new_unit = str(row[c_unit] or "").strip()
+                new_ref = str(row[c_reference] or "").strip()
+                if new_val == old_val and new_unit == old_unit and new_ref == old_ref:
+                    continue
+                kwargs = {}
+                if new_val != old_val:
+                    kwargs["value"] = new_val
+                if new_unit != old_unit:
+                    kwargs["unit"] = new_unit
+                if new_ref != old_ref:
+                    kwargs["ref_range"] = new_ref
+                outcome = update_data_point(session, dp.id, patient.id, **kwargs)
+                if outcome["status"] == "applied":
+                    applied += 1
+                elif outcome["status"] == "skipped":
+                    rejected += 1
+                    # Rendered directly, not queued: when nothing at all was
+                    # applied we do NOT rerun, so a queued message would sit
+                    # until some unrelated interaction.
+                    st.warning(t("msg_edit_rejected", name=dp.canonical_name,
+                                 detail=outcome["detail"]))
+            if applied:
+                # One rebuild for the whole batch: refreshing per row would
+                # re-run detection N times, and the flags are derived data
+                # anyway.
+                refresh_patient_risk_flags(session, patient.id)
+                plural = "e" if applied > 1 else ""
+                _flash("mapping_edit", "success",
+                       t("msg_edits_applied", count=applied, plural=plural))
+                # The commit bumped the cache token, so the rerun rebuilds the
+                # editor from DB truth and the user's raw input is replaced by
+                # the stored (normalized) form.
+                st.session_state._rerun_requested = True
 
         # --- Rename section ---
         st.divider()
