@@ -1,9 +1,11 @@
 """Reports management tab.
 
-Renders the Reports tab: PDF upload + processing, risk-flag refresh, summary
-regeneration, bulk description/interpretation generation, and the report list
-with delete. (Reference-range backfill lives in the Biomarker-Einstellungen
-tab.)
+Renders the Reports tab: PDF upload + processing, re-extraction, and the
+report list with delete — pure document management since the UX rework moved
+the other long-running operations to the tabs that show their results (risk
+refresh → Risiken, summary regeneration → Übersicht, bulk description/
+interpretation generation → Trends). Reference-range backfill lives in the
+Datenqualität tab.
 
 Since WP6 all long-running operations are submitted as background jobs
 (llm_jobs.submit_job) — the buttons no longer block the UI, and progress is
@@ -154,66 +156,23 @@ def render_reports_tab(session, patients, patient, gen_summary):
 
             _confirm_reprocess()
 
-    # Button layout: 3-across row, 2-across bulk row.
-    # Every button carries params={"patient_id": patient.id} — that is what
-    # scopes the job's work AND its slot in the (kind, patient) kind lock, so a
-    # job started for another patient can never disable one of these buttons.
-    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
-    with col_btn1:
-        _show_flash("process_pdfs")
-        _job_button(
-            session,
-            label_key="btn_process_all", kind="process_pdfs",
-            job_label_key="job_kind_process_pdfs", key="btn_process_all",
-            params={"patient_id": patient.id},
-            flash_key="process_pdfs",
-            # Files are being processed — clear the pending-upload hint. Must be
-            # a callback: the helper's st.rerun() aborts this run, so code after
-            # the call never executes.
-            on_submit=lambda: st.session_state.__setitem__("_files_uploaded", False),
-        )
-    with col_btn2:
-        _show_flash("refresh_risks")
-        _job_button(
-            session,
-            label_key="btn_refresh_risks", kind="refresh_risks",
-            job_label_key="job_kind_refresh_risks", key="btn_refresh_risks",
-            params={"patient_id": patient.id},
-            flash_key="refresh_risks",
-        )
-    with col_btn3:
-        _show_flash("regen_summary")
-        _job_button(
-            session,
-            label_key="btn_regenerate_summary", kind="regen_summary",
-            job_label_key="job_kind_regen_summary", key="reports_regenerate_summary",
-            params={"patient_id": patient.id},
-            flash_key="regen_summary",
-            button_type="secondary",
-        )
-
-    # Biomarker Info bulk buttons row
-    col_bulk1, col_bulk2 = st.columns(2)
-    with col_bulk1:
-        _show_flash("bulk_desc")
-        _job_button(
-            session,
-            label_key="btn_generate_all_descriptions", kind="bulk_descriptions",
-            job_label_key="job_kind_bulk_descriptions", key="btn_bulk_gen_desc",
-            params={"patient_id": patient.id},
-            flash_key="bulk_desc",
-            button_type="secondary",
-        )
-    with col_bulk2:
-        _show_flash("bulk_interp")
-        _job_button(
-            session,
-            label_key="btn_generate_all_interpretations", kind="bulk_interpretations",
-            job_label_key="job_kind_bulk_interpretations", key="btn_bulk_gen_interp",
-            params={"patient_id": patient.id},
-            flash_key="bulk_interp",
-            button_type="secondary",
-        )
+    # Process uploads. The other long-running operations moved to the tabs that
+    # show their results in the UX rework — risk refresh lives with the flags
+    # (Risiken), summary regeneration with the summary (Übersicht), bulk
+    # description/interpretation generation with the biomarker detail (Trends) —
+    # so this tab is pure document management: upload, process, re-extract, delete.
+    _show_flash("process_pdfs")
+    _job_button(
+        session,
+        label_key="btn_process_all", kind="process_pdfs",
+        job_label_key="job_kind_process_pdfs", key="btn_process_all",
+        params={"patient_id": patient.id},
+        flash_key="process_pdfs",
+        # Files are being processed — clear the pending-upload hint. Must be
+        # a callback: the helper's st.rerun() aborts this run, so code after
+        # the call never executes.
+        on_submit=lambda: st.session_state.__setitem__("_files_uploaded", False),
+    )
 
     # Re-extract existing reports (destructive → confirmation dialog)
     _op_reprocess_pdfs()

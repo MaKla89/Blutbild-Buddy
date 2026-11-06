@@ -15,9 +15,30 @@ import streamlit as st
 
 from translations import t, translate_description, category_label, category_label_plain
 from ui import queries
+from ui.helpers import _job_button, _show_flash
 
 
 def render_risks_tab(session, patient, patient_reports, lang):
+    # --- Risk-flag refresh (moved here from the Berichte tab in the UX rework) ---
+    # The flags below are this tab's result, so the action that recomputes them
+    # lives with them. The caption shows when they were last (re)computed:
+    # extraction jobs refresh the flags automatically after processing, so a
+    # finished process_pdfs/reprocess_pdfs job is as truthful a timestamp as an
+    # explicit refresh (see queries.risk_flags_updated_at).
+    _show_flash("refresh_risks")
+    col_refresh, _ = st.columns([1, 3])
+    with col_refresh:
+        _job_button(
+            session,
+            label_key="btn_refresh_risks", kind="refresh_risks",
+            job_label_key="job_kind_refresh_risks", key="btn_refresh_risks",
+            params={"patient_id": patient.id},
+            flash_key="refresh_risks",
+        )
+    updated_at = queries.risk_flags_updated_at(patient.id)
+    if updated_at is not None:
+        st.caption(f"{t('last_updated')}: {updated_at.strftime('%d.%m.%Y %H:%M')}")
+
     patient_flags = queries.risk_flags(patient.id)
 
     if patient_flags:

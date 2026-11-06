@@ -1,10 +1,14 @@
-"""Biomarker Mapping tab (moved verbatim from app.py main(), WP3f).
+"""Data Quality tab (moved verbatim from app.py main(), WP3f).
 
-Renders the Biomarker Mapping tab: mapping table, rename section, manual
-registry edit, reference-range backfill, and the per-patient data-quality
-check. Since WP6 the long-running operations (backfill, data-quality check)
-are submitted as background jobs (llm_jobs.submit_job) — the buttons no
-longer block the UI; progress is tracked in the "LLM-Jobs" tab."""
+Renders the per-patient data review tab ("🩺 Datenqualität"): editable
+measurement table, rename section, reference-range backfill, and the
+data-quality check + second-pass column audit. The manual registry edit lived
+here until the UX rework — reference-data maintenance moved to the Settings
+tab (ui/tabs/llm_settings.py), which is where new names/units/ranges belong.
+
+Since WP6 the long-running operations (backfill, data-quality check) are
+submitted as background jobs (llm_jobs.submit_job) — the buttons no longer
+block the UI; progress is tracked in the "LLM-Jobs" tab."""
 
 import json
 
@@ -164,14 +168,18 @@ def render_mapping_tab(session, patient, patient_reports):
         custom_names = get_custom_biomarkers(session)
         unregistered = _unregistered_markers(unique_canonicals, registry)
         # Names the user added deliberately as custom biomarkers are not
-        # pipeline misses — the rename/edit sections below already cover them,
-        # so listing them here would be permanent noise.
+        # pipeline misses — the rename section below (and the registry editor
+        # in the Settings tab) already cover them, so listing them here would
+        # be permanent noise.
         unregistered = [n for n in unregistered if n.lower() not in {c.lower() for c in custom_names}]
         if unregistered:
             st.warning(
                 t("warning_unregistered_markers", names=", ".join(unregistered))
                 + "\n\n" + t("warning_unregistered_markers_hint")
             )
+            # The registry editor moved to the Settings tab in the UX rework —
+            # point there instead of leaving the user guessing where it went.
+            st.caption(t("warning_unregistered_registry_crossref"))
 
         # Column labels are resolved once, not per row: a mapping table can run
         # into the thousands of rows and each t() hits session state for the
@@ -391,67 +399,11 @@ def render_mapping_tab(session, patient, patient_reports):
             if data_changed:
                 st.session_state._rerun_requested = True
 
-        # --- Manual registry edit section ---
-        st.divider()
-        st.subheader(t("subheader_registry_edit"))
-        st.caption(t("caption_registry_edit"))
-        _show_flash("registry_edit")
-
-        col_e1, col_e2, col_e3, col_e4 = st.columns([2, 1, 2, 1])
-        with col_e1:
-            # All known canonical names (registry + custom): editing a custom
-            # name promotes it to a full registry row.
-            edit_name = st.selectbox(t("select_registry_biomarker"), all_canonical_options, key="registry_edit_name")
-        with col_e2:
-            edit_field_label = st.selectbox(
-                t("select_registry_field"),
-                [t("field_name"), t("field_unit"), t("field_ref_range")],
-                key="registry_edit_field",
-            )
-        field_key = {
-            t("field_name"): "name",
-            t("field_unit"): "unit",
-            t("field_ref_range"): "ref_range",
-        }[edit_field_label]
-        with col_e3:
-            edit_value = st.text_input(
-                t("input_registry_value"), key="registry_edit_value",
-                placeholder={
-                    "name": t("placeholder_registry_name"),
-                    "unit": t("placeholder_registry_unit"),
-                    "ref_range": t("placeholder_registry_ref_range"),
-                }[field_key],
-            )
-        with col_e4:
-            apply_edit = st.button(t("btn_apply_registry_edit"), type="secondary",
-                                   width='stretch', key="btn_apply_registry_edit")
-
-        if apply_edit:
-            if not edit_value.strip():
-                st.error(t("error_empty_value"))
-            else:
-                # patient_id scopes the DATA migration of a 'name' edit to this
-                # patient (the registry row itself stays global — see
-                # update_biomarker_registry). unit/ref_range edits touch only
-                # the shared reference row and never migrate measurements.
-                outcome = update_biomarker_registry(session, edit_name, field_key,
-                                                    edit_value, patient_id=patient.id)
-                # Queued via _flash: the _rerun_requested below discards this run.
-                if outcome["status"] == "applied":
-                    _flash("registry_edit", "success",
-                           t("msg_registry_edit_applied", field=field_key, proposed=outcome["detail"]))
-                else:
-                    _flash("registry_edit", "warning",
-                           t("msg_suggestion_skipped", detail=outcome.get("detail", "")))
-                st.session_state._rerun_requested = True
-
         # --- Backfill registry defaults onto missing data points -----------
         # Applies the registry default ranges to THIS patient's historical
         # DataPoints that are still missing them. The registry read stays global
         # (reference data), the writes are scoped — writing ranges into another
-        # patient's measurements would be editing their data. Same operation as
-        # the Berichte-tab button; the (kind, patient) lock in llm_jobs keeps
-        # either tab from double-running it for the same patient.
+        # patient's measurements would be editing their data.
 
         # Contextual backfill: applies registry defaults to missing data points
         # of the selected patient.

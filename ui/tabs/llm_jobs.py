@@ -40,9 +40,11 @@ _EXTRA_FLASH_KINDS = {"test_connection"}
 # Which _flash() keys receive the result message when a job kind finishes.
 # A kind can be started from several tabs, and every tab renders on every
 # rerun, so each entry gets the message. Keys match the flash_key each tab
-# passes to ui.helpers._job_button().
+# passes to ui.helpers._job_button(). regen_summary is only ever started from
+# the Overview tab since the UX rework removed the duplicate button from the
+# Berichte tab — one entry, no cross-tab fan-out.
 _FINISH_FLASH_KEYS = {
-    "regen_summary": ("overview_regenerate_summary", "regen_summary"),
+    "regen_summary": ("overview_regenerate_summary",),
     "gen_description": ("gen_desc",),
     "gen_interpretation": ("gen_interp",),
     "process_pdfs": ("process_pdfs",),

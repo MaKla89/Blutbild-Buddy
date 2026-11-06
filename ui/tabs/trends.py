@@ -17,6 +17,34 @@ from ui.helpers import _job_button, _show_flash, _time_range_slider
 
 
 def render_trends_tab(session, patient, patient_reports, min_date, max_date, time_range_key, lang):
+    # --- Bulk generation for ALL markers (moved here from the Berichte tab in
+    # the UX rework) ---
+    # Descriptions and interpretations are per-marker content displayed on this
+    # tab, so generating them for every marker of the patient belongs with the
+    # results, not in document management. Same patient-scoped jobs as before —
+    # the (kind, patient) lock keeps a double-run out whichever tab started it.
+    col_bulk1, col_bulk2 = st.columns(2)
+    with col_bulk1:
+        _show_flash("bulk_desc")
+        _job_button(
+            session,
+            label_key="btn_generate_all_descriptions", kind="bulk_descriptions",
+            job_label_key="job_kind_bulk_descriptions", key="btn_bulk_gen_desc",
+            params={"patient_id": patient.id},
+            flash_key="bulk_desc",
+            button_type="secondary",
+        )
+    with col_bulk2:
+        _show_flash("bulk_interp")
+        _job_button(
+            session,
+            label_key="btn_generate_all_interpretations", kind="bulk_interpretations",
+            job_label_key="job_kind_bulk_interpretations", key="btn_bulk_gen_interp",
+            params={"patient_id": patient.id},
+            flash_key="bulk_interp",
+            button_type="secondary",
+        )
+
     if patient_reports:
         all_entries = queries.biomarkers(patient.id)
         # display label -> (canonical name, unit). Resolving the selection with a

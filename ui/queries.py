@@ -35,7 +35,7 @@ import streamlit as st
 from sqlalchemy import func, text
 
 import config
-from database import DataPoint, Report, RiskFlag, commit_version, get_session
+from database import DataPoint, LlmJob, Report, RiskFlag, commit_version, get_session
 
 # Lightweight, ORM-free stand-ins for the rows the tabs render.
 ReportRow = namedtuple("ReportRow", "id filename report_date panel_type")
@@ -409,3 +409,29 @@ def _risk_flags(token, patient_id: int):
 def risk_flags(patient_id: int) -> list:
     """All risk flags of a patient, ranked (Risks tab and Overview counters)."""
     return _risk_flags(cache_token(), patient_id)
+
+
+# ── LLM job timestamps ────────────────────────────────────────────────────────
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def _risk_flags_updated_at(token, patient_id: int):
+    with get_session() as s:
+        return (
+            s.query(func.max(LlmJob.finished_at))
+            .filter(
+                LlmJob.patient_id == patient_id,
+                LlmJob.kind.in_(["refresh_risks", "process_pdfs", "reprocess_pdfs"]),
+                LlmJob.status == "done",
+            )
+            .scalar()
+        )
+
+
+def risk_flags_updated_at(patient_id: int):
+    """Newest time this patient's risk flags were (re)computed, or None.
+
+    Extraction jobs refresh the flags automatically after processing, so a
+    finished process_pdfs/reprocess_pdfs job is as truthful a timestamp as an
+    explicit refresh — not only the refresh button counts.
+    """
+    return _risk_flags_updated_at(cache_token(), patient_id)

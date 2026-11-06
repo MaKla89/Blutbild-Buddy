@@ -7454,7 +7454,7 @@ class TestUiBehaviourAppTest(unittest.TestCase):
     def test_job_polling_only_runs_while_a_job_is_active(self):
         """An unconditional @st.fragment(run_every=2) re-executed every 2s forever
         and re-registered a new browser interval on every rerun, so an idle screen
-        got steadily busier. Both poll fragments must be registered ONLY while a
+        got steadily busier. Every poll fragment must be registered ONLY while a
         job is actually in flight (run_every is fixed at decoration time, so this
         requires the conditional definition asserted here)."""
         from pathlib import Path
@@ -7467,6 +7467,54 @@ class TestUiBehaviourAppTest(unittest.TestCase):
         self.assertIn("get_active_llm_jobs", Path("ui/tabs/llm_jobs.py").read_text(encoding="utf-8"))
         # The chat tab gates on its own in-flight answer.
         self.assertIn("if pending:", Path("ui/tabs/chat.py").read_text(encoding="utf-8"))
+        # The global running-jobs strip (app.py, UX rework) follows the same
+        # rule: its fragment is gated on get_active_llm_jobs, never defined
+        # unconditionally at module level.
+        app_src = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("@st.fragment(run_every=2)", app_src)
+        self.assertNotIn("@st.fragment(run_every=2)\ndef", app_src,
+                         "app.py: unconditional polling fragment")
+        self.assertIn("get_active_llm_jobs", app_src)
+
+    def test_running_jobs_strip_renders_only_while_a_job_is_active(self):
+        """The global running-jobs strip (below the patient picker, UX rework)
+        shows live progress + abort for every pending/running job without
+        navigating to LLM-Jobs. It must render ONLY while a job is in flight —
+        the behavioural half of test_job_polling_only_runs_while_a_job_is_active."""
+        from translations import t as _t
+        self._seed_patient()
+        at = self._run_app()
+        self._assert_clean(at)
+        markdowns = " || ".join(str(m.value) for m in at.markdown)
+        self.assertNotIn(_t("strip_running_jobs"), markdowns,
+                         "strip rendered although no job is active")
+
+        # A pending job for the selected patient → strip with its own abort key.
+        job = database.LlmJob(kind="process_pdfs", label="PDFs verarbeiten (Test)",
+                              status="pending", patient_id=1, params_json="{}")
+        self.session.add(job)
+        self.session.commit()
+        job_id = job.id
+
+        # app.py marks stale jobs interrupted on every run; with no live worker
+        # in this process the pending row would be claimed before the strip
+        # renders. Neutralise it for this one run (in production the exclude
+        # list of live-worker ids is what keeps running jobs alive).
+        orig_mark = database.mark_stale_llm_jobs_interrupted
+        database.mark_stale_llm_jobs_interrupted = lambda *a, **k: 0
+        try:
+            at.run()
+        finally:
+            database.mark_stale_llm_jobs_interrupted = orig_mark
+        self._assert_clean(at)
+        markdowns = " || ".join(str(m.value) for m in at.markdown)
+        self.assertIn(_t("strip_running_jobs"), markdowns,
+                      "active job not shown in the running-jobs strip")
+        # The abort buttons use their OWN key space: the jobs tab renders
+        # abort_job_{id} for the same job in the SAME rerun — a shared key would
+        # raise StreamlitDuplicateElementKey and _assert_clean would catch it.
+        self.assertTrue(any(b.key == f"strip_abort_job_{job_id}" for b in at.button),
+                        "strip abort button missing or not keyed strip_abort_job_*")
 
     def test_no_connection_test_button_blocks_the_render_path(self):
         """The LLM connection test must be a background job: an inline call froze

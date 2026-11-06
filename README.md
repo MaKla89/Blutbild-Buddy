@@ -20,7 +20,7 @@ The app is built around **German** lab reports: the biomarker registry, aliases,
 - **Chat with your data** — Ask free-form questions about your measurements; the assistant answers strictly from the selected time range's data (dates, units, reference ranges) plus the qualitative findings from that window. Conversations are saved in the database (multiple per patient, like mainstream chat UIs) and answers are generated as background jobs — switching tabs or refreshing the page (F5) never loses a question or an in-flight answer.
 - **Biomarker mapping & merging** — Rename canonical names, auto-detect variant groups (LLM-suggested), and merge them — or merge manually.
 - **Re-extract existing reports** — After improving the LLM endpoint or the biomarker registry, re-run extraction over already-processed reports. Your previous data is snapshotted first and stays intact if a re-extraction fails, so a failed run never costs you anything.
-- **Multi-language UI** — German and English, switchable in the sidebar.
+- **Multi-language UI** — German and English, switchable via the selector at the top of the app.
 - **Deduplication** — PDFs are skipped if their SHA-256 hash already exists in the database.
 
 ## Screenshots
@@ -49,7 +49,7 @@ Severity-ranked risk flags (out-of-range values, concerning trends, cross-biomar
 
 | File | Role |
 |------|------|
-| `app.py` | Streamlit UI — sidebar, data tabs (overview / detail / trends / risks / all values / chat) + management tabs (reports / patients / LLM settings / LLM jobs / biomarker mapping), session state management |
+| `app.py` | Streamlit UI — patient picker, global running-jobs strip, and one tab bar in both states: data tabs (overview / detail / trends / risks / all values / chat) + reports (document management) + nested Verwaltung (patients / settings / LLM jobs / data quality), session state management |
 | `llm_jobs.py` | Background LLM job queue: worker threads for long-running ops (including chat answers), kind locks, config snapshots, progress persistence |
 | `extractor.py` | PDF pipeline: hash check → image render → LLM extraction (one call per report) → deterministic + global name normalization → DB insert (data points **and qualitative artifacts**) |
 | `analyzer.py` | Risk flag engine: out-of-range, trending, volatility, missing markers, qualitative artifact flags |
@@ -95,10 +95,10 @@ All data (database + uploaded PDFs) persists in Docker named volumes (`blutbild-
 # 1. Set up a virtual environment
 python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
-# 2. Configure your LLM endpoint via environment variables or the app's ⚙️ Settings dialog
+# 2. Configure your LLM endpoint via environment variables or the app's ⚙️ Settings tab
 #    Default: http://localhost:8888/v1 (Unsloth / vLLM / any OpenAI-compatible server)
 
-# 3. Upload German lab report PDFs using the file uploader in the app sidebar
+# 3. Upload German lab report PDFs using the file uploader in the Berichte (Reports) tab
 
 # 4. Launch the app
 streamlit run app.py
@@ -126,7 +126,7 @@ streamlit run app.py
 
 ## LLM Configuration
 
-The app requires an OpenAI-compatible LLM endpoint. Configure it via environment variables (Docker) or via the ⚙️ Settings dialog in the sidebar:
+The app requires an OpenAI-compatible LLM endpoint. Configure it via environment variables (Docker) or via the ⚙️ Settings tab:
 
 | Env Var | Default | Description |
 |---------|---------|-------------|
@@ -143,7 +143,7 @@ For LAN deployment, set the env vars in your `.env` file or inline:
 LLM_BASE_URL=http://192.168.1.100:8888/v1 LLM_API_KEY=your-key docker compose up -d
 ```
 
-The in-app Settings dialog (⚙️) lets you change these at runtime — changes persist until the container restarts.
+The in-app Settings tab (⚙️) lets you change these at runtime — changes persist until the app restarts (settings live in session state and are re-seeded from the environment on startup).
 
 ## Database
 

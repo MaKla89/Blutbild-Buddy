@@ -8,10 +8,10 @@ import config
 from database import (
     init_db, get_session, Patient, Report, DataPoint, RiskFlag,
     get_latest_patient_summary, patient_age_years, collect_report_artifacts,
-    mark_stale_llm_jobs_interrupted,
+    mark_stale_llm_jobs_interrupted, get_active_llm_jobs,
 )
 from llm_client import generate_patient_summary
-from llm_jobs import active_job_ids
+from llm_jobs import active_job_ids, abort_job
 from translations import t, set_lang, _get_lang
 
 # Shared helpers moved to ui/helpers.py (WP1). Re-exported here so existing
@@ -203,6 +203,33 @@ def _patient_label(stats, patient):
     return patient.name
 
 
+def _render_job_strip(patient_id):
+    """One compact row per active job: label, live progress, abort button.
+
+    Called from the global running-jobs strip (see main()). It re-queries the
+    DB on every 2 s fragment tick — by then main's session is closed — so it
+    opens its own session. The abort buttons use their OWN keys
+    (strip_abort_job_*): the LLM-Jobs tab renders an abort button for the same
+    job in the SAME rerun with key abort_job_{id}, and a duplicate element key
+    would raise StreamlitDuplicateElementKey.
+    """
+    with get_session() as s:
+        jobs = get_active_llm_jobs(s, patient_id=patient_id)
+    if not jobs:
+        return
+    st.markdown(f"**{t('strip_running_jobs')}**")
+    for job in jobs:
+        c_label, c_abort = st.columns([3, 1])
+        with c_label:
+            icon = "⏳" if job.status == "pending" else "🔄"
+            st.markdown(f"{icon} **{job.label}**")
+            pct = (job.progress_current or 0) / 100.0
+            st.progress(pct, text=job.progress_message or "")
+        with c_abort:
+            if st.button(t("btn_abort_job"), key=f"strip_abort_job_{job.id}"):
+                abort_job(job.id)
+
+
 def main():
     lang = _get_lang()
 
@@ -210,16 +237,17 @@ def main():
     # run before any tab renders; re-injection on rerun is harmless.
     inject_card_css()
 
-    # Language selector at top
+    # Language selector at top — visible label (the collapsed label made the
+    # widget look like a decorative dropdown, and "Language" was hardcoded while
+    # everything else around it was translated).
     col_title, col_lang = st.columns([3, 1])
     with col_title:
         st.title(t("app_title"))
     with col_lang:
         st.selectbox(
-            "Language",
+            t("label_language"),
             options=["de", "en"],
             index=0 if lang == "de" else 1,
-            label_visibility="collapsed",
             key="_lang_selector",
             format_func=lambda x: f"🌐 {x.upper()}",
             on_change=lambda: set_lang(st.session_state._lang_selector),
@@ -247,10 +275,40 @@ def main():
         disabled=not patients,
     )
 
+    # --- Running-jobs strip (global, below the patient picker) ---------------
+    # A compact live view of every pending/running job for this scope — progress
+    # without having to navigate to LLM-Jobs. Informational + abort only: the
+    # transition detection that flashes results and triggers the full app rerun
+    # stays exclusively in the jobs-tab poll (two fragments racing st.rerun() on
+    # the same transition would double-fire). Defined with run_every=2 ONLY
+    # while a job is actually pending/running — an unconditional fragment would
+    # re-execute every 2 s forever, and every full rerun would register another
+    # browser interval (same rule as the jobs-tab poll, ui/tabs/llm_jobs.py).
+    strip_patient_id = selected_patient.id if selected_patient is not None else None
+    with get_session() as s:
+        _strip_job_active = bool(get_active_llm_jobs(s, patient_id=strip_patient_id))
+
+    if _strip_job_active:
+        @st.fragment(run_every=2)
+        def _job_strip_poll():
+            _render_job_strip(strip_patient_id)
+
+        _job_strip_poll()
+
     # Determine which tabs to show
     has_patient = bool(patients) and selected_patient is not None
-    
-    # Build tab labels — result-based tabs first (left), settings-related tabs second (right)
+
+    # ONE tab bar in both states — with AND without a patient. The old two-state
+    # layout (data tabs only when a patient existed, management tabs only when
+    # not) hid the workflow entry points: "Berichte" sat two levels deep, and
+    # the no-patient state ended on a dead empty tab that was created but never
+    # rendered into. Now the top row is always data tabs + Berichte +
+    # Verwaltung{Patienten, Einstellungen, LLM-Jobs, Datenqualität}; without a
+    # patient the data tabs (and the per-patient Datenqualität sub-tab) render
+    # a one-line placeholder instead of vanishing, so the layout never changes
+    # shape when the first patient is created. The inner st.tabs() call must
+    # happen INSIDE the parent tab's context so Streamlit renders the sub-tab
+    # bar within it, not as a second top-level row.
     data_tabs = [
         t("tab_overview"),
         t("tab_detail"),
@@ -259,60 +317,59 @@ def main():
         t("tab_all_values"),
         t("tab_chat"),
     ]
-    
+
     management_tabs = [
-        t("tab_reports"),
         t("tab_patients"),
         t("tab_llm_settings"),
         t("tab_llm_jobs"),
         t("tab_mapping"),
     ]
 
-    # With a patient selected the management tabs are grouped under one
-    # top-level "Verwaltung" tab (nested st.tabs inside); without a patient
-    # they are shown directly as the only tabs. The inner st.tabs() call must
-    # happen INSIDE the parent tab's context so Streamlit renders the sub-tab
-    # bar within it, not as a second top-level row.
-    if has_patient:
-        top_tabs = st.tabs(data_tabs + [t("tab_management")])
-        (data_tab_overview, data_tab_detail, data_tab_trends,
-         data_tab_risks, data_tab_all_values, data_tab_chat, mgmt_tab) = top_tabs
-        with mgmt_tab:
-            mgmt_subtabs = st.tabs(management_tabs)
-    else:
+    top_tabs = st.tabs(data_tabs + [t("tab_reports"), t("tab_management")])
+    (data_tab_overview, data_tab_detail, data_tab_trends,
+     data_tab_risks, data_tab_all_values, data_tab_chat,
+     reports_tab, mgmt_tab) = top_tabs
+    with mgmt_tab:
         mgmt_subtabs = st.tabs(management_tabs)
 
-    # --- TAB: Reports ---
+    # --- TAB: Reports (document management — top level since the UX rework) ---
     # The selected patient is passed explicitly rather than read from session
     # state inside the tab: it is the scope of everything this tab lists and of
     # every job it submits.
-    with mgmt_subtabs[0]:
+    with reports_tab:
         _render_reports_tab(session, patients, selected_patient,
                             _generate_summary_for_patient)
 
     # --- TAB: Patients ---
-    with mgmt_subtabs[1]:
+    with mgmt_subtabs[0]:
         _render_patients_tab(session, patients)
 
-    # --- TAB: LLM Settings ---
-    with mgmt_subtabs[2]:
-        _render_llm_settings_tab(session)
+    # --- TAB: Settings (LLM connection + PDF rendering + biomarker registry) ---
+    with mgmt_subtabs[1]:
+        _render_llm_settings_tab(session, selected_patient)
 
     # --- TAB: LLM Jobs ---
-    with mgmt_subtabs[3]:
+    with mgmt_subtabs[2]:
         render_llm_jobs_tab(session, selected_patient)
 
-    # First rerun check: runs after the management sub-tabs (Reports, Patients,
-    # LLM Settings, LLM Jobs) have rendered. Nested tabs execute all of their
+    # First rerun check: runs after the management tabs (Reports, Patients,
+    # Settings, LLM Jobs) have rendered. Nested tabs execute all of their
     # content on every rerun — exactly like the old flat tab bar — so a flag
     # set by any of them is picked up here.
     if st.session_state.get("_rerun_requested", False):
         st.session_state._rerun_requested = False
         st.rerun()
 
-    # If no patient selected, stop here
+    # If no patient selected, stop here — but render the SAME tab bar with a
+    # one-line placeholder in each data tab (and the per-patient Datenqualität
+    # sub-tab), so creating the first patient never reshuffles the layout.
     if not has_patient:
-        st.info(t("info_select_patient_first"))
+        for _tab in (data_tab_overview, data_tab_detail, data_tab_trends,
+                     data_tab_risks, data_tab_all_values, data_tab_chat):
+            with _tab:
+                st.info(t("info_no_patient_yet"))
+        with mgmt_subtabs[3]:
+            st.info(t("info_no_patient_yet"))
         session.close()
         return
 
@@ -357,8 +414,8 @@ def main():
         render_chat_tab(session, patient, lang, min_date, max_date,
                         f"chat_time_range_{patient.id}")
 
-    # --- TAB: Biomarker Mapping (management sub-tab) ---
-    with mgmt_subtabs[4]:
+    # --- TAB: Datenqualität (per-patient measurements review; management sub-tab) ---
+    with mgmt_subtabs[3]:
         render_mapping_tab(session, patient, patient_reports)
 
     # Second rerun check: patient-specific tabs (Detail, Trends, Risks,
