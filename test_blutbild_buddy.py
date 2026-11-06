@@ -7516,6 +7516,76 @@ class TestUiBehaviourAppTest(unittest.TestCase):
         self.assertTrue(any(b.key == f"strip_abort_job_{job_id}" for b in at.button),
                         "strip abort button missing or not keyed strip_abort_job_*")
 
+    @staticmethod
+    def _top_level_tab_bar_slots(at):
+        """Main-container child indices holding a top-level ``st.tabs()`` bar.
+
+        Streamlit identifies a block by its delta path — the index of each
+        ancestor among its siblings — and the frontend keys a tab bar's React
+        component (which owns the selected tab) by exactly that path. So the
+        indices are what must stay constant across a job starting/finishing.
+        """
+        return sorted(i for i, child in at.main.children.items()
+                      if getattr(child, "type", "") == "tab_container")
+
+    def test_tab_bar_position_stable_when_a_job_starts(self):
+        """Regression: starting or finishing a job threw the user back to the
+        Overview "dashboard" tab.
+
+        The running-jobs strip rendered a VARIABLE number of blocks above the
+        tab bar (zero when idle, one or more while a job ran). Every block
+        below it therefore shifted one slot in the delta path when the strip
+        appeared (job start) or vanished (job finish), which remounted the tab
+        container in React — and an unkeyed st.tabs() keeps its selected tab
+        ONLY in that component's state, so the selection reset to tab 0.
+
+        Two independent guarantees, both asserted here:
+          1. the tab bar occupies the SAME main-container slot with and without
+             an active job (the strip renders into an always-present container);
+          2. the tab bar block carries a stable id (user key), which is what
+             lets the frontend persist/restore the active tab label in the
+             widget manager's element state even if a remount ever happens.
+        """
+        from translations import t as _t
+        self._seed_patient()
+        at = self._run_app()
+        self._assert_clean(at)
+        slots_idle = self._top_level_tab_bar_slots(at)
+        self.assertEqual(len(slots_idle), 1,
+                         "expected exactly one top-level tab bar in main")
+
+        # A pending job for the selected patient → the strip renders.
+        self.session.add(database.LlmJob(
+            kind="process_pdfs", label="PDFs verarbeiten (Test)",
+            status="pending", patient_id=1, params_json="{}"))
+        self.session.commit()
+
+        # app.py marks stale jobs interrupted on every run; neutralise that for
+        # this run so the pending row survives into the strip (see the sibling
+        # strip test for why).
+        orig_mark = database.mark_stale_llm_jobs_interrupted
+        database.mark_stale_llm_jobs_interrupted = lambda *a, **k: 0
+        try:
+            at.run()
+        finally:
+            database.mark_stale_llm_jobs_interrupted = orig_mark
+        self._assert_clean(at)
+        markdowns = " || ".join(str(m.value) for m in at.markdown)
+        self.assertIn(_t("strip_running_jobs"), markdowns,
+                      "strip missing — the two runs would not be comparable")
+
+        slots_active = self._top_level_tab_bar_slots(at)
+        self.assertEqual(slots_idle, slots_active,
+                         "the tab bar moved between main-container slots when a "
+                         "job started — React remounts it and the selected tab "
+                         "resets to the first one (the Overview dashboard)")
+
+        # Keyed tab bar → stable block id → frontend persists the active tab.
+        tab_block = at.main.children[slots_active[0]]
+        self.assertTrue(tab_block.proto.id,
+                        "the top-level tab bar is unkeyed: its selected tab would "
+                        "live only in React state and reset on any remount")
+
     def test_no_connection_test_button_blocks_the_render_path(self):
         """The LLM connection test must be a background job: an inline call froze
         the whole app for the configured timeout (up to 2000s) when the endpoint

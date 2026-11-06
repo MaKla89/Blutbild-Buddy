@@ -284,6 +284,15 @@ def main():
     # while a job is actually pending/running — an unconditional fragment would
     # re-execute every 2 s forever, and every full rerun would register another
     # browser interval (same rule as the jobs-tab poll, ui/tabs/llm_jobs.py).
+    #
+    # The strip renders into an ALWAYS-created container, even when it stays
+    # empty. Streamlit identifies a block by its delta path (its position among
+    # its siblings), so a block that appears when a job starts and vanishes when
+    # it finishes shifts EVERY block below it by one slot — which remounts the
+    # tab bar and resets the selected tab to the first one (the Overview
+    # "dashboard"). A constant number of blocks above the tab bar keeps those
+    # paths stable. (The tab bars are additionally keyed, see below.)
+    _job_strip_slot = st.container()
     strip_patient_id = selected_patient.id if selected_patient is not None else None
     with get_session() as s:
         _strip_job_active = bool(get_active_llm_jobs(s, patient_id=strip_patient_id))
@@ -293,7 +302,8 @@ def main():
         def _job_strip_poll():
             _render_job_strip(strip_patient_id)
 
-        _job_strip_poll()
+        with _job_strip_slot:
+            _job_strip_poll()
 
     # Determine which tabs to show
     has_patient = bool(patients) and selected_patient is not None
@@ -325,12 +335,23 @@ def main():
         t("tab_mapping"),
     ]
 
-    top_tabs = st.tabs(data_tabs + [t("tab_reports"), t("tab_management")])
+    # Both tab bars MUST keep a stable user key (regression: the app jumped back
+    # to the Overview "dashboard" whenever a job started or finished).
+    # Unkeyed st.tabs() stores the selected tab ONLY in React component state,
+    # keyed by the block's position (delta path) in the main container — the
+    # backend re-sends default_tab_index 0 on every run. The running-jobs strip
+    # above renders a variable number of blocks, so when a job starts (strip
+    # appears) or finishes (strip disappears) the tab bar shifts one slot, React
+    # remounts it, and the selection resets to the first tab. A user key gives
+    # the block a stable id, which makes the frontend persist and restore the
+    # active tab label in the widget manager's element state — immune to the shift.
+    top_tabs = st.tabs(data_tabs + [t("tab_reports"), t("tab_management")],
+                       key="_main_tab_bar")
     (data_tab_overview, data_tab_detail, data_tab_trends,
      data_tab_risks, data_tab_all_values, data_tab_chat,
      reports_tab, mgmt_tab) = top_tabs
     with mgmt_tab:
-        mgmt_subtabs = st.tabs(management_tabs)
+        mgmt_subtabs = st.tabs(management_tabs, key="_mgmt_tab_bar")
 
     # --- TAB: Reports (document management — top level since the UX rework) ---
     # The selected patient is passed explicitly rather than read from session
