@@ -4904,6 +4904,32 @@ class TestApplyDataQualityFinding(unittest.TestCase):
         self.assertEqual(self.crp.value, 5.2)  # no conversion for same unit
         self.assertEqual(self.crp.unit, "mg/L")
 
+    def test_set_unit_stale_after_rename_reports_renamed(self):
+        # The live case: an ambiguous "Testosteron" was resolved to
+        # "Testosteron gesamt" (units ng/dl, nmol/l), so the unit guard flagged the
+        # row's "pg/ml" and proposed set_unit -> ng/dl. The user then renamed the
+        # marker to "Testosteron frei" (units pg/ml, pmol/l), where "pg/ml" is
+        # correct and ng/dl is a unit this marker is never measured in. Accepting
+        # the now-stale proposal must fail with a message that says so (and points
+        # at the manual correction form), not "unsupported unit conversion".
+        testo = database.DataPoint(
+            report_id=self.crp.report_id, canonical_name="Testosteron frei",
+            original_name="Testosteron", value=3.5, unit="pg/ml",
+        )
+        self.session.add(testo)
+        self.session.commit()
+        fid = self._add_finding("data_point", "Testosteron frei", action="set_unit",
+                                params={"unit": "ng/dl"},
+                                data_point_ids=[testo.id], category="unit")
+        out = database.apply_data_quality_finding(self.session, fid)
+        self.assertEqual(out["status"], "skipped")
+        self.session.expire_all()
+        self.assertEqual(testo.value, 3.5)   # untouched
+        self.assertEqual(testo.unit, "pg/ml")  # stored unit kept — it is correct
+        detail = out["detail"]
+        self.assertIn("renamed", detail)
+        self.assertIn("manual correction", detail)
+
     def test_set_unit_notation_variant_normalizes_without_conversion(self):
         """Real-world case: WBC stored as '/nl' (same magnitude as 10^3/µl).
 
@@ -7398,6 +7424,122 @@ class TestUiBehaviourAppTest(unittest.TestCase):
         markdowns = " || ".join(m.value for m in at.markdown)
         self.assertIn("Spaltenvertauschung", markdowns)
 
+    def _add_ack_finding_on_first_dp(self, patient, category="value"):
+        """Seed a pending 'acknowledge' finding pointing at one real DataPoint.
+
+        Returns (finding_id, data_point_id). 'acknowledge' is the action with no
+        machine fix — exactly the case the inline correction form exists for."""
+        dp = (
+            self.session.query(database.DataPoint)
+            .join(database.Report, database.DataPoint.report_id == database.Report.id)
+            .filter(database.Report.patient_id == patient.id)
+            .order_by(database.DataPoint.id)
+            .first()
+        )
+        finding = database.DataQualityFinding(
+            patient_id=patient.id, category=category, target_type="data_point",
+            biomarker=dp.canonical_name, report_id=dp.report_id,
+            data_point_ids=json.dumps([dp.id]), source_page=1,
+            description="Beim Auslesen unsicher", action="acknowledge",
+            params_json="{}", source="extraction", status="pending",
+        )
+        self.session.add(finding)
+        self.session.commit()
+        return finding.id, dp.id
+
+    def test_acknowledge_finding_shows_correction_form_not_fix_button(self):
+        """An 'acknowledge' finding (no machine fix) must NOT render the dead
+        'Korrigieren' button, and must render the inline correction form (a value
+        text input + a save button) so the user can hand-correct the suspect cell.
+        Guards the whole manual-recovery UI path against a widget crash."""
+        p = self._seed_patient()
+        fid, dp_id = self._add_ack_finding_on_first_dp(p)
+        at = self._run_app()
+        self._assert_clean(at)
+        # The correction form's widgets are present and keyed per finding+dp.
+        ti_keys = {ti.key for ti in at.text_input}
+        self.assertIn(f"fix_val_{fid}_{dp_id}", ti_keys,
+                      "correction value input missing for an acknowledge finding")
+        self.assertIn(f"fix_save_{fid}", {b.key for b in at.button},
+                      "correction save button missing")
+        # The machine 'Korrigieren' button is suppressed for acknowledge findings.
+        self.assertNotIn(f"accept_finding_{fid}", {b.key for b in at.button},
+                         "dead fix button shown for an acknowledge finding")
+
+    def test_acknowledge_finding_correction_applies_and_dismisses(self):
+        """Typing a corrected value into the form and saving must rewrite the
+        DataPoint (is_corrected set) and dismiss the now-superseded finding — the
+        manual counterpart to accepting a machine fix."""
+        p = self._seed_patient()
+        fid, dp_id = self._add_ack_finding_on_first_dp(p)
+        at = self._run_app()
+        self._assert_clean(at)
+        at.text_input(key=f"fix_val_{fid}_{dp_id}").set_value("99.5")
+        at.button(key=f"fix_save_{fid}").click()
+        at.run()
+        self._assert_clean(at)
+        dp = self.session.get(database.DataPoint, dp_id)
+        self.assertAlmostEqual(dp.value, 99.5)
+        self.assertTrue(dp.is_corrected, "manual edit must mark the row corrected")
+        finding = self.session.get(database.DataQualityFinding, fid)
+        self.assertEqual(finding.status, "dismissed",
+                         "a hand-fix must supersede the pending finding")
+
+    def test_acknowledge_finding_rejects_range_in_value_cell(self):
+        """A range typed into the value cell is the value/reference mix-up the
+        guard exists to catch — the edit is rejected (value unchanged) and the
+        finding stays pending, with a warning shown instead of silently storing
+        the first bound."""
+        p = self._seed_patient()
+        fid, dp_id = self._add_ack_finding_on_first_dp(p)
+        before = self.session.get(database.DataPoint, dp_id).value
+        at = self._run_app()
+        self._assert_clean(at)
+        at.text_input(key=f"fix_val_{fid}_{dp_id}").set_value("5,0-10,0")
+        at.button(key=f"fix_save_{fid}").click()
+        at.run()
+        self._assert_clean(at)
+        dp = self.session.get(database.DataPoint, dp_id)
+        self.assertAlmostEqual(dp.value, before, msg="rejected edit must not change value")
+        self.assertEqual(self.session.get(database.DataQualityFinding, fid).status, "pending")
+
+    def test_machine_finding_shows_both_fix_button_and_correction_form(self):
+        """A machine-applicable data_point finding (set_unit) must render BOTH the
+        'Korrigieren' accept button AND the inline correction form. The auto-fix can
+        still fail to apply — the live case is a stale proposal left over from a
+        rename (the Testosteron frei case), where the proposed unit no longer fits
+        the renamed marker — so the manual form is the user's escape hatch even when
+        a machine fix is offered."""
+        p = self._seed_patient()
+        dp = (
+            self.session.query(database.DataPoint)
+            .join(database.Report, database.DataPoint.report_id == database.Report.id)
+            .filter(database.Report.patient_id == p.id)
+            .order_by(database.DataPoint.id)
+            .first()
+        )
+        finding = database.DataQualityFinding(
+            patient_id=p.id, category="unit", target_type="data_point",
+            biomarker=dp.canonical_name, report_id=dp.report_id,
+            data_point_ids=json.dumps([dp.id]), source_page=1,
+            description="Einheit passt nicht zum Marker", action="set_unit",
+            params_json=json.dumps({"unit": "mmol/l"}), source="extraction",
+            status="pending",
+        )
+        self.session.add(finding)
+        self.session.commit()
+        fid, dp_id = finding.id, dp.id
+        at = self._run_app()
+        self._assert_clean(at)
+        buttons = {b.key for b in at.button}
+        # The machine fix button IS present (unlike an acknowledge finding).
+        self.assertIn(f"accept_finding_{fid}", buttons,
+                      "machine fix button missing for a set_unit finding")
+        # AND the manual correction form is present as the fallback.
+        self.assertIn(f"fix_val_{fid}_{dp_id}", {ti.key for ti in at.text_input},
+                      "manual correction form missing for a machine-applicable finding")
+        self.assertIn(f"fix_save_{fid}", buttons)
+
     # ── widget identity (selection survives unrelated reruns) ────────────────
 
     def test_report_and_biomarker_selectboxes_have_keys(self):
@@ -8229,6 +8371,33 @@ class TestUnitGuardExtraction(unittest.TestCase):
         self.assertEqual(len(low), 1)
         self.assertEqual(low[0].source_page, 1)
         self.assertIn("Hämatokrit", low[0].description)
+
+    def test_low_confidence_description_shows_reading(self):
+        """The whole point of a low-confidence finding is that the user eyeballs
+        the suspect number against the source page. A description that names the
+        marker + confidence but hides the value makes the page image useless —
+        there is nothing to compare the scan against. The reading (and the
+        reference) must be quoted in the description."""
+        page = {
+            "patient_name": "UnitGuard", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                {"name": "Hämatokrit", "value": 45.0, "unit": "%",
+                 "reference_range": "40-54", "column_index": 1, "confidence": 0.3},
+            ],
+        }
+        processed, errors = self._extract(page)
+        self.assertEqual(errors, [])
+        low = [f for f in self._findings() if f.action == "acknowledge" and f.category == "value"]
+        self.assertEqual(len(low), 1)
+        # The suspect value and its reference range are quoted, not just the name.
+        self.assertIn("45", low[0].description)
+        self.assertIn("40-54", low[0].description)
 
 
 class TestSetUnitRelabelIfImplausible(unittest.TestCase):

@@ -62,6 +62,139 @@ def _fmt_num(v):
     return str(int(f)) if f == int(f) else str(f)
 
 
+def _ref_bounds(low, high) -> str:
+    """Reference-range text from raw bounds ('5-10', '< 12', '> 0.5', '' if none).
+
+    Shared by the editable mapping table and the per-finding correction form so
+    a stored range renders identically in both places (and the form's prefilled
+    text round-trips through ``update_data_point``'s range parser unchanged).
+    """
+    if low is None and high is None:
+        return ""
+    if low is not None and high is not None:
+        return f"{_fmt_num(low)}–{_fmt_num(high)}"
+    if high is not None:
+        return f"< {_fmt_num(high)}"
+    return f"> {_fmt_num(low)}"
+
+
+def _series_caption(dp) -> str:
+    """Human label for which measurement series a data point belongs to.
+
+    A report that printed several result columns tags each value with a
+    ``result_date`` and/or a printed ``column_label``. When present this tells
+    the user WHICH column a flagged value came from — essential when a finding
+    points at several rows of the same marker at once (e.g. the systematic
+    value==reference-bound misread). Empty for the common single-column report.
+    """
+    label = (getattr(dp, "column_label", None) or "").strip()
+    if not label and getattr(dp, "result_date", None) is not None:
+        try:
+            label = dp.result_date.strftime("%d.%m.%Y")
+        except (AttributeError, ValueError):
+            label = str(dp.result_date)
+    return label
+
+
+def _render_finding_correction(session, f, patient) -> bool:
+    """Inline manual-correction form for an 'acknowledge' finding on data points.
+
+    A finding whose action is machine-applicable (set_unit, swap_value_ref_range,
+    …) gets the 'Korrigieren' button, which applies the fix the pipeline worked
+    out. An 'acknowledge' finding — low confidence, the systematic
+    value==reference-bound misread, a missing/dropped result column — has NO fix
+    the pipeline can apply, so before this the user could only look at the source
+    page and dismiss: there was nowhere to act on the evidence. This form shows
+    the exact stored value beside that page (so the scan finally has something to
+    be checked against) and lets the user hand-correct value / unit / reference
+    with the same write primitive the editable table uses (``update_data_point``).
+    That primitive also dismisses the now-superseded finding, so a hand-fix and
+    the machine suggestion can't both linger.
+
+    Returns True when at least one correction was applied (the caller reruns).
+    Rejected edits (a range typed into the value cell, a non-unit) warn in place
+    without rerunning, so the reason is visible.
+    """
+    dps = queries.finding_data_points(f.id)
+    if not dps:
+        return False  # report-/registry-level acknowledge: nothing to edit inline
+
+    st.caption(t("caption_finding_correct"))
+    # Visible column headers, aligned to the input columns below. The inputs
+    # themselves keep collapsed labels (a repeated label per row would be noise
+    # and push the suspect number far from the page image above), so the ONE
+    # header row is what tells the user which box is value / unit / reference.
+    _fix_widths = [2.4, 1.0, 1.0, 1.2]
+    _h_name, _h_val, _h_unit, _h_ref = st.columns(_fix_widths)
+    _h_name.markdown(f"**{t('col_biomarker')}**")
+    _h_val.markdown(f"**{t('col_value')}**")
+    _h_unit.markdown(f"**{t('col_unit')}**")
+    _h_ref.markdown(f"**{t('col_reference')}**")
+    rows = []
+    for dp in dps:
+        series = _series_caption(dp)
+        label = dp.canonical_name + (f" — {series}" if series else "")
+        c_name, c_val, c_unit, c_ref = st.columns(_fix_widths)
+        c_name.markdown(f"**{label}**")
+        if dp.original_name and dp.original_name != dp.canonical_name:
+            c_name.caption(t("caption_finding_original", original=dp.original_name))
+        cur_val = "" if dp.value is None else _fmt_num(dp.value)
+        cur_unit = dp.unit or ""
+        cur_ref = _ref_bounds(dp.ref_low, dp.ref_high)
+        # Prefilled with the stored reading: the suspect number is right there to
+        # compare against the page image, and the user edits it in place.
+        new_val = c_val.text_input(t("col_value"), value=cur_val,
+                                   key=f"fix_val_{f.id}_{dp.id}",
+                                   label_visibility="collapsed",
+                                   help=t("help_edit_value"))
+        new_unit = c_unit.text_input(t("col_unit"), value=cur_unit,
+                                     key=f"fix_unit_{f.id}_{dp.id}",
+                                     label_visibility="collapsed",
+                                     help=t("help_edit_unit"))
+        new_ref = c_ref.text_input(t("col_reference"), value=cur_ref,
+                                   key=f"fix_ref_{f.id}_{dp.id}",
+                                   label_visibility="collapsed",
+                                   help=t("help_edit_reference"))
+        rows.append((dp, cur_val, cur_unit, cur_ref, new_val, new_unit, new_ref))
+
+    if not st.button(t("btn_save_finding_correction"), key=f"fix_save_{f.id}",
+                     type="primary"):
+        return False
+
+    applied = 0
+    for dp, cur_val, cur_unit, cur_ref, new_val, new_unit, new_ref in rows:
+        kwargs = {}
+        if new_val.strip() != cur_val:
+            kwargs["value"] = new_val
+        if new_unit.strip() != cur_unit:
+            kwargs["unit"] = new_unit
+        if new_ref.strip() != cur_ref:
+            kwargs["ref_range"] = new_ref
+        if not kwargs:
+            continue
+        outcome = update_data_point(session, dp.id, patient.id, **kwargs)
+        if outcome["status"] == "applied":
+            applied += 1
+        elif outcome["status"] == "skipped":
+            # Rendered directly: when nothing applied we do NOT rerun, so a
+            # queued message would sit until an unrelated interaction.
+            st.warning(t("msg_edit_rejected", name=dp.canonical_name,
+                         detail=outcome["detail"]))
+    if applied:
+        refresh_patient_risk_flags(session, patient.id)
+        plural = "e" if applied > 1 else ""
+        # Queued via _flash: the caller's _rerun_requested discards this run.
+        _flash("finding_result", "success",
+               t("msg_finding_corrections_applied", count=applied, plural=plural))
+        return True
+    if not any(
+        (nv.strip() != cv or nu.strip() != cu or nr.strip() != cr)
+        for _, cv, cu, cr, nv, nu, nr in rows
+    ):
+        st.info(t("msg_finding_correction_nothing"))
+    return False
+
+
 def _finding_proposal(f) -> str:
     """Human-readable summary of the machine-applicable fix a finding carries.
 
@@ -194,13 +327,7 @@ def render_mapping_tab(session, patient, patient_reports):
         unregistered_lower = {n.lower() for n in unregistered}
 
         def _ref_text(dp) -> str:
-            if dp.ref_low is None and dp.ref_high is None:
-                return ""
-            if dp.ref_low is not None and dp.ref_high is not None:
-                return f"{_fmt_num(dp.ref_low)}–{_fmt_num(dp.ref_high)}"
-            if dp.ref_high is not None:
-                return f"< {_fmt_num(dp.ref_high)}"
-            return f"> {_fmt_num(dp.ref_low)}"
+            return _ref_bounds(dp.ref_low, dp.ref_high)
 
         mapping_rows = []
         for dp in dp_results:
@@ -478,6 +605,11 @@ def render_mapping_tab(session, patient, patient_reports):
             if st.button(t("btn_accept_all_findings"), type="secondary"):
                 applied = skipped = 0
                 for f in findings:
+                    # 'acknowledge' findings have no machine fix — accepting them
+                    # would only ever skip. They are corrected with the inline
+                    # form below, so don't inflate the skipped count with them.
+                    if f.action == "acknowledge":
+                        continue
                     outcome = apply_data_quality_finding(session, f.id)
                     if outcome["status"] == "applied":
                         applied += 1
@@ -512,7 +644,13 @@ def render_mapping_tab(session, patient, patient_reports):
                 )
                 c_desc.markdown(f.description)
                 c_prop.markdown(_finding_proposal(f))
-                if c_accept.button(t("btn_accept_finding"), key=f"accept_finding_{f.id}"):
+                # 'acknowledge' findings carry no machine-applicable fix — the
+                # pipeline saw something suspicious but cannot decide the right
+                # value from stored data. Showing 'Korrigieren' there is a dead
+                # button that always skips; the real recovery is the inline
+                # correction form rendered under the source page below.
+                is_ack = f.action == "acknowledge"
+                if not is_ack and c_accept.button(t("btn_accept_finding"), key=f"accept_finding_{f.id}"):
                     outcome = apply_data_quality_finding(session, f.id)
                     # Queue via _flash: the rerun triggered by any_changed
                     # below discards anything rendered in this run.
@@ -543,6 +681,21 @@ def render_mapping_tab(session, patient, patient_reports):
                                 st.image(f"data:image/jpeg;base64,{img}", use_container_width=True)
                             else:
                                 st.caption(t("caption_finding_source_missing", page=f.source_page))
+
+                # Manual recovery for a measurement-level finding. Shown for
+                # EVERY data_point finding, not only 'acknowledge': an
+                # 'acknowledge' finding has no machine fix at all, and a
+                # machine-applicable one (set_unit / set_ref_range / …) can still
+                # fail to apply — e.g. a stale proposal left over from a rename
+                # (the Testosteron frei case: the marker was renamed after the
+                # finding, so the proposed unit no longer fits and the auto-fix
+                # skips). Either way the user needs somewhere to act on the
+                # evidence, so the suspect stored value is shown beside the page
+                # image and corrected in place. Placed after the image so the
+                # value sits right under the scan it should be checked against.
+                if f.target_type == "data_point":
+                    if _render_finding_correction(session, f, patient):
+                        any_changed = True
                 if idx < len(findings) - 1:
                     st.divider()
 

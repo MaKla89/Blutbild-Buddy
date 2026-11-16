@@ -135,6 +135,26 @@ _MIN_BOUND_FRACTION = 0.3
 _LOW_CONFIDENCE_THRESHOLD = 0.5
 
 
+def _fmt_reading(entry) -> str:
+    """The value exactly as the reader produced it, for a finding description.
+
+    A low-confidence finding is only actionable if the user can see WHAT was
+    read and compare it against the source page — naming the marker and the
+    confidence but hiding the number makes the page image useless (there is
+    nothing to check the scan against). Prefers ``value_raw`` (the verbatim
+    printed string, e.g. '13,18' — kept whenever the model returned a string)
+    so the description shows the SAME text the scan shows; falls back to the
+    parsed number, then to a dash for a qualitative/empty cell.
+    """
+    raw = (getattr(entry, "value_raw", "") or "").strip()
+    if raw:
+        return raw
+    v = getattr(entry, "value", None)
+    if v is None:
+        return "—"
+    return str(int(v)) if float(v).is_integer() else str(v)
+
+
 def _parse_result_date(text: str | None) -> datetime | None:
     """Parse a result column's header into a date, when it is one.
 
@@ -340,12 +360,18 @@ def _column_findings(
         # reader itself was unsure about, so the user eyeballs the source page.
         # Only fires when the model actually emitted a confidence below the
         # threshold; a clean read (no confidence field) stays silent.
+        # The description MUST quote the reading that is in doubt: without the
+        # number there is nothing to compare the source page against, and the
+        # user is left staring at a scan with no idea which cell the pipeline
+        # is even asking about.
         if entry.confidence is not None and entry.confidence < _LOW_CONFIDENCE_THRESHOLD:
             findings.append({
                 "category": "value",
                 "entry_positions": [pos],
                 "description": t("dq_low_confidence", lang=lang,
-                                 name=name, confidence=int(round(entry.confidence * 100))),
+                                 name=name, confidence=int(round(entry.confidence * 100)),
+                                 reading=_fmt_reading(entry),
+                                 ref=ref_text or "—"),
                 "action": "acknowledge", "params": {},
             })
 

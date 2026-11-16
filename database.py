@@ -3081,6 +3081,22 @@ def _recompute_abnormal(dp: DataPoint) -> None:
     dp.is_abnormal = below or above
 
 
+def _unit_matches_marker_units(unit: str, reg_units: list[str]) -> bool:
+    """Strict: is ``unit`` one of (or a notation variant of) the marker's OWN units?
+
+    Unlike ``config.unit_known_for_marker`` (lenient — True for unknown/ambiguous
+    fragments), this returns True ONLY when the unit matches a unit the marker
+    itself lists. Used both by the relabel-vs-convert plausibility check and by
+    the stale-proposal guard in ``_apply_data_point_fix``.
+    """
+    if not unit or not reg_units:
+        return False
+    u = _config._norm_unit(unit)
+    return any(_config._norm_unit(ru) == u
+               or _config._units_equivalent(u, _config._norm_unit(ru))
+               for ru in reg_units)
+
+
 def _value_implausible_under_old_unit(dp: DataPoint, old_unit: str, new_unit: str,
                                       _config) -> bool:
     """True when a ``set_unit`` fix should RELABEL (keep the number) not CONVERT.
@@ -3107,13 +3123,9 @@ def _value_implausible_under_old_unit(dp: DataPoint, old_unit: str, new_unit: st
     if not reg_units:
         return False
 
-    def _matches(unit: str) -> bool:
-        u = _config._norm_unit(unit)
-        return any(_config._norm_unit(ru) == u or _config._units_equivalent(u, _config._norm_unit(ru))
-                   for ru in reg_units)
-
     # (1) old unit foreign to the marker, (2) new unit native to it.
-    if _matches(old_unit) or not _matches(new_unit):
+    if _unit_matches_marker_units(old_unit, reg_units) \
+            or not _unit_matches_marker_units(new_unit, reg_units):
         return False
 
     # (3) value plausible under the new unit's default range (wide tolerance so a
@@ -3192,6 +3204,7 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
             return False, "no target unit provided"
         import config as _config
         updated = 0
+        stale = 0
         for dp in dps:
             old_unit = clean_unit(dp.unit) or ""
             if old_unit and old_unit.lower() == new_unit.lower():
@@ -3230,6 +3243,26 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
                 dp.canonical_name, dp.value, dp.value, old_unit, new_unit
             )
             if conv_value is None:
+                # Classify the failure. When the value already sits in a unit
+                # this marker IS measured in, but the proposed unit is foreign
+                # to it, the proposal was computed against a DIFFERENT (wrong)
+                # name — almost always a rename after the finding was raised.
+                # The live case: an ambiguous 'Testosteron' resolved to
+                # 'Testosteron gesamt' (units ng/dl, nmol/l), so the unit guard
+                # flagged the row's 'pg/ml' and proposed set_unit→ng/dl; the user
+                # then renamed it to 'Testosteron frei' (units pg/ml, pmol/l),
+                # where 'pg/ml' is correct and 'ng/dl' is not a unit this marker
+                # is ever measured in. Converting would move a correctly-labelled
+                # value into a foreign unit (and there is no pg/ml→ng/dl factor,
+                # so it just fails). Count it as stale so the message says so
+                # plainly — the manual correction form is the way out — instead of
+                # implying a broken conversion table.
+                reg_units = list(
+                    (get_registry(session).get(dp.canonical_name) or {}).get("units") or []
+                )
+                if reg_units and _unit_matches_marker_units(old_unit, reg_units) \
+                        and not _unit_matches_marker_units(new_unit, reg_units):
+                    stale += 1
                 continue
             dp.value = float(conv_value)
             # Convert stored ref bounds when present (assumed to be in the
@@ -3243,6 +3276,15 @@ def _apply_data_point_fix(session: SASession, finding: DataQualityFinding, param
             _recompute_abnormal(dp)
             updated += 1
         if not updated:
+            if stale:
+                # The proposal no longer fits the marker's current name — almost
+                # always because the marker was renamed after the finding was
+                # raised. Tell the user plainly rather than implying a broken
+                # conversion table; the manual correction form is the way out.
+                return False, ("the proposed unit is not a unit this marker is "
+                               "measured in — the marker was likely renamed after "
+                               "this finding was created. The stored unit looks "
+                               "correct; use the manual correction below instead.")
             return False, "no data point could be updated (unsupported unit conversion?)"
         return True, f"{updated} data point(s) updated"
 

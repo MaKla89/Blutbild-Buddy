@@ -29,13 +29,17 @@ combined.
 
 from collections import namedtuple
 from datetime import datetime
+import json
 from pathlib import Path
 
 import streamlit as st
 from sqlalchemy import func, text
 
 import config
-from database import DataPoint, LlmJob, Report, RiskFlag, commit_version, get_session
+from database import (
+    DataPoint, DataQualityFinding, LlmJob, Report, RiskFlag,
+    commit_version, get_session,
+)
 
 # Lightweight, ORM-free stand-ins for the rows the tabs render.
 ReportRow = namedtuple("ReportRow", "id filename report_date panel_type")
@@ -54,6 +58,14 @@ MappingRow = namedtuple(
     "MappingRow",
     "id report_date filename original_name canonical_name value unit ref_low ref_high "
     "is_disabled is_corrected",
+)
+# The measurements a data-point finding points at, for the Mapping tab's review
+# row: the user needs to SEE the current stored value beside the source-page
+# image (otherwise the scan has nothing to be checked against) and edit it in
+# place when the pipeline misread it. ORM-free so st.cache_data can copy it.
+FindingValueRow = namedtuple(
+    "FindingValueRow",
+    "id canonical_name original_name value unit ref_low ref_high result_date column_label",
 )
 
 
@@ -351,6 +363,44 @@ def _mapping_rows(token, patient_id: int, report_id):
 def mapping_rows(patient_id: int, report_id=None) -> list:
     """Rows of the Mapping tab (all reports, or one when `report_id` is given)."""
     return _mapping_rows(cache_token(), patient_id, report_id)
+
+
+# ── Measurements behind a data-quality finding (Mapping tab review) ──────────
+
+@st.cache_data(max_entries=64, show_spinner=False)
+def _finding_data_points(token, finding_id: int):
+    """The DataPoints a data-point finding points at, as plain rows.
+
+    The Mapping tab shows these beside the source-page image so the user can
+    compare the stored value against the scan (a finding that only says
+    'unsicher' with no number gives the image nothing to be checked against),
+    and edits them in place when the reading is wrong. Returns ORM-free
+    ``FindingValueRow``s in the finding's own id order. Empty for a report- or
+    registry-level finding (no data points) or when the rows were since removed.
+    """
+    with get_session() as s:
+        f = s.get(DataQualityFinding, finding_id)
+        if f is None or not f.data_point_ids:
+            return []
+        try:
+            ids = json.loads(f.data_point_ids)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        rows = []
+        for dp_id in ids:
+            dp = s.get(DataPoint, dp_id)
+            if dp is None:
+                continue
+            rows.append(FindingValueRow(
+                dp.id, dp.canonical_name, dp.original_name, dp.value, dp.unit,
+                dp.ref_low, dp.ref_high, dp.result_date, dp.column_label,
+            ))
+        return rows
+
+
+def finding_data_points(finding_id: int) -> list:
+    """ORM-free measurements a data-point finding targets (see ``_finding_data_points``)."""
+    return _finding_data_points(cache_token(), finding_id)
 
 
 # ── Report page images (for the Mapping tab's finding review) ─────────────────
