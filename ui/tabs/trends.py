@@ -9,11 +9,44 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from config import embedded_unit, marker_base, name_has_unit
 from database import get_biomarker_info
 from translations import t
 from ui import queries
 from ui.cards import render_markdown_card
-from ui.helpers import _job_button, _show_flash, _time_range_slider
+from ui.helpers import _job_button, _show_flash, _time_range_slider, marker_label
+
+
+def _unique_variant_label(cname: str, unit: str | None, used: set[str]) -> str:
+    """Display label for one measurement group inside the unit sub-pick.
+
+    A marker's storage groups are (canonical_name, unit) pairs. The clean ones
+    read ``HbA1c (%)`` / ``HbA1c (mmol/mol)`` — ``marker_label`` already omits a
+    unit the name embeds. But a patient's data can also hold DRIFTED groups: the
+    same name stored with a missing or foreign unit (the live DB had
+    ``HbA1c (mmol/mol)`` rows whose unit was ``%``). Those must stay individually
+    selectable (the series query is keyed on the exact pair), yet a naive label
+    makes them collide with their clean sibling — and appending the raw unit
+    yields ``HbA1c (%) [%]``, which reads exactly like the doubled-unit bug this
+    whole change set out to remove.
+
+    So the label states the stored unit honestly whenever it disagrees with the
+    name, and never in a way that looks like a second unit on the name:
+      - unit matches the name (or the name embeds no unit) → clean ``marker_label``;
+      - unit missing → ``… — ohne Einheit`` / ``… — no unit``;
+      - unit foreign to the name → ``… — gespeicherte Einheit: <unit>`` so the
+        drift is visible and the clean group keeps its uncluttered label.
+    """
+    if unit is None:
+        label = f"{cname} — {t('label_unit_missing')}"
+    elif name_has_unit(cname, unit):
+        label = marker_label(cname, unit)
+    else:
+        label = f"{cname} — {t('label_unit_stored')}: {unit}"
+    if label in used:  # final safety net — distinct pairs should never collide now
+        label = f"{label} · #{len(used) + 1}"
+    used.add(label)
+    return label
 
 
 def render_trends_tab(session, patient, patient_reports, min_date, max_date, time_range_key, lang):
@@ -47,18 +80,42 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
 
     if patient_reports:
         all_entries = queries.biomarkers(patient.id)
-        # display label -> (canonical name, unit). Resolving the selection with a
-        # dict lookup also removes the old `[x for x in …][0]` pair, which shadowed
-        # the translation function `t` and raised IndexError on a stale selection.
-        options = {}
+        # ── Two-level marker picker ──────────────────────────────────────────
+        # One marker = one entry, not one per (name, unit) pair. A canonical name
+        # that embeds its unit ('HbA1c (%)' vs 'HbA1c (mmol/mol)') is a VARIANT of
+        # the same marker, and unit drift on a plain name ('Erythrozyten (RBC)' in
+        # Mio./µl, 10³/µl, /ml, Mill/ul) split one marker into four picker rows —
+        # 160 rows for 128 markers in a typical patient. Grouping on
+        # ``config.marker_base`` collapses them to one choice, and the unit becomes
+        # a second-level pick that only appears when the marker really has more
+        # than one measurement group. Relative (%) vs absolute (10³/µl) counts stay
+        # separate on purpose — they are different quantities, never merged.
+        groups: dict[str, list[tuple[str, str | None]]] = {}
         for cname, unit in all_entries:
-            options[f"{cname} ({unit})" if unit else cname] = (cname, unit)
+            groups.setdefault(marker_base(cname) or cname, []).append((cname, unit))
+        marker_names = sorted(groups)
         # Explicit key: without one, Streamlit derives an auto-key from the label +
         # option list, so adding a report or renaming a marker silently resets the
         # user's current selection.
-        selected_label = st.selectbox(t("select_biomarker"), list(options),
-                                      key=f"trends_marker_{patient.id}")
-        selected_cname, selected_unit = options[selected_label]
+        selected_base = st.selectbox(t("select_biomarker"), marker_names,
+                                     key=f"trends_marker_{patient.id}")
+
+        used: set[str] = set()
+        variant_options = {
+            _unique_variant_label(cname, unit, used): (cname, unit)
+            for cname, unit in sorted(groups[selected_base],
+                                      key=lambda cu: (cu[0], (cu[1] or "")))
+        }
+        if len(variant_options) > 1:
+            selected_variant = st.selectbox(
+                t("select_unit_variant"), list(variant_options),
+                key=f"trends_unit_{patient.id}_{selected_base}",
+            )
+        else:
+            # Single group: no second control to add (a conditional widget here
+            # would shift the block count below it — the tab-reset class of bug).
+            selected_variant = next(iter(variant_options))
+        selected_cname, selected_unit = variant_options[selected_variant]
 
         # --- Time range slider (robust against a single report) ---
         start_date, end_date = _time_range_slider(
@@ -128,7 +185,9 @@ def render_trends_tab(session, patient, patient_reports, min_date, max_date, tim
             st.divider()
 
             # ── Trend Chart ──────────────────────────────────────────────────
-            chart_label = selected_label
+            # The chosen variant's display label doubles as the y-axis series
+            # name; it is already unique within this marker's group.
+            chart_label = selected_variant
             df_chart = pd.DataFrame({
                 t("col_date"): dates,
                 chart_label: values,

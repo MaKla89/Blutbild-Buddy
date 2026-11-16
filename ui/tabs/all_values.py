@@ -15,10 +15,11 @@ from openpyxl.utils import get_column_letter
 
 from translations import t
 from ui import queries
+from ui.helpers import marker_label
 
 
 @st.cache_data(show_spinner=False)
-def _build_xlsx_bytes(df_pivot: pd.DataFrame, date_list: list, marker_label: str,
+def _build_xlsx_bytes(df_pivot: pd.DataFrame, date_list: list, marker_col_label: str,
                       sheet_title: str, disabled_by_label: dict,
                       ref_min_label: str, ref_max_label: str) -> bytes:
     """Build the styled XLSX workbook for the all-values matrix.
@@ -34,7 +35,7 @@ def _build_xlsx_bytes(df_pivot: pd.DataFrame, date_list: list, marker_label: str
     ws.title = sheet_title[:31]  # Excel sheet-name limit
 
     # Header row
-    headers = [marker_label, ref_min_label, ref_max_label] + date_list
+    headers = [marker_col_label, ref_min_label, ref_max_label] + date_list
     for col_idx, header in enumerate(headers, 1):
         cell = ws.cell(row=1, column=col_idx, value=header)
         cell.alignment = Alignment(horizontal="center")
@@ -46,7 +47,7 @@ def _build_xlsx_bytes(df_pivot: pd.DataFrame, date_list: list, marker_label: str
     white_font_alignment = Alignment(horizontal="center", vertical="center")
 
     for row_idx, row_data in enumerate(df_pivot.to_dict("records"), 2):
-        marker_value = row_data[marker_label]
+        marker_value = row_data[marker_col_label]
         ref_low = row_data.get("Min")
         ref_high = row_data.get("Max")
 
@@ -115,7 +116,7 @@ def render_all_values_tab(session, patient, patient_reports):
             pivot_rows = []
             disabled_by_label = {}
             for cname, unit in all_entries:
-                label = f"{cname} ({unit})" if unit else cname
+                label = marker_label(cname, unit)
                 ref_low, ref_high = ref_lookup.get((cname, unit), (None, None))
                 row = {c_marker: label, "Min": ref_low, "Max": ref_high}
                 has_value = False

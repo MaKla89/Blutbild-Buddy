@@ -16,7 +16,7 @@ import streamlit as st
 
 from translations import t
 from ui import queries
-from ui.helpers import _time_range_slider
+from ui.helpers import _time_range_slider, marker_label
 
 
 def render_overview_tab(session, patient, patient_reports, min_date, max_date, time_range_key, render_health_summary):
@@ -121,7 +121,7 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
         all_cnames_units = queries.biomarkers(patient.id)
         all_options = []
         for cname, unit in all_cnames_units:
-            label = f"{cname} ({unit})" if unit else cname
+            label = marker_label(cname, unit)
             all_options.append((label, cname, unit))
         fav_options = [o[0] for o in all_options]
         # Favorites are stored as display labels in the DB, but the option list
@@ -282,7 +282,7 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                             if b is not None:
                                 boundary = b
                                 break
-                        marker_label = f"{cname} ({unit})" if unit else cname
+                        label = marker_label(cname, unit)
                         for report_date, value, ref_low, ref_high in pts:
                             if show_log_scale:
                                 # Log mode plots the deviation magnitude of
@@ -296,14 +296,14 @@ def render_overview_tab(session, patient, patient_reports, min_date, max_date, t
                                     continue
                                 rows.append({
                                     c_date: report_date,
-                                    c_marker: marker_label,
+                                    c_marker: label,
                                     "pct": abs(pct),
                                 })
                             else:
                                 pct = ((value - boundary) / boundary) * 100 if boundary not in (None, 0) else 0.0
                                 rows.append({
                                     c_date: report_date,
-                                    c_marker: marker_label,
+                                    c_marker: label,
                                     # Neutral internal column name — the visible
                                     # axis title comes from t("chart_relative_ylabel").
                                     "pct": pct,

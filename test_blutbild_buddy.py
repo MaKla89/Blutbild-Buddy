@@ -7556,16 +7556,47 @@ class TestUiBehaviourAppTest(unittest.TestCase):
     def test_biomarker_selection_survives_a_rerun(self):
         """Picking a biomarker in Trends must still be selected after a later
         interaction re-runs the app (the old `[t[1] for t in ...][0]` lookup also
-        raised IndexError when the option list changed under the selection)."""
+        raised IndexError when the option list changed under the selection).
+
+        The picker is two-level now: the first selectbox lists each marker ONCE by
+        base name (``Leukozyten``, not ``Leukozyten (Tsd./µl)``), so the persisted
+        selection is the base name. ``Leukozyten`` has a single measurement group
+        here, so no unit sub-pick renders."""
         self._seed_patient()
         at = self._run_app()
         self._assert_clean(at)
         marker_sb = next(sb for sb in at.selectbox if sb.key == "trends_marker_1")
-        marker_sb.select("Leukozyten (Tsd./\u00b5l)")
+        marker_sb.select("Leukozyten")
         at.run()
         self._assert_clean(at)
         marker_sb = next(sb for sb in at.selectbox if sb.key == "trends_marker_1")
-        self.assertEqual(marker_sb.value, "Leukozyten (Tsd./\u00b5l)")
+        self.assertEqual(marker_sb.value, "Leukozyten")
+
+    def test_unit_qualified_variants_group_under_one_marker(self):
+        """'HbA1c (%)' and 'HbA1c (mmol/mol)' are variants of ONE marker, not two
+        markers. The flat picker listed both (plus a doubled unit, 'HbA1c (%) (%)').
+        The two-level picker must list 'HbA1c' exactly once in the marker selectbox
+        and expose the unit as a second selectbox."""
+        self._seed_patient(markers=(("HbA1c (%)", "%", 4.0, 5.7),
+                                    ("HbA1c (mmol/mol)", "mmol/mol", 20.0, 42.0)))
+        at = self._run_app()
+        self._assert_clean(at)
+        marker_sb = next(sb for sb in at.selectbox if sb.key == "trends_marker_1")
+        # One entry for the whole HbA1c family, and no doubled-unit label anywhere.
+        self.assertIn("HbA1c", marker_sb.options)
+        self.assertNotIn("HbA1c (%)", marker_sb.options)
+        self.assertNotIn("HbA1c (%) (%)", marker_sb.options)
+        # Two measurement groups → the unit sub-pick renders, keyed per marker.
+        unit_sb = next(sb for sb in at.selectbox if sb.key == "trends_unit_1_HbA1c")
+        self.assertEqual(sorted(unit_sb.options), ["HbA1c (%)", "HbA1c (mmol/mol)"])
+
+    def test_single_group_marker_shows_no_unit_subpick(self):
+        """A marker with exactly one measurement group must not grow a second
+        selectbox — a conditional widget would change the block count below it."""
+        self._seed_patient(markers=(("CRP", "mg/l", 0.0, 5.0),))
+        at = self._run_app()
+        self._assert_clean(at)
+        self.assertFalse([sb for sb in at.selectbox if sb.key.startswith("trends_unit_")])
 
     # ── export flow ──────────────────────────────────────────────────────────
 
@@ -8240,6 +8271,156 @@ class TestUnitHygieneConfig(unittest.TestCase):
         self.assertTrue(config.unit_known_for_marker("ALT (GPT)", None, reg))
 
 
+class TestUnitQualifiedVariant(unittest.TestCase):
+    """The HbA1c family of bugs: a canonical name that embeds its unit
+    ('HbA1c (%)' vs 'HbA1c (mmol/mol)') is a VARIANT of one marker. A bare
+    'HbA1c' resolves through the alias table to whichever variant is listed
+    first, and an LLM name mapping can pick the wrong one — the live DB stored
+    rows named 'HbA1c (mmol/mol)' whose value/unit/reference range were all in
+    '%'. These helpers re-derive the variant from the unit the row carries, and
+    the UI label helper stops printing the unit twice."""
+
+    def test_marker_base_groups_variants(self):
+        self.assertEqual(config.marker_base("HbA1c (%)"), "HbA1c")
+        self.assertEqual(config.marker_base("HbA1c (mmol/mol)"), "HbA1c")
+        self.assertEqual(config.marker_base("eGFR (CKD-EPI)"), "eGFR")
+        self.assertEqual(config.marker_base("CRP"), "CRP")
+        self.assertEqual(config.marker_base(None), "")
+
+    def test_embedded_unit_vs_abbreviation(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # A unit qualifier is recognised from the marker's OWN registry units.
+        self.assertEqual(config.embedded_unit("HbA1c (%)", reg), "%")
+        self.assertEqual(config.embedded_unit("HbA1c (mmol/mol)", reg), "mmol/mol")
+        # A parenthesised abbreviation is NOT a unit — these must keep their unit.
+        self.assertIsNone(config.embedded_unit("ALT (GPT)", reg))
+        self.assertIsNone(config.embedded_unit("Hämoglobin (Hb)", reg))
+        self.assertIsNone(config.embedded_unit("Vitamin D (25-OH)", reg))
+        self.assertIsNone(config.embedded_unit("CRP", reg))
+
+    def test_name_has_unit_drives_the_label(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # The doubled-unit case: name already says %, so the UI must not append it.
+        self.assertTrue(config.name_has_unit("HbA1c (%)", "%", reg))
+        self.assertTrue(config.name_has_unit("HbA1c (mmol/mol)", "mmol/mol", reg))
+        # A foreign unit is not embedded, so it IS shown: HbA1c (%) (mg/l).
+        self.assertFalse(config.name_has_unit("HbA1c (%)", "mg/l", reg))
+        # Abbreviation names always show their unit: ALT (GPT) (U/l).
+        self.assertFalse(config.name_has_unit("ALT (GPT)", "U/l", reg))
+        # No unit → nothing to suppress.
+        self.assertFalse(config.name_has_unit("HbA1c (%)", None, reg))
+
+    def test_resolve_variant_snaps_wrong_name_to_unit(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # The live-DB defect: name says IFCC, the row's unit is % → HbA1c (%).
+        self.assertEqual(
+            config.resolve_unit_qualified_variant("HbA1c (mmol/mol)", "%", reg),
+            "HbA1c (%)")
+        # And the mirror case.
+        self.assertEqual(
+            config.resolve_unit_qualified_variant("HbA1c (%)", "mmol/mol", reg),
+            "HbA1c (mmol/mol)")
+        # Already correct → unchanged.
+        self.assertEqual(
+            config.resolve_unit_qualified_variant("HbA1c (%)", "%", reg), "HbA1c (%)")
+
+    def test_resolve_variant_leaves_ambiguous_and_abbreviations_alone(self):
+        reg = config._CANONICAL_BIOMARKERS
+        # No sibling matches the unit → stay put (left to the category-error guard).
+        self.assertEqual(
+            config.resolve_unit_qualified_variant("HbA1c (%)", "mg/l", reg), "HbA1c (%)")
+        # A name whose parenthetical is an abbreviation is never touched.
+        self.assertEqual(
+            config.resolve_unit_qualified_variant("ALT (GPT)", "U/l", reg), "ALT (GPT)")
+        # No unit → nothing to key on.
+        self.assertEqual(
+            config.resolve_unit_qualified_variant("HbA1c (mmol/mol)", None, reg),
+            "HbA1c (mmol/mol)")
+
+    def test_marker_label_helper_omits_redundant_unit(self):
+        from ui.helpers import marker_label
+        # Doubled-unit names collapse to the name alone.
+        self.assertEqual(marker_label("HbA1c (%)", "%"), "HbA1c (%)")
+        self.assertEqual(marker_label("HbA1c (mmol/mol)", "mmol/mol"), "HbA1c (mmol/mol)")
+        # Abbreviation names keep their unit; a foreign unit is still shown.
+        self.assertEqual(marker_label("ALT (GPT)", "U/l"), "ALT (GPT) (U/l)")
+        self.assertEqual(marker_label("HbA1c (%)", "mg/l"), "HbA1c (%) (mg/l)")
+        # Plain names with a unit are unchanged.
+        self.assertEqual(marker_label("CRP", "mg/l"), "CRP (mg/l)")
+        self.assertEqual(marker_label("INR", None), "INR")
+
+
+class TestUnitQualifiedVariantExtraction(unittest.TestCase):
+    """End-to-end: a wrong LLM name mapping (HbA1c → HbA1c (mmol/mol)) is snapped
+    back to the variant matching the row's unit at ingestion, value-preserving."""
+
+    def setUp(self):
+        import streamlit as st
+        st.session_state.pdf_dpi = 100
+        st.session_state.pdf_batch_size = 0
+        self.session = _fresh_db(f"variantguard_{self._testMethodName}.db")
+
+    def tearDown(self):
+        self.session.close()
+
+    def _extract(self, page_dict, mappings):
+        from schemas import ExtractedPage, NormalizationMapping
+        import extractor
+        with patch("extractor.REPORTS_DIR", str(_single_page_pdf_dir())), \
+             patch("extractor.pdf_to_base64_jpeg", return_value=["fake_b64"]), \
+             patch("extractor.extract_page", return_value=ExtractedPage(**page_dict)), \
+             patch("extractor.normalize_names",
+                   return_value=NormalizationMapping(mappings=mappings)):
+            return extractor.process_new_pdfs(self.session, lang="de")
+
+    def test_wrong_variant_mapping_is_snapped_to_unit(self):
+        # The LLM maps a bare 'HbA1c' to the IFCC variant even though the row's
+        # unit is '%' — the exact live-DB defect. Ingestion must rename it to
+        # HbA1c (%) and leave the number untouched.
+        page = {
+            "patient_name": "VariantGuard", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                {"name": "HbA1c", "value": 5.7, "unit": "%",
+                 "reference_range": "4.8-5.7", "column_index": 1},
+            ],
+        }
+        mappings = [{"original": "HbA1c", "unit": "%", "canonical": "HbA1c (mmol/mol)"}]
+        processed, errors = self._extract(page, mappings)
+        self.assertEqual(errors, [])
+        dp = self.session.query(database.DataPoint).one()
+        self.assertEqual(dp.canonical_name, "HbA1c (%)")
+        self.assertEqual(dp.unit, "%")
+        self.assertEqual(dp.value, 5.7)  # value never converted
+
+    def test_correct_variant_mapping_is_left_alone(self):
+        page = {
+            "patient_name": "VariantGuard", "report_date": "2024-05-01",
+            "panel_type": "Blutbild",
+            "columns": [
+                {"index": 0, "role": "name"},
+                {"index": 1, "role": "result", "header": "Messwert"},
+                {"index": 2, "role": "reference"},
+            ],
+            "entries": [
+                {"name": "HbA1c IFCC", "value": 39.0, "unit": "mmol/mol",
+                 "reference_range": "20-42", "column_index": 1},
+            ],
+        }
+        mappings = [{"original": "HbA1c IFCC", "unit": "mmol/mol",
+                     "canonical": "HbA1c (mmol/mol)"}]
+        processed, errors = self._extract(page, mappings)
+        self.assertEqual(errors, [])
+        dp = self.session.query(database.DataPoint).one()
+        self.assertEqual(dp.canonical_name, "HbA1c (mmol/mol)")
+        self.assertEqual(dp.unit, "mmol/mol")
+
+
 class TestEntryConfidenceAndRaw(unittest.TestCase):
     """Idea 8 (schemas layer): always keep the printed value string, and coerce a
     model-reported per-entry confidence into [0,1] (or None when not reported)."""
@@ -8805,6 +8986,8 @@ if __name__ == "__main__":
     suite.addTests(loader.loadTestsFromTestCase(TestColumnFixActions))
     suite.addTests(loader.loadTestsFromTestCase(TestVerifyExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestUnitHygieneConfig))
+    suite.addTests(loader.loadTestsFromTestCase(TestUnitQualifiedVariant))
+    suite.addTests(loader.loadTestsFromTestCase(TestUnitQualifiedVariantExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestEntryConfidenceAndRaw))
     suite.addTests(loader.loadTestsFromTestCase(TestUnitGuardExtraction))
     suite.addTests(loader.loadTestsFromTestCase(TestSetUnitRelabelIfImplausible))

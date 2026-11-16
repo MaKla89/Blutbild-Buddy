@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session as SASession
 from config import (
     REPORTS_DIR, resolve_canonical, get_default_ref_range,
     sanitize_unit, canonicalize_unit, unit_known_for_marker,
+    resolve_unit_qualified_variant,
 )
 from database import (
     Report, DataPoint, Patient, ReportArtifact, DataQualityFinding,
@@ -504,6 +505,15 @@ def _apply_global_normalization(
         if not dp.original_name:
             continue
         new_canon = _normalize_name(dp.original_name, dp.unit, mappings, canonical_names, registry=registry)
+        # A canonical name that embeds its unit ('HbA1c (%)' vs 'HbA1c (mmol/mol)')
+        # is a VARIANT of one marker. The LLM mapping can pick the wrong variant for
+        # a bare 'HbA1c' — the live DB stored rows named 'HbA1c (mmol/mol)' whose
+        # value/unit/reference range were all in '%'. Re-derive the variant from the
+        # unit the row actually carries BEFORE the equality check below, so a mapping
+        # that would only move the row to the wrong sibling collapses to a no-op (the
+        # Phase 1 name already matches), and BEFORE the ref-range re-derivation, which
+        # must use the corrected name. Renames only — value/unit/range never converted.
+        new_canon = resolve_unit_qualified_variant(new_canon, dp.unit, registry=registry)
         if new_canon == dp.canonical_name:
             continue
         old_canon = dp.canonical_name
@@ -770,6 +780,21 @@ def process_new_pdfs(session: SASession, progress_callback=None, dpi: int | None
                     # keeps one marker on one spelling so merge grouping, the
                     # ref-range default and dedup all stay aligned.
                     unit = canonicalize_unit(canonical, unit, registry=registry)
+                    # A canonical name that embeds its unit ('HbA1c (%)' vs
+                    # 'HbA1c (mmol/mol)') is a VARIANT of one marker, not a marker
+                    # of its own. A bare 'HbA1c' resolves through the alias table to
+                    # whichever variant is listed first, and an LLM name mapping can
+                    # pick the wrong one — the live DB stored rows named
+                    # 'HbA1c (mmol/mol)' whose value, unit and reference range were
+                    # all in '%', so the name contradicted the data and the marker
+                    # pickers showed a phantom entry. Re-derive the variant from the
+                    # unit the row actually carries, then re-snap the unit to that
+                    # variant's registry spelling. Renames only — the number, its
+                    # unit and its range are never converted here.
+                    snapped = resolve_unit_qualified_variant(canonical, unit, registry=registry)
+                    if snapped != canonical:
+                        canonical = snapped
+                        unit = canonicalize_unit(canonical, unit, registry=registry)
                     ref_low, ref_high = _parse_reference_range(entry.reference_range)
                     had_pdf_ref = ref_low is not None or ref_high is not None
 

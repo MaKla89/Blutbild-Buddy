@@ -564,6 +564,120 @@ def unit_known_for_marker(canonical_name: str | None, unit: str | None,
     return not recognised
 
 
+def marker_base(canonical_name: str | None) -> str:
+    """Strip a trailing parenthetical from a canonical name.
+
+    ``'HbA1c (%)'`` → ``'HbA1c'``, ``'eGFR (CKD-EPI)'`` → ``'eGFR'``,
+    ``'CRP'`` → ``'CRP'``. Mirrors ``database._canonical_base`` — duplicated
+    here because the dependency runs the other way (database imports config),
+    so config must never import database.
+
+    This is what makes the UI able to show ONE ``HbA1c`` entry instead of one
+    per unit-qualified variant: ``HbA1c (%)`` and ``HbA1c (mmol/mol)`` share a
+    base, so they group together and the unit becomes a second-level choice.
+    """
+    if not canonical_name:
+        return ""
+    name = canonical_name.strip()
+    if "(" in name and name.endswith(")"):
+        return name[:name.rfind("(")].strip()
+    return name
+
+
+def embedded_unit(canonical_name: str | None, registry: dict | None = None) -> str | None:
+    """Return the unit a canonical name embeds in its trailing parenthetical.
+
+    ``'HbA1c (%)'`` → ``'%'``, ``'HbA1c (mmol/mol)'`` → ``'mmol/mol'``.
+    Returns ``None`` when the parenthetical is NOT a unit for this marker —
+    ``'ALT (GPT)'``, ``'Hämoglobin (Hb)'``, ``'Vitamin D (25-OH)'``,
+    ``'Östradiol (E2)'``, ``'eGFR (CKD-EPI)'``, ``'Base Excess (BE)'``.
+
+    The test is the marker's OWN registry units (case/spacing/notation
+    insensitive), which separates a unit qualifier from a parenthesised
+    abbreviation with no hardcoded list of names — and stays cheap enough to
+    call once per data point (a marker lists 1-4 units). A marker that embeds a
+    unit it does not list in ``units`` reports no embedded unit; that is the
+    safe direction, since the consequence is only that the UI prints the unit
+    once more rather than swallowing a real one.
+    """
+    if not canonical_name:
+        return None
+    name = canonical_name.strip()
+    if "(" not in name or not name.endswith(")"):
+        return None
+    inner = name[name.rfind("(") + 1:-1].strip()
+    if not inner:
+        return None
+    info = (registry if registry is not None else _CANONICAL_BIOMARKERS).get(canonical_name)
+    reg_units = list((info or {}).get("units") or [])
+    inner_norm = _norm_unit(inner)
+    for ru in reg_units:
+        if _norm_unit(ru) == inner_norm or _units_equivalent(inner_norm, _norm_unit(ru)):
+            return ru
+    return None
+
+
+def name_has_unit(canonical_name: str | None, unit: str | None,
+                  registry: dict | None = None) -> bool:
+    """True when ``canonical_name`` already embeds ``unit`` in its parenthetical.
+
+    ``('HbA1c (%)', '%')`` → True; ``('HbA1c (%)', 'mmol/mol')`` → False;
+    ``('ALT (GPT)', 'U/l')`` → False (``GPT`` is an abbreviation, not a unit).
+    Equivalence-aware, so a notation variant counts as already-present. The UI
+    uses this to avoid printing the unit twice — ``HbA1c (%)`` already says
+    ``%``, so appending the stored unit yields the redundant ``HbA1c (%) (%)``.
+    """
+    if not unit:
+        return False
+    embedded = embedded_unit(canonical_name, registry)
+    if embedded is None:
+        return False
+    return _norm_unit(embedded) == _norm_unit(unit) or _units_equivalent(embedded, unit)
+
+
+def resolve_unit_qualified_variant(canonical: str | None, unit: str | None,
+                                   registry: dict | None = None) -> str | None:
+    """Snap a unit-qualified canonical name to the sibling variant matching ``unit``.
+
+    ``('HbA1c (mmol/mol)', '%')`` → ``'HbA1c (%)'``.
+
+    This is the ingestion fix for the unit drift that made one marker look like
+    several. A name read off a PDF as a bare ``HbA1c`` resolves through the
+    alias table to whichever variant is listed FIRST, and an LLM name mapping
+    can pick the wrong one — so the live DB ended up with rows named
+    ``HbA1c (mmol/mol)`` whose value, unit and reference range are all in ``%``.
+    The name then contradicts the data, and every picker shows a phantom marker.
+
+    Deliberately narrow, because guessing here would corrupt correct data:
+      - fires only when BOTH names are unit-qualified variants of the SAME base
+        (``embedded_unit`` non-null, ``marker_base`` equal), so a marker whose
+        parenthetical is an abbreviation (``ALT (GPT)``) is never touched;
+      - fires only when the row's unit is INCOMPATIBLE with the current name and
+        EXACTLY matches a sibling's — never when no sibling fits (``HbA1c (%)
+        `` stored as ``mg/l`` stays put and is left to the category-error guard);
+      - renames only. The value, unit and reference range are never converted,
+        so the number the lab printed is untouched.
+    """
+    if not canonical or not unit:
+        return canonical
+    active = registry if registry is not None else _CANONICAL_BIOMARKERS
+    own_unit = embedded_unit(canonical, active)
+    if own_unit is None:
+        return canonical
+    unit_norm = _norm_unit(unit)
+    if _norm_unit(own_unit) == unit_norm or _units_equivalent(own_unit, unit):
+        return canonical  # the name already says this unit — nothing to fix
+    base = marker_base(canonical).lower()
+    for other in active:
+        if other == canonical or marker_base(other).lower() != base:
+            continue
+        other_unit = embedded_unit(other, active)
+        if other_unit and (_norm_unit(other_unit) == unit_norm
+                           or _units_equivalent(other_unit, unit)):
+            return other
+    return canonical
+
+
 def _units_equivalent(from_unit: str, to_unit: str) -> bool:
     """True when both units are notation variants of the same physical unit."""
     a = _norm_unit(from_unit)

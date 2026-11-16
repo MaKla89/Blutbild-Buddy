@@ -280,6 +280,9 @@ DE = {
 
     # Trends tab
     "select_biomarker": "Biomarker wählen",
+    "select_unit_variant": "Einheit / Variante",
+    "label_unit_missing": "ohne Einheit",
+    "label_unit_stored": "gespeicherte Einheit",
     "info_no_biomarker_data": "Keine Daten für diesen Biomarker.",
     "time_range_label": "Zeitraum:",
 
@@ -817,6 +820,9 @@ EN = {
 
     # Trends tab
     "select_biomarker": "Select Biomarker",
+    "select_unit_variant": "Unit / variant",
+    "label_unit_missing": "no unit",
+    "label_unit_stored": "stored unit",
     "info_no_biomarker_data": "No data for this biomarker.",
     "time_range_label": "Time range:",
 

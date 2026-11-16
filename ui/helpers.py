@@ -225,6 +225,26 @@ def _job_button(session, *, label_key: str, kind: str, job_label_key: str,
     st.rerun()
 
 
+def marker_label(cname: str, unit: str | None) -> str:
+    """Display label for one (canonical name, unit) measurement group.
+
+    Appends the stored unit only when the canonical name does not already
+    embed it. ``HbA1c (%)`` already says ``%``, so the old unconditional
+    ``f"{cname} ({unit})"`` produced the redundant ``HbA1c (%) (%)`` — and the
+    same for ``HbA1c (mmol/mol) (mmol/mol)``, ``Hämoglobin (Hb)``-style names
+    where the parenthetical is an abbreviation keep their unit appended, since
+    there the unit carries real information.
+
+    Single source of truth: Overview (favorites multiselect + deviation charts),
+    Trends (marker picker) and All-Values (matrix rows) all built this label
+    inline and had to stay byte-identical, because the Overview favorites are
+    PERSISTED as these display strings in ``Patient.favorites``.
+    """
+    if unit and not config.name_has_unit(cname, unit):
+        return f"{cname} ({unit})"
+    return cname
+
+
 def _time_range_slider(min_date, max_date, value_key, slider_key, label):
     """Robust date-range slider shared by the Overview and Trends tabs.
 
